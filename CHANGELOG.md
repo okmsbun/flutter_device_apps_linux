@@ -1,3 +1,3 @@
 ## 0.0.1
 
-- Added the initial private package scaffold.
+- Added `FlutterDeviceAppsLinux.listApps()` to list visible Linux desktop apps with their names and desktop file IDs.

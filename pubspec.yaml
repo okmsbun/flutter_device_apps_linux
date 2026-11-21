@@ -1,7 +1,6 @@
 name: flutter_device_apps_linux
-description: Private Flutter package scaffold for Linux app discovery and management.
+description: List installed Linux desktop apps and read their display names and desktop file IDs from Flutter.
 version: 0.0.1
-publish_to: none
 
 repository: https://github.com/okmsbun/flutter_device_apps_linux
 issue_tracker: https://github.com/okmsbun/flutter_device_apps_linux/issues
@@ -19,3 +18,9 @@ dependencies:
 
 dev_dependencies:
   flutter_lints: ^6.0.0
+
+flutter:
+  plugin:
+    platforms:
+      linux:
+        pluginClass: FlutterDeviceAppsLinuxPlugin
