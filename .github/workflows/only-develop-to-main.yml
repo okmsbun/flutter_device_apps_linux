@@ -1,0 +1,43 @@
+name: only-develop-to-main
+
+on:
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  only-develop-to-main:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Allow only develop -> main PRs
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          echo "head_ref: $HEAD_REF"
+          echo "base_ref: $BASE_REF"
+          if [ "$BASE_REF" = "main" ] && [ "$HEAD_REF" != "develop" ]; then
+            echo "Only PRs from 'develop' to 'main' are allowed."
+            exit 1
+          fi
+
+  quality:
+    needs: only-develop-to-main
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: pub.dev dry-run
+        run: flutter pub publish --dry-run
