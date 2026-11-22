@@ -21,8 +21,8 @@ Use Flutter's standard Linux build tooling.
 
 ## Main package
 
-The Flutter Device Apps main package provides the Android and macOS APIs.
-Add this package directly for Linux. [Main package](https://pub.dev/packages/flutter_device_apps) · [Main package README](https://github.com/okmsbun/flutter_device_apps#readme)
+`flutter_device_apps` 2.1.0+ re-exports this plugin alongside Android and macOS.
+You can also add this package directly for Linux. [Main package](https://pub.dev/packages/flutter_device_apps) · [Main package README](https://github.com/okmsbun/flutter_device_apps#readme)
 
 ## Usage
 
