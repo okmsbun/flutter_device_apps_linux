@@ -4,4 +4,5 @@
 .pub/
 build/
 doc/api/
-pubspec.lock
+/pubspec.lock
+/coverage/
