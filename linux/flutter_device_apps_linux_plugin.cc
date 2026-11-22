@@ -209,8 +209,14 @@ static FlValue* file_handlers(const char* path, bool default_only, GError** erro
 
 static gchar* elf_path(GDesktopAppInfo* desktop) {
   if (!g_str_equal(install_source(desktop).source, "unknown")) return nullptr;
-  const char* executable = g_app_info_get_executable(G_APP_INFO(desktop));
-  if (executable == nullptr || *executable == '\0') return nullptr;
+  const char* command = g_app_info_get_commandline(G_APP_INFO(desktop));
+  g_auto(GStrv) arguments = nullptr;
+  if (command == nullptr ||
+      !g_shell_parse_argv(command, nullptr, &arguments, nullptr) ||
+      *arguments[0] == '\0') {
+    return nullptr;
+  }
+  const char* executable = arguments[0];
   g_autofree char* name = g_path_get_basename(executable);
   for (const auto* wrapper : {"env", "sh", "bash", "dash", "zsh", "flatpak", "snap", "bwrap"}) {
     if (g_str_equal(name, wrapper)) return nullptr;

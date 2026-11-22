@@ -1,6 +1,3 @@
-## 0.0.1
-
-- Added `FlutterDeviceAppsLinux.listApps()` to list visible Linux desktop apps with their names and desktop file IDs.
 ## 1.0.0
 
 - Added desktop ID lookup, app search, launch, and PNG icons.
@@ -10,3 +7,6 @@
 - Added categorized technology detection from direct ELF dependencies.
 - Added the Linux example, API guide, and release workflows.
 
+## 0.0.1
+
+- Added `FlutterDeviceAppsLinux.listApps()` to list visible Linux desktop apps with their names and desktop file IDs.
