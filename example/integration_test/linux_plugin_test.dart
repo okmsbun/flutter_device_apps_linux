@@ -125,10 +125,7 @@ void main() {
     final fixture = fixtureMatches.single;
     expect(fixture.resolvedId, isNotEmpty);
     expect(fixture.desktopMenuVisibility, LinuxDesktopMenuVisibility.visible);
-    expect(
-      fixture.capabilities.supportsFiles,
-      LinuxCapabilityState.supported,
-    );
+    expect(fixture.capabilities.supportsFiles, LinuxCapabilityState.supported);
     expect(
       fixture.capabilities.requiresTerminal,
       LinuxCapabilityState.unsupported,

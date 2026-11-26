@@ -62,7 +62,8 @@ void main() {
                   'launchable': 'supported',
                 },
                 'providerId': 'gio',
-                'originalApplicationId': 'gio:unknown:org.example.Editor.desktop',
+                'originalApplicationId':
+                    'gio:unknown:org.example.Editor.desktop',
               },
             ],
             'linkedPackageIdentityIds': <String>[],
@@ -191,11 +192,7 @@ void main() {
           },
         ],
         'providerDiagnostics': [
-          {
-            'providerId': 'gio',
-            'status': 'succeeded',
-            'discoveredCount': 1,
-          },
+          {'providerId': 'gio', 'status': 'succeeded', 'discoveredCount': 1},
           {
             'providerId': 'flatpak',
             'status': 'partiallyFailed',
@@ -331,19 +328,10 @@ void main() {
     // All returned lists are immutable.
     expect(() => result.applications.add(snapApp), throwsUnsupportedError);
     expect(() => result.packages.add(pkg), throwsUnsupportedError);
-    expect(
-      () => result.providerDiagnostics.clear(),
-      throwsUnsupportedError,
-    );
+    expect(() => result.providerDiagnostics.clear(), throwsUnsupportedError);
     expect(() => result.ambiguities.clear(), throwsUnsupportedError);
-    expect(
-      () => flatpakApp.sourceProvenances.clear(),
-      throwsUnsupportedError,
-    );
-    expect(
-      () => flatpakApp.originalRecordIds.clear(),
-      throwsUnsupportedError,
-    );
+    expect(() => flatpakApp.sourceProvenances.clear(), throwsUnsupportedError);
+    expect(() => flatpakApp.originalRecordIds.clear(), throwsUnsupportedError);
     expect(() => flatpakApp.desktopEntries.clear(), throwsUnsupportedError);
     expect(
       () => flatpakApp.linkedAppStreamComponentIds.clear(),
@@ -353,10 +341,7 @@ void main() {
       () => flatpakApp.catalogReleases.releases.clear(),
       throwsUnsupportedError,
     );
-    expect(
-      () => flatpakApp.metadataConflicts.clear(),
-      throwsUnsupportedError,
-    );
+    expect(() => flatpakApp.metadataConflicts.clear(), throwsUnsupportedError);
     expect(() => pkg.groups.clear(), throwsUnsupportedError);
     expect(() => pkg.licenses.clear(), throwsUnsupportedError);
   });
@@ -383,116 +368,119 @@ void main() {
     expect(result.packages, isEmpty);
   });
 
-  test('handles null response and unknown wire enum values conservatively', () async {
-    messenger.setMockMethodCallHandler(channel, (call) async => null);
-    final empty = await FlutterDeviceAppsLinux.discoverApps();
-    expect(empty.applications, isEmpty);
-    expect(empty.packages, isEmpty);
-    expect(empty.providerDiagnostics, isEmpty);
-    expect(empty.ambiguities, isEmpty);
+  test(
+    'handles null response and unknown wire enum values conservatively',
+    () async {
+      messenger.setMockMethodCallHandler(channel, (call) async => null);
+      final empty = await FlutterDeviceAppsLinux.discoverApps();
+      expect(empty.applications, isEmpty);
+      expect(empty.packages, isEmpty);
+      expect(empty.providerDiagnostics, isEmpty);
+      expect(empty.ambiguities, isEmpty);
 
-    messenger.setMockMethodCallHandler(channel, (call) async {
-      return <String, Object?>{
-        'applications': [
-          {
-            'resolvedId': 'future:x',
-            'primaryProvenance': {
-              'providerId': 'future',
-              'nativeId': 'x',
-              'installationSource': 'futureSource',
-              'installationScope': 'futureScope',
+      messenger.setMockMethodCallHandler(channel, (call) async {
+        return <String, Object?>{
+          'applications': [
+            {
+              'resolvedId': 'future:x',
+              'primaryProvenance': {
+                'providerId': 'future',
+                'nativeId': 'x',
+                'installationSource': 'futureSource',
+                'installationScope': 'futureScope',
+              },
+              'capabilities': {
+                'supportsFiles': 'maybe',
+                'supportsUris': 'maybe',
+                'requiresTerminal': 'maybe',
+                'launchable': 'maybe',
+              },
+              'desktopMenuVisibility': 'sometimes',
+              'classification': 'futureKind',
             },
-            'capabilities': {
-              'supportsFiles': 'maybe',
-              'supportsUris': 'maybe',
-              'requiresTerminal': 'maybe',
-              'launchable': 'maybe',
+          ],
+          'packages': [
+            {
+              'packageIdentityId': 'future:pkg',
+              'packageName': 'pkg',
+              'installationState': 'futureState',
+              'selectionState': 'futureSelection',
+              'installReason': 'futureReason',
             },
-            'desktopMenuVisibility': 'sometimes',
-            'classification': 'futureKind',
-          },
-        ],
-        'packages': [
-          {
-            'packageIdentityId': 'future:pkg',
-            'packageName': 'pkg',
-            'installationState': 'futureState',
-            'selectionState': 'futureSelection',
-            'installReason': 'futureReason',
-          },
-        ],
-        'providerDiagnostics': [
-          {
-            'providerId': 'future',
-            'status': 'futureStatus',
-          },
-        ],
-      };
-    });
+          ],
+          'providerDiagnostics': [
+            {'providerId': 'future', 'status': 'futureStatus'},
+          ],
+        };
+      });
 
-    final decoded = await FlutterDeviceAppsLinux.discoverApps(
-      includePackages: true,
-    );
-    final app = decoded.applications.single;
-    expect(
-      app.primaryProvenance.installationSource,
-      LinuxInstallationSource.unknown,
-    );
-    expect(
-      app.primaryProvenance.installationScope,
-      LinuxInstallationScope.unknown,
-    );
-    expect(app.capabilities.supportsFiles, LinuxCapabilityState.unknown);
-    expect(app.desktopMenuVisibility, LinuxDesktopMenuVisibility.unknown);
-    expect(app.classification, LinuxAppClassification.unknown);
-    expect(app.metadata.name, isNull);
-    expect(app.metadata.version, isNull);
-
-    final pkg = decoded.packages.single;
-    expect(pkg.installationState, LinuxPackageInstallationState.unknown);
-    expect(pkg.selectionState, LinuxPackageSelectionState.unknown);
-    expect(pkg.installReason, LinuxPackageInstallReason.unknown);
-    expect(
-      decoded.providerDiagnostics.single.status,
-      LinuxDiscoveryProviderStatus.failed,
-    );
-  });
-
-  test('validates arguments, platform, and preserves legacy listApps', () async {
-    for (final invalid in [
-      const <String>[],
-      const [''],
-      const ['gio', ''],
-      const ['gio\u0000bad'],
-    ]) {
-      await expectLater(
-        FlutterDeviceAppsLinux.discoverApps(providers: invalid),
-        throwsArgumentError,
+      final decoded = await FlutterDeviceAppsLinux.discoverApps(
+        includePackages: true,
       );
-    }
+      final app = decoded.applications.single;
+      expect(
+        app.primaryProvenance.installationSource,
+        LinuxInstallationSource.unknown,
+      );
+      expect(
+        app.primaryProvenance.installationScope,
+        LinuxInstallationScope.unknown,
+      );
+      expect(app.capabilities.supportsFiles, LinuxCapabilityState.unknown);
+      expect(app.desktopMenuVisibility, LinuxDesktopMenuVisibility.unknown);
+      expect(app.classification, LinuxAppClassification.unknown);
+      expect(app.metadata.name, isNull);
+      expect(app.metadata.version, isNull);
 
-    debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
-    await expectLater(
-      FlutterDeviceAppsLinux.discoverApps(),
-      throwsUnsupportedError,
-    );
+      final pkg = decoded.packages.single;
+      expect(pkg.installationState, LinuxPackageInstallationState.unknown);
+      expect(pkg.selectionState, LinuxPackageSelectionState.unknown);
+      expect(pkg.installReason, LinuxPackageInstallReason.unknown);
+      expect(
+        decoded.providerDiagnostics.single.status,
+        LinuxDiscoveryProviderStatus.failed,
+      );
+    },
+  );
 
-    debugDefaultTargetPlatformOverride = TargetPlatform.linux;
-    messenger.setMockMethodCallHandler(channel, (call) async {
-      expect(call.method, 'listApps');
-      expect(call.arguments, isNull);
-      return [
-        {
-          'desktopFileId': 'org.example.Legacy.desktop',
-          'appName': 'Legacy',
-          'supportsFiles': true,
-          'supportsUris': false,
-          'requiresTerminal': false,
-        },
-      ];
-    });
-    final legacy = await FlutterDeviceAppsLinux.listApps();
-    expect(legacy.single.desktopFileId, 'org.example.Legacy.desktop');
-    expect(legacy.single.appName, 'Legacy');
-  });
+  test(
+    'validates arguments, platform, and preserves legacy listApps',
+    () async {
+      for (final invalid in [
+        const <String>[],
+        const [''],
+        const ['gio', ''],
+        const ['gio\u0000bad'],
+      ]) {
+        await expectLater(
+          FlutterDeviceAppsLinux.discoverApps(providers: invalid),
+          throwsArgumentError,
+        );
+      }
+
+      debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+      await expectLater(
+        FlutterDeviceAppsLinux.discoverApps(),
+        throwsUnsupportedError,
+      );
+
+      debugDefaultTargetPlatformOverride = TargetPlatform.linux;
+      messenger.setMockMethodCallHandler(channel, (call) async {
+        expect(call.method, 'listApps');
+        expect(call.arguments, isNull);
+        return [
+          {
+            'desktopFileId': 'org.example.Legacy.desktop',
+            'appName': 'Legacy',
+            'supportsFiles': true,
+            'supportsUris': false,
+            'requiresTerminal': false,
+          },
+        ];
+      });
+      final legacy = await FlutterDeviceAppsLinux.listApps();
+      expect(legacy.single.desktopFileId, 'org.example.Legacy.desktop');
+      expect(legacy.single.appName, 'Legacy');
+    },
+  );
 }

@@ -4995,16 +4995,29 @@ void test_async_resolved_discovery_lifecycle_serialization_and_legacy_isolation(
           res.applications.push_back(std::move(app));
           return res;
         }));
+    class CallbackPackageProvider final : public PackageDiscoveryProvider {
+     public:
+      CallbackPackageProvider(std::string id,
+                              std::function<PackageDiscoveryResult()> fn)
+          : id_(std::move(id)), fn_(std::move(fn)) {}
+      const char* id() const override { return id_.c_str(); }
+      bool is_available() const override { return true; }
+      PackageDiscoveryResult discover_packages() override { return fn_(); }
+
+     private:
+      std::string id_;
+      std::function<PackageDiscoveryResult()> fn_;
+    };
+
     service->register_package_provider(
-        std::make_unique<FakePackageDiscoveryProvider>(
-            "dpkg", true, [&]() {
-              pkg_calls.fetch_add(1);
-              PackageDiscoveryResult res;
-              res.packages.push_back(make_owned_pkg(
-                  "dpkg", InstallationSource::kDpkg, "async-app", "amd64",
-                  "1.2.3-1"));
-              return res;
-            }));
+        std::make_unique<CallbackPackageProvider>("dpkg", [&]() {
+          pkg_calls.fetch_add(1);
+          PackageDiscoveryResult res;
+          res.packages.push_back(make_owned_pkg(
+              "dpkg", InstallationSource::kDpkg, "async-app", "amd64",
+              "1.2.3-1"));
+          return res;
+        }));
 
     AppStreamBackendResult as_backend_res;
     AppStreamMetadataRecord as_rec;
@@ -5012,14 +5025,11 @@ void test_async_resolved_discovery_lifecycle_serialization_and_legacy_isolation(
     as_rec.component_kind = "desktop-application";
     as_rec.desktop_launchable_ids = {"org.example.AsyncApp.desktop"};
     as_rec.summary = OptionalString::of("Async App Summary");
-    as_rec.provenance.origin_kind = AppStreamMetadataOriginKind::kMetaInfo;
+    as_rec.provenance.origin_kind = AppStreamMetadataOriginKind::kMetainfo;
     as_backend_res.records.push_back(as_rec);
     service->set_metadata_provider(std::make_unique<AppStreamMetadataProvider>(
         std::make_unique<FakeAppStreamBackend>(
-            true, [&]() {
-              as_calls.fetch_add(1);
-              return as_backend_res;
-            })));
+            true, "libappstream.so.5", as_backend_res, nullptr, &as_calls)));
 
     TestPlatformLoop loop;
     WorkerPoolFixture pool;
@@ -5240,7 +5250,7 @@ void test_async_resolved_discovery_lifecycle_serialization_and_legacy_isolation(
 
     release_slow.count_down();
     pool.join_all();
-    loop.drain();
+    loop.drain_available();
     expect(inflight_callbacks.load() == 0,
            "in-flight resolved request must not invoke callback after teardown");
   }

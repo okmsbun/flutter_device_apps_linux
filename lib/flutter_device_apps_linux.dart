@@ -158,7 +158,7 @@ abstract final class FlutterDeviceAppsLinux {
     final args = <String, Object?>{
       'includePackages': includePackages,
       'includeAppStreamMetadata': includeAppStreamMetadata,
-      if (validatedProviders != null) 'providers': validatedProviders,
+      'providers': ?validatedProviders,
     };
     final result = await _channel.invokeMapMethod<Object?, Object?>(
       'discoverApps',
