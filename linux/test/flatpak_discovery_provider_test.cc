@@ -50,6 +50,8 @@ int run_missing_lib() {
          "missing libflatpak library must report is_available() == false");
   const DiscoveryResult result = provider.discover();
   expect(!result.ok, "discover() with missing library must fail cleanly");
+  expect(result.error_message.find("failed to load") != std::string::npos,
+         "missing library diagnostic must report dynamic loading error");
   if (g_failures > 0) return 1;
   std::cout << "Flatpak missing-library native test passed.\n";
   return 0;
@@ -60,6 +62,10 @@ int run_missing_symbols(const char* incomplete_so, const char* core_only_so) {
     FlatpakDiscoveryProvider provider(create_libflatpak_backend(incomplete_so));
     expect(!provider.is_available(),
            "library missing required symbols must report unavailable");
+    const DiscoveryResult result = provider.discover();
+    expect(!result.ok && result.error_message.find("missing required symbols") !=
+                             std::string::npos,
+           "missing required symbols diagnostic must be distinguishable");
   }
   {
     FlatpakDiscoveryProvider provider(create_libflatpak_backend(core_only_so));
@@ -75,8 +81,13 @@ int run_missing_symbols(const char* incomplete_so, const char* core_only_so) {
 int run_fixture() {
   FlatpakDiscoveryProvider provider(
       create_libflatpak_backend("libflatpak.so.0"));
-  expect(provider.is_available(),
-         "libflatpak.so.0 must be available in Linux Flatpak fixture test");
+  if (!provider.is_available()) {
+    const DiscoveryResult diag = provider.discover();
+    std::cerr << "FAIL: libflatpak.so.0 unavailable: " << diag.error_message
+              << "\n";
+    ++g_failures;
+    return 1;
+  }
 
   const DiscoveryResult result = provider.discover();
   expect(result.ok, "isolated local Flatpak fixture discovery must succeed");

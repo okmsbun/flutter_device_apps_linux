@@ -16,6 +16,43 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Free disk space
+        if: runner.environment == 'github-hosted'
+        run: |
+          echo "=== Disk usage before cleanup ==="
+          df -h /
+
+          # Explicit allowlist of large standalone (non-dpkg-managed) SDKs and
+          # toolcaches preinstalled on GitHub-hosted Ubuntu runners.
+          # Excludes dpkg-managed runtimes (.NET, PowerShell, Google Cloud CLI)
+          # to preserve /var/lib/dpkg/status inventory consistency.
+          cleanup_dirs=(
+            "/usr/local/lib/android"
+            "/opt/hostedtoolcache/CodeQL"
+            "/usr/local/.ghcup"
+            "/usr/share/swift"
+            "/usr/share/miniconda"
+            "/usr/local/julia"
+            "/usr/local/aws-cli"
+          )
+
+          for dir in "${cleanup_dirs[@]}"; do
+            if [ -L "$dir" ] || [ ! -d "$dir" ]; then
+              continue
+            fi
+            if dpkg -S "$dir" >/dev/null 2>&1; then
+              echo "Skipping dpkg-managed path: $dir"
+              continue
+            fi
+            du -sh "$dir" || true
+            sudo rm -rf -- "$dir"
+          done
+
+          sudo apt-get clean
+
+          echo "=== Disk usage after cleanup ==="
+          df -h /
+
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
@@ -25,10 +62,10 @@ jobs:
       - name: Install Linux build and test dependencies
         run: |
           sudo apt-get update
-          # Note: intentionally install flatpak and libappstream runtime shared
-          # libraries without libflatpak-dev or libappstream-dev, proving the
-          # plugin builds without compile-time or link-time headers.
-          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev libstdc++-12-dev libgl1-mesa-dri shared-mime-info xvfb xauth flatpak
+          # Note: intentionally install flatpak, libflatpak0, and libappstream
+          # runtime shared libraries without libflatpak-dev or libappstream-dev,
+          # proving the plugin builds without compile-time or link-time headers.
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev libstdc++-12-dev libgl1-mesa-dri shared-mime-info xvfb xauth flatpak libflatpak0
           sudo apt-get install -y libappstream5 || sudo apt-get install -y libappstream4
 
       - name: Install dependencies
@@ -144,6 +181,30 @@ jobs:
             echo "Unexpected mandatory DT_NEEDED dependency on libflatpak"
             exit 1
           fi
+
+          # Verify runtime libflatpak.so.0 availability and required exported
+          # symbols via ldconfig and nm.
+          libflatpak_path="$(ldconfig -p | awk '/libflatpak\.so\.0 / { print $NF; exit }')"
+          if [ -z "$libflatpak_path" ] || [ ! -r "$libflatpak_path" ]; then
+            echo "libflatpak.so.0 was not found in ldconfig cache"
+            exit 1
+          fi
+          echo "Resolved runtime libflatpak: $libflatpak_path"
+          for sym in \
+            flatpak_get_system_installations \
+            flatpak_installation_new_user \
+            flatpak_installation_list_installed_refs_by_kind \
+            flatpak_installation_get_id \
+            flatpak_installation_get_is_user \
+            flatpak_ref_get_name \
+            flatpak_ref_get_arch \
+            flatpak_ref_get_branch \
+            flatpak_ref_get_kind; do
+            if ! nm -D --defined-only "$libflatpak_path" | grep -q " ${sym}$"; then
+              echo "Required libflatpak symbol not exported: $sym"
+              exit 1
+            fi
+          done
 
           work_dir="$(mktemp -d)"
           trap 'sudo rm -rf -- "$work_dir"' EXIT

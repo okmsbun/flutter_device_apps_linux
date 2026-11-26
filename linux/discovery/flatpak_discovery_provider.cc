@@ -60,7 +60,10 @@ DiscoveryResult FlatpakDiscoveryProvider::discover() {
   DiscoveryResult result;
   if (!is_available()) {
     result.ok = false;
-    result.error_message = "libflatpak backend is unavailable";
+    const std::string detail =
+        backend_ != nullptr ? backend_->availability_error() : "";
+    result.error_message =
+        detail.empty() ? "libflatpak backend is unavailable" : detail;
     return result;
   }
 

@@ -8,6 +8,7 @@
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace flutter_device_apps_linux {
 namespace {
@@ -71,8 +72,12 @@ bool load_symbol(GModule* module, const char* name, Fn* out) {
 class LibFlatpakBackend final : public FlatpakBackend {
  public:
   explicit LibFlatpakBackend(const char* library_name) {
-    if (library_name == nullptr || *library_name == '\0' ||
-        !g_module_supported()) {
+    if (library_name == nullptr || *library_name == '\0') {
+      unavailable_reason_ = "empty libflatpak library name";
+      return;
+    }
+    if (!g_module_supported()) {
+      unavailable_reason_ = "GModule dynamic loading is not supported";
       return;
     }
 
@@ -80,35 +85,67 @@ class LibFlatpakBackend final : public FlatpakBackend {
         library_name, static_cast<GModuleFlags>(G_MODULE_BIND_LOCAL |
                                                 G_MODULE_BIND_LAZY));
     if (module == nullptr) {
+      const char* mod_error = g_module_error();
+      unavailable_reason_ =
+          std::string("failed to load ") + library_name +
+          (mod_error != nullptr && *mod_error != '\0'
+               ? std::string(": ") + mod_error
+               : std::string(" (library not found or unreadable)"));
       return;
     }
 
+    std::vector<std::string> missing_symbols;
     const bool has_system_list = load_symbol(
         module, "flatpak_get_system_installations",
         &symbols_.get_system_installations);
     const bool has_system_single = load_symbol(
         module, "flatpak_installation_new_system",
         &symbols_.installation_new_system);
+    if (!has_system_list && !has_system_single) {
+      missing_symbols.emplace_back(
+          "flatpak_get_system_installations|flatpak_installation_new_system");
+    }
 
-    const bool core_ok =
-        (has_system_list || has_system_single) &&
-        load_symbol(module, "flatpak_installation_new_user",
-                    &symbols_.installation_new_user) &&
-        load_symbol(module, "flatpak_installation_list_installed_refs_by_kind",
-                    &symbols_.installation_list_installed_refs_by_kind) &&
-        load_symbol(module, "flatpak_installation_get_id",
-                    &symbols_.installation_get_id) &&
-        load_symbol(module, "flatpak_installation_get_is_user",
-                    &symbols_.installation_get_is_user) &&
-        load_symbol(module, "flatpak_ref_get_name", &symbols_.ref_get_name) &&
-        load_symbol(module, "flatpak_ref_get_arch", &symbols_.ref_get_arch) &&
-        load_symbol(module, "flatpak_ref_get_branch",
-                    &symbols_.ref_get_branch) &&
-        load_symbol(module, "flatpak_ref_get_kind", &symbols_.ref_get_kind);
+    if (!load_symbol(module, "flatpak_installation_new_user",
+                     &symbols_.installation_new_user)) {
+      missing_symbols.emplace_back("flatpak_installation_new_user");
+    }
+    if (!load_symbol(module, "flatpak_installation_list_installed_refs_by_kind",
+                     &symbols_.installation_list_installed_refs_by_kind)) {
+      missing_symbols.emplace_back(
+          "flatpak_installation_list_installed_refs_by_kind");
+    }
+    if (!load_symbol(module, "flatpak_installation_get_id",
+                     &symbols_.installation_get_id)) {
+      missing_symbols.emplace_back("flatpak_installation_get_id");
+    }
+    if (!load_symbol(module, "flatpak_installation_get_is_user",
+                     &symbols_.installation_get_is_user)) {
+      missing_symbols.emplace_back("flatpak_installation_get_is_user");
+    }
+    if (!load_symbol(module, "flatpak_ref_get_name", &symbols_.ref_get_name)) {
+      missing_symbols.emplace_back("flatpak_ref_get_name");
+    }
+    if (!load_symbol(module, "flatpak_ref_get_arch", &symbols_.ref_get_arch)) {
+      missing_symbols.emplace_back("flatpak_ref_get_arch");
+    }
+    if (!load_symbol(module, "flatpak_ref_get_branch",
+                     &symbols_.ref_get_branch)) {
+      missing_symbols.emplace_back("flatpak_ref_get_branch");
+    }
+    if (!load_symbol(module, "flatpak_ref_get_kind", &symbols_.ref_get_kind)) {
+      missing_symbols.emplace_back("flatpak_ref_get_kind");
+    }
 
-    if (!core_ok) {
+    if (!missing_symbols.empty()) {
       g_module_close(module);
       symbols_ = LibFlatpakSymbols{};
+      unavailable_reason_ =
+          std::string("missing required symbols in ") + library_name + ": ";
+      for (size_t i = 0; i < missing_symbols.size(); ++i) {
+        if (i > 0) unavailable_reason_.append(", ");
+        unavailable_reason_.append(missing_symbols[i]);
+      }
       return;
     }
 
@@ -130,11 +167,17 @@ class LibFlatpakBackend final : public FlatpakBackend {
 
   bool is_available() const override { return available_; }
 
+  std::string availability_error() const override {
+    return unavailable_reason_;
+  }
+
   FlatpakBackendQueryResult list_installed_apps() override {
     FlatpakBackendQueryResult result;
     if (!available_) {
       result.ok = false;
-      result.error_message = "libflatpak is not available";
+      result.error_message = unavailable_reason_.empty()
+                                 ? "libflatpak is not available"
+                                 : unavailable_reason_;
       return result;
     }
 
@@ -285,6 +328,7 @@ class LibFlatpakBackend final : public FlatpakBackend {
   }
 
   bool available_ = false;
+  std::string unavailable_reason_;
   LibFlatpakSymbols symbols_;
 };
 

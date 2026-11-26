@@ -52,6 +52,10 @@ class FlatpakBackend {
   // Returns whether libflatpak and required symbols are available at runtime.
   virtual bool is_available() const = 0;
 
+  // Optional human-readable diagnostic explaining why is_available() is false
+  // (for example, missing library, g_module_error(), or missing symbols).
+  virtual std::string availability_error() const { return ""; }
+
   // Performs read-only local discovery across user and configured system
   // Flatpak installations.
   virtual FlatpakBackendQueryResult list_installed_apps() = 0;

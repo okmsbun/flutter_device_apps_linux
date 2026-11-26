@@ -1042,11 +1042,13 @@ void test_concurrent_registration_and_discovery_on_service() {
 class FakeFlatpakBackend final : public FlatpakBackend {
  public:
   FakeFlatpakBackend(bool available, FlatpakBackendQueryResult result,
-                     int* list_calls = nullptr, int* destroyed_count = nullptr)
+                     int* list_calls = nullptr, int* destroyed_count = nullptr,
+                     std::string availability_err = "")
       : available_(available),
         result_(std::move(result)),
         list_calls_(list_calls),
-        destroyed_count_(destroyed_count) {}
+        destroyed_count_(destroyed_count),
+        availability_error_(std::move(availability_err)) {}
 
   ~FakeFlatpakBackend() override {
     if (destroyed_count_ != nullptr) {
@@ -1055,6 +1057,10 @@ class FakeFlatpakBackend final : public FlatpakBackend {
   }
 
   bool is_available() const override { return available_; }
+
+  std::string availability_error() const override {
+    return availability_error_;
+  }
 
   FlatpakBackendQueryResult list_installed_apps() override {
     if (list_calls_ != nullptr) {
@@ -1068,6 +1074,7 @@ class FakeFlatpakBackend final : public FlatpakBackend {
   FlatpakBackendQueryResult result_;
   int* list_calls_;
   int* destroyed_count_;
+  std::string availability_error_;
 };
 
 FlatpakInstalledAppRecord make_flatpak_ref(
@@ -1095,6 +1102,15 @@ void test_flatpak_missing_backend_or_library_is_unavailable() {
          "null backend must report unavailable");
   const DiscoveryResult null_result = null_provider.discover();
   expect(!null_result.ok, "discover() on unavailable backend must not succeed");
+
+  FlatpakDiscoveryProvider diag_provider(std::make_unique<FakeFlatpakBackend>(
+      false, FlatpakBackendQueryResult{}, nullptr, nullptr,
+      "failed to load libflatpak.so.0: cannot open shared object file"));
+  const DiscoveryResult diag_result = diag_provider.discover();
+  expect(!diag_result.ok &&
+             diag_result.error_message.find("failed to load libflatpak.so.0") !=
+                 std::string::npos,
+         "provider must surface backend availability_error() diagnostics");
 
   int list_calls = 0;
   ApplicationDiscoveryService service;
