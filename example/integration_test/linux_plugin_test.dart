@@ -6,6 +6,9 @@ import 'package:integration_test/integration_test.dart';
 
 const _id = 'org.example.DeviceAppsFixture.desktop';
 const _hiddenId = 'org.example.HiddenFixture.desktop';
+const _onlyShowInKdeId = 'org.example.OnlyShowInKdeFixture.desktop';
+const _notShowInGnomeId = 'org.example.NotShowInGnomeFixture.desktop';
+const _trulyHiddenId = 'org.example.TrulyHiddenFixture.desktop';
 
 void main() {
   IntegrationTestWidgetsFlutterBinding.ensureInitialized();
@@ -13,8 +16,30 @@ void main() {
 
   testWidgets('lists and searches visible desktop entries', (_) async {
     final apps = await FlutterDeviceAppsLinux.listApps();
-    expect(apps.any((app) => app.desktopFileId == _id), isTrue);
+    final fixture = apps.where((app) => app.desktopFileId == _id).toList();
+    expect(fixture, hasLength(1));
+    expect(fixture.single.appName, 'Device Apps Linux Fixture');
+    expect(fixture.single.supportsFiles, isTrue);
+    expect(fixture.single.supportsUris, isFalse);
+    expect(fixture.single.requiresTerminal, isFalse);
+    expect(fixture.single.description, isNull);
+    expect(fixture.single.desktopFilePath, isNull);
+    expect(fixture.single.categories, isEmpty);
+    expect(fixture.single.mimeTypes, isEmpty);
     expect(apps.any((app) => app.desktopFileId == _hiddenId), isFalse);
+    expect(apps.any((app) => app.desktopFileId == _onlyShowInKdeId), isFalse);
+    expect(apps.any((app) => app.desktopFileId == _notShowInGnomeId), isFalse);
+    expect(apps.any((app) => app.desktopFileId == _trulyHiddenId), isFalse);
+
+    final concurrent = await Future.wait([
+      FlutterDeviceAppsLinux.listApps(),
+      FlutterDeviceAppsLinux.listApps(),
+      FlutterDeviceAppsLinux.listApps(),
+    ]);
+    for (final batch in concurrent) {
+      expect(batch.any((app) => app.desktopFileId == _id), isTrue);
+      expect(batch.any((app) => app.desktopFileId == _hiddenId), isFalse);
+    }
 
     final search = await FlutterDeviceAppsLinux.searchApps('deviceappsfixture');
     expect(search.map((app) => app.desktopFileId), [_id]);
@@ -77,5 +102,61 @@ void main() {
       'org.example.ELFFixture.desktop',
     );
     expect(technologies?.libraries, contains(LinuxAppTechnology.sdl3));
+  });
+
+  testWidgets('discovers normalized applications and optional packages', (
+    _,
+  ) async {
+    final result = await FlutterDeviceAppsLinux.discoverApps();
+    expect(result.packages, isEmpty);
+    expect(
+      result.providerDiagnostics.any(
+        (d) =>
+            d.providerId == 'gio' &&
+            d.status == LinuxDiscoveryProviderStatus.succeeded,
+      ),
+      isTrue,
+    );
+
+    final fixtureMatches = result.applications
+        .where((app) => app.desktopEntries.any((e) => e.desktopFileId == _id))
+        .toList();
+    expect(fixtureMatches, hasLength(1));
+    final fixture = fixtureMatches.single;
+    expect(fixture.resolvedId, isNotEmpty);
+    expect(fixture.desktopMenuVisibility, LinuxDesktopMenuVisibility.visible);
+    expect(fixture.capabilities.supportsFiles, LinuxCapabilityState.supported);
+    expect(
+      fixture.capabilities.requiresTerminal,
+      LinuxCapabilityState.unsupported,
+    );
+
+    final withPackages = await FlutterDeviceAppsLinux.discoverApps(
+      includePackages: true,
+      providers: const ['gio', 'dpkg'],
+    );
+    expect(
+      withPackages.providerDiagnostics.map((d) => d.providerId),
+      everyElement(isIn(['gio', 'dpkg', 'dpkg-ownership'])),
+    );
+    final dpkgDiag = withPackages.providerDiagnostics
+        .where((d) => d.providerId == 'dpkg')
+        .toList();
+    if (dpkgDiag.isNotEmpty &&
+        dpkgDiag.single.status == LinuxDiscoveryProviderStatus.succeeded) {
+      expect(withPackages.packages, isNotEmpty);
+      expect(withPackages.packages.first.packageIdentityId, isNotEmpty);
+      expect(withPackages.packages.first.packageName, isNotEmpty);
+    }
+
+    // Verify concurrent execution alongside legacy listApps preserves legacy
+    // GIO-only behavior.
+    final concurrent = await Future.wait<Object?>([
+      FlutterDeviceAppsLinux.discoverApps(includeAppStreamMetadata: false),
+      FlutterDeviceAppsLinux.listApps(),
+    ]);
+    final legacyApps = concurrent[1]! as List<LinuxAppInfo>;
+    expect(legacyApps.any((app) => app.desktopFileId == _id), isTrue);
+    expect(legacyApps.any((app) => app.desktopFileId == _hiddenId), isFalse);
   });
 }

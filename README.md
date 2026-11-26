@@ -8,13 +8,18 @@
 <a href="https://pub.dev/packages/flutter_device_apps"><img src="https://img.shields.io/badge/Main%20Package-orange.svg" alt="Main Package"></a>
 </p>
 
-A Flutter plugin to discover and open Linux desktop apps, get their icons and
-metadata, find file handlers, and identify directly linked technologies.
+A Flutter plugin to discover Linux applications across local desktop and
+packaging sources (GIO, Flatpak, Snap, DPKG, RPM, Pacman, Nix, and AppStream),
+open desktop apps, get their icons and metadata, find file handlers, and
+identify directly linked ELF technologies.
 
 ## Requirements
 
-Requires Linux desktop with GTK 3 and GIO, Flutter 3.44+, and Dart 3.12+.
-Use Flutter's standard Linux build tooling.
+Requires Linux desktop with GTK 3, GIO, and GLib (`gmodule-2.0`), Flutter
+3.44+, and Dart 3.12+. Use Flutter's standard Linux build tooling. Optional
+native libraries (`libflatpak`, `librpm`, `libalpm`, `libappstream`) are loaded
+dynamically at runtime only when available and are never required to build or
+run the plugin.
 
 [API reference](https://pub.dev/documentation/flutter_device_apps_linux/latest/flutter_device_apps_linux/)
 · [Guide to Linux desktop app discovery](doc/api-capabilities.md)
@@ -48,6 +53,67 @@ final matches = await FlutterDeviceAppsLinux.searchApps('image editor');
 
 Both methods return desktop entries that GIO considers visible in menus.
 Search results follow GIO's relevance order.
+
+### Discover normalized applications across local Linux sources
+
+```dart
+final inventory = await FlutterDeviceAppsLinux.discoverApps();
+for (final app in inventory.applications) {
+  print(
+    '${app.resolvedId}: ${app.metadata.name} '
+    '(installed: ${app.metadata.version}, '
+    'classification: ${app.classification.name})',
+  );
+}
+
+// Check per-provider execution status and diagnostics:
+for (final diag in inventory.providerDiagnostics) {
+  print('${diag.providerId}: ${diag.status.name} (${diag.discoveredCount})');
+}
+
+// Optionally restrict providers, skip AppStream, or include raw packages:
+final full = await FlutterDeviceAppsLinux.discoverApps(
+  includePackages: true,
+  includeAppStreamMetadata: true,
+  providers: const ['gio', 'flatpak', 'dpkg'],
+);
+print('Installed packages: ${full.packages.length}');
+```
+
+`discoverApps()` queries available local read-only sources, correlates and
+deduplicates verified installations, and returns an immutable
+`LinuxDiscoveryResult`:
+
+| Provider ID | Source | Runtime requirement |
+| --- | --- | --- |
+| `gio` | XDG `.desktop` entries | Built-in GIO (required) |
+| `flatpak` | User and system Flatpak installations | Optional `libflatpak` via `GModule` |
+| `snap` | Enabled Snap apps | Optional local `snapd` UNIX socket |
+| `dpkg` | Local DPKG status and file ownership | Optional local `/var/lib/dpkg` |
+| `rpm` | Local RPM database and file ownership | Optional `librpm` via `GModule` |
+| `pacman` | Local Pacman database and file ownership | Optional `libalpm` via `GModule` |
+| `nix` | Active local Nix profiles | Optional local Nix profile manifests |
+| `appstream` | Local AppStream MetaInfo / catalogs | Optional `libappstream` via `GModule` |
+
+Key immutable models returned by `discoverApps()`:
+
+- `LinuxDiscoveryResult`: `applications`, optional `packages` (empty unless
+  `includePackages: true`), `providerDiagnostics`, and top-level `ambiguities`.
+- `LinuxDiscoveredApp`: `resolvedId`, `primaryProvenance`, `sourceProvenances`,
+  `desktopEntries`, `metadata` (verified installed version), `catalogReleases`
+  (separate upstream AppStream release history), tri-state `capabilities`,
+  `desktopMenuVisibility`, `classification`, `metadataConflicts`, and
+  `ambiguities`.
+- `LinuxInstalledPackage`: raw system/profile package records kept strictly
+  separate from confirmed applications.
+
+Known limitations: missing optional libraries or inaccessible databases report
+`LinuxDiscoveryProviderStatus.unavailable` or `failed` without aborting the
+pass; desktop entries are never fabricated for desktop-less apps; classification
+remains `unknown` without authoritative evidence; and `resolvedId` changes if an
+RPM package transitions between single-version and simultaneous parallel
+installations. See [Guide to Linux desktop app discovery](doc/api-capabilities.md)
+for full details. Legacy `listApps()` remains GIO-only and unchanged.
 
 ### Get an app by desktop file ID
 
@@ -100,6 +166,7 @@ All methods below belong to `FlutterDeviceAppsLinux`.
 
 | Method | Purpose |
 | --- | --- |
+| `discoverApps` | Discover normalized applications across local Linux sources, with optional package inventory and provider diagnostics. |
 | `getAppIcon` | Get the app icon as PNG bytes. |
 | `openApp` | Request a launch through GIO and return whether it was accepted. |
 | `getAppMetadata` | Read homepage, developer, license, and description from local AppStream MetaInfo. |
@@ -107,9 +174,12 @@ All methods below belong to `FlutterDeviceAppsLinux`.
 
 ## Linux setup
 
-Discovery uses the desktop session's GIO and XDG data directories.
-Available entries and metadata depend on session visibility and filesystem access.
-See [Flutter's Linux setup](https://docs.flutter.dev/platform-integration/linux/setup)
+Desktop entry lookup uses the desktop session's GIO and XDG data directories.
+`discoverApps()` additionally inspects available local package databases,
+profiles, sockets, and optional shared libraries in read-only mode without
+executing package manager CLIs or network requests. Available entries and
+metadata depend on session visibility, installed providers, and filesystem
+permissions. See [Flutter's Linux setup](https://docs.flutter.dev/platform-integration/linux/setup)
 and the [Linux development example](example/README.md).
 
 ## Community Standards

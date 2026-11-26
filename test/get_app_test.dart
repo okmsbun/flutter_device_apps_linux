@@ -55,11 +55,67 @@ void main() {
     messenger.setMockMethodCallHandler(channel, (call) async {
       expect(call.method, 'listApps');
       expect(call.arguments, isNull);
-      return [minimal];
+      return [
+        {
+          ...minimal,
+          'supportsFiles': true,
+          'supportsUris': false,
+          'requiresTerminal': true,
+        },
+        {'desktopFileId': 'Second.desktop', 'appName': 'Second'},
+      ];
+    });
+    final apps = await FlutterDeviceAppsLinux.listApps();
+    expect(apps.map((app) => app.desktopFileId), [id, 'Second.desktop']);
+    expect(apps.first.appName, 'Editor');
+    expect(apps.first.supportsFiles, isTrue);
+    expect(apps.first.supportsUris, isFalse);
+    expect(apps.first.requiresTerminal, isTrue);
+    expect(apps.first.description, isNull);
+    expect(apps.first.desktopFilePath, isNull);
+    expect(apps.first.categories, isEmpty);
+    expect(apps.first.mimeTypes, isEmpty);
+    expect(apps.last.supportsFiles, isFalse);
+    expect(apps.last.supportsUris, isFalse);
+    expect(apps.last.requiresTerminal, isFalse);
+  });
+
+  test('handles empty and null listApps responses', () async {
+    List<Map<String, Object?>>? response = const [];
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      expect(call.method, 'listApps');
+      expect(call.arguments, isNull);
+      return response;
+    });
+    expect(await FlutterDeviceAppsLinux.listApps(), isEmpty);
+    response = null;
+    expect(await FlutterDeviceAppsLinux.listApps(), isEmpty);
+  });
+
+  test('preserves empty appName and ignores unknown internal fields', () async {
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      expect(call.method, 'listApps');
+      expect(call.arguments, isNull);
+      return [
+        {
+          'desktopFileId': id,
+          'appName': '',
+          'supportsFiles': false,
+          'supportsUris': true,
+          'requiresTerminal': false,
+          'applicationId': 'gio:$id',
+          'providerId': 'gio',
+        },
+      ];
     });
     final app = (await FlutterDeviceAppsLinux.listApps()).single;
     expect(app.desktopFileId, id);
-    expect(app.appName, 'Editor');
+    expect(app.appName, '');
+    expect(app.supportsFiles, isFalse);
+    expect(app.supportsUris, isTrue);
+    expect(app.requiresTerminal, isFalse);
+    expect(app.description, isNull);
+    expect(app.desktopFilePath, isNull);
     expect(app.categories, isEmpty);
     expect(app.mimeTypes, isEmpty);
   });
