@@ -180,7 +180,9 @@ profiles, sockets, and optional shared libraries in read-only mode without
 executing package manager CLIs or network requests. Available entries and
 metadata depend on session visibility, installed providers, and filesystem
 permissions. See [Flutter's Linux setup](https://docs.flutter.dev/platform-integration/linux/setup)
-and the [Linux development example](example/README.md).
+and the [Linux application explorer example](example/README.md) for a complete
+Material 3 app showcasing `discoverApps()`, package inventory browsing, provider
+diagnostics, launching, technology detection, and handler lookup.
 
 ## Community Standards
 

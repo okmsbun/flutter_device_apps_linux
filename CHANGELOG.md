@@ -1,3 +1,9 @@
+## 1.1.1
+
+- Redesigned the Linux example app into a Material 3 desktop application explorer powered by `FlutterDeviceAppsLinux.discoverApps()`.
+- Added a discovery statistics dashboard, master-detail application and installed package browsers, instant local search/sorting/filtering, provider diagnostics, metadata conflicts/ambiguities views, and Light/Dark/System themes.
+- Updated example widget tests, Linux integration tests, and documentation.
+
 ## 1.1.0
 
 - Added `FlutterDeviceAppsLinux.discoverApps()` for normalized, deduplicated Linux application discovery across local sources (GIO, Flatpak, Snap, DPKG, RPM, Pacman, Nix, and AppStream metadata).
