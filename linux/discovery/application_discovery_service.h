@@ -10,6 +10,7 @@
 
 #include "application_discovery_provider.h"
 #include "appstream_metadata_provider.h"
+#include "package_discovery_provider.h"
 
 namespace flutter_device_apps_linux {
 
@@ -48,8 +49,11 @@ struct ProviderExecutionSummary {
 };
 
 // Aggregated result of a discovery pass across all selected providers.
+// Confirmed application records and raw system-package inventory records remain
+// strictly separate collections.
 struct DiscoveryPassResult {
   std::vector<DiscoveredApplication> applications;
+  std::vector<InstalledPackageRecord> packages;
   std::vector<ProviderExecutionSummary> provider_summaries;
 };
 
@@ -87,8 +91,21 @@ class ApplicationDiscoveryService {
       const DiscoveryRequestOptions& options =
           DiscoveryRequestOptions::all_providers());
 
+  // Registers an installed-package inventory provider (for example, DPKG).
+  // Package records remain strictly separate from confirmed application records.
+  void register_package_provider(
+      std::unique_ptr<PackageDiscoveryProvider> provider);
+
+  // Returns the number of registered package inventory providers.
+  size_t package_provider_count() const;
+
   // Convenience entry point returning only collected applications.
   std::vector<DiscoveredApplication> discover_applications(
+      const DiscoveryRequestOptions& options =
+          DiscoveryRequestOptions::all_providers());
+
+  // Convenience entry point returning only collected system package records.
+  std::vector<InstalledPackageRecord> discover_packages(
       const DiscoveryRequestOptions& options =
           DiscoveryRequestOptions::all_providers());
 
@@ -108,6 +125,7 @@ class ApplicationDiscoveryService {
  private:
   mutable std::mutex mutex_;
   std::vector<std::unique_ptr<ApplicationDiscoveryProvider>> providers_;
+  std::vector<std::unique_ptr<PackageDiscoveryProvider>> package_providers_;
   std::unique_ptr<AppStreamMetadataProvider> metadata_provider_;
 };
 

@@ -43,6 +43,7 @@ jobs:
             linux/discovery/application_discovery_service.cc \
             linux/discovery/appstream_metadata_provider.cc \
             linux/discovery/async_discovery_runner.cc \
+            linux/discovery/dpkg_discovery_provider.cc \
             linux/discovery/flatpak_discovery_provider.cc \
             linux/discovery/legacy_list_apps_adapter.cc \
             linux/discovery/snap_discovery_provider.cc \
@@ -58,6 +59,7 @@ jobs:
             linux/discovery/application_discovery_service.cc \
             linux/discovery/appstream_metadata_provider.cc \
             linux/discovery/async_discovery_runner.cc \
+            linux/discovery/dpkg_discovery_provider.cc \
             linux/discovery/flatpak_discovery_provider.cc \
             linux/discovery/legacy_list_apps_adapter.cc \
             linux/discovery/snap_discovery_provider.cc \
@@ -296,6 +298,17 @@ jobs:
           EOF
 
           /tmp/appstream_metadata_provider_test --fixture "$as_dir/metainfo" "$as_dir/catalog"
+
+      - name: Run native DPKG dpkg-query parity test
+        run: |
+          clang++ -std=c++14 -Wall -Wextra -Wpedantic -Werror \
+            -fsanitize=address,undefined \
+            -Ilinux \
+            linux/discovery/application_identity.cc \
+            linux/discovery/dpkg_discovery_provider.cc \
+            linux/test/dpkg_discovery_provider_test.cc \
+            -o /tmp/dpkg_discovery_provider_test
+          /tmp/dpkg_discovery_provider_test
 
       - name: Run Linux integration tests
         run: bash example/tool/test_linux.sh

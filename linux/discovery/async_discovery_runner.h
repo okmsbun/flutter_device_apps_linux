@@ -23,6 +23,7 @@ enum class DiscoveryExecutionStatus {
 struct DiscoveryExecutionOutcome {
   DiscoveryExecutionStatus status = DiscoveryExecutionStatus::kCompleted;
   std::vector<DiscoveredApplication> applications;
+  std::vector<InstalledPackageRecord> packages;
   std::vector<ProviderExecutionSummary> provider_summaries;
   std::string error_message;
 };

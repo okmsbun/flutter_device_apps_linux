@@ -197,6 +197,7 @@ void AsyncDiscoveryRunner::run_worker_loop(
             state->service->discover_with_report(request.options);
         outcome.status = DiscoveryExecutionStatus::kCompleted;
         outcome.applications = std::move(pass.applications);
+        outcome.packages = std::move(pass.packages);
         outcome.provider_summaries = std::move(pass.provider_summaries);
       } catch (const std::exception& error) {
         outcome.status = DiscoveryExecutionStatus::kExecutionError;
@@ -216,6 +217,7 @@ void AsyncDiscoveryRunner::run_worker_loop(
     if (cancelled_after_run) {
       outcome.status = DiscoveryExecutionStatus::kCancelled;
       outcome.applications.clear();
+      outcome.packages.clear();
       outcome.provider_summaries.clear();
       outcome.error_message.clear();
     }

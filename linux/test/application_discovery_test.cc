@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -26,8 +27,11 @@
 #include "discovery/appstream_metadata_provider.h"
 #include "discovery/async_discovery_runner.h"
 #include "discovery/discovered_application.h"
+#include "discovery/dpkg_discovery_provider.h"
 #include "discovery/flatpak_discovery_provider.h"
+#include "discovery/installed_package.h"
 #include "discovery/legacy_list_apps_adapter.h"
+#include "discovery/package_discovery_provider.h"
 #include "discovery/snap_discovery_provider.h"
 #include "discovery/snapd_socket_backend.h"
 
@@ -59,6 +63,8 @@ using flutter_device_apps_linux::DiscoveryPassResult;
 using flutter_device_apps_linux::DiscoveryRequestHandle;
 using flutter_device_apps_linux::DiscoveryRequestOptions;
 using flutter_device_apps_linux::DiscoveryResult;
+using flutter_device_apps_linux::DpkgDiscoveryConfig;
+using flutter_device_apps_linux::DpkgDiscoveryProvider;
 using flutter_device_apps_linux::FlatpakBackend;
 using flutter_device_apps_linux::FlatpakBackendQueryResult;
 using flutter_device_apps_linux::FlatpakDiscoveryProvider;
@@ -66,10 +72,15 @@ using flutter_device_apps_linux::FlatpakInstallationQueryResult;
 using flutter_device_apps_linux::FlatpakInstalledAppRecord;
 using flutter_device_apps_linux::InstallationScope;
 using flutter_device_apps_linux::InstallationSource;
+using flutter_device_apps_linux::InstalledPackageRecord;
 using flutter_device_apps_linux::is_valid_legacy_desktop_file_id;
 using flutter_device_apps_linux::kFlatpakRefKindApp;
 using flutter_device_apps_linux::kFlatpakRefKindRuntime;
 using flutter_device_apps_linux::OptionalString;
+using flutter_device_apps_linux::PackageDiscoveryProvider;
+using flutter_device_apps_linux::PackageDiscoveryResult;
+using flutter_device_apps_linux::PackageInstallationState;
+using flutter_device_apps_linux::PackageSelectionState;
 using flutter_device_apps_linux::ProviderExecutionStatus;
 using flutter_device_apps_linux::SnapBackend;
 using flutter_device_apps_linux::SnapBackendQueryResult;
@@ -2208,6 +2219,365 @@ void test_appstream_metadata_fields_ambiguous_candidates_and_install_evidence() 
          "metainfo origin kind must be distinct from catalog origin kind");
 }
 
+// --- DpkgDiscoveryProvider tests ---
+
+class TempStatusFile {
+ public:
+  explicit TempStatusFile(const std::string& content) {
+    static std::atomic<int> counter{0};
+    path_ = "/tmp/fda-dpkg-" + std::to_string(getpid()) + "-" +
+            std::to_string(counter.fetch_add(1)) + ".status";
+    std::ofstream out(path_.c_str(), std::ios::binary | std::ios::trunc);
+    out.write(content.data(), static_cast<std::streamsize>(content.size()));
+  }
+
+  ~TempStatusFile() {
+    if (!path_.empty()) {
+      unlink(path_.c_str());
+    }
+  }
+
+  const std::string& path() const { return path_; }
+
+ private:
+  std::string path_;
+};
+
+class CountingPackageProvider final : public PackageDiscoveryProvider {
+ public:
+  CountingPackageProvider(std::string id, bool available,
+                          PackageDiscoveryResult result,
+                          std::atomic<int>* avail_calls,
+                          std::atomic<int>* disc_calls)
+      : id_(std::move(id)),
+        available_(available),
+        result_(std::move(result)),
+        avail_calls_(avail_calls),
+        disc_calls_(disc_calls) {}
+
+  const char* id() const override { return id_.c_str(); }
+
+  bool is_available() const override {
+    if (avail_calls_ != nullptr) avail_calls_->fetch_add(1);
+    return available_;
+  }
+
+  PackageDiscoveryResult discover_packages() override {
+    if (disc_calls_ != nullptr) disc_calls_->fetch_add(1);
+    return result_;
+  }
+
+ private:
+  std::string id_;
+  bool available_;
+  PackageDiscoveryResult result_;
+  std::atomic<int>* avail_calls_;
+  std::atomic<int>* disc_calls_;
+};
+
+void test_dpkg_missing_empty_and_unreadable_databases() {
+  // Missing file.
+  {
+    DpkgDiscoveryConfig cfg;
+    cfg.status_file_path = "/tmp/fda-dpkg-does-not-exist-99999.status";
+    DpkgDiscoveryProvider provider(cfg);
+    expect(std::string(provider.id()) == "dpkg",
+           "DpkgDiscoveryProvider id() must be dpkg");
+    expect(!provider.is_available(),
+           "missing dpkg status file must report unavailable");
+    expect(!provider.discover_packages().ok,
+           "missing dpkg status file query must fail cleanly");
+  }
+
+  // Non-regular path (directory).
+  {
+    DpkgDiscoveryConfig cfg;
+    cfg.status_file_path = "/tmp";
+    DpkgDiscoveryProvider provider(cfg);
+    expect(!provider.is_available(),
+           "directory path must not be treated as valid dpkg status file");
+  }
+
+  // Empty database -> succeeds with 0 packages.
+  {
+    TempStatusFile empty("");
+    DpkgDiscoveryConfig cfg;
+    cfg.status_file_path = empty.path();
+    DpkgDiscoveryProvider provider(cfg);
+    expect(provider.is_available(), "empty status file should be available");
+    const PackageDiscoveryResult res = provider.discover_packages();
+    expect(res.ok && res.packages.empty() && res.error_message.empty(),
+           "empty dpkg status file must succeed cleanly with 0 packages");
+  }
+}
+
+void test_dpkg_states_multiarch_multiline_missing_fields_and_upgrade_id() {
+  const std::string status_db =
+      // 1. Standard installed package with arbitrary field ordering,
+      // case-insensitive field names, and multiline description with '.' break.
+      "Version: 14.1.0-1\n"
+      "Architecture: amd64\n"
+      "status: install ok installed\n"
+      "Package: ripgrep\n"
+      "Section: utils\n"
+      "Priority: optional\n"
+      "Homepage: https://github.com/BurntSushi/ripgrep\n"
+      "Maintainer: Debian Rust Maintainers <pkg-rust@example.org>\n"
+      "Description: Recursively searches directories for a regex pattern\n"
+      " ripgrep is a line-oriented search tool.\n"
+      " .\n"
+      " It respects gitignore rules by default.\n"
+      "\n"
+      // 2. Held package -> MUST be included with selection=kHold,
+      // installation=kInstalled.
+      "Package: vim\n"
+      "Status: hold ok installed\n"
+      "Architecture: amd64\n"
+      "Version: 2:9.1.0-1\n"
+      "\n"
+      // 3. Multi-arch packages (same name, distinct architectures) + pending
+      // triggers -> BOTH MUST be included with distinct identities!
+      "Package: libc6\n"
+      "Status: install ok triggers-pending\n"
+      "Architecture: amd64\n"
+      "Version: 2.39-0ubuntu8\n"
+      "\n"
+      "Package: libc6\n"
+      "Status: hold ok triggers-awaited\n"
+      "Architecture: i386\n"
+      "Version: 2.39-0ubuntu8\n"
+      "\n"
+      // 4. Marked for deinstall, but STILL actually installed -> MUST be
+      // included with selection=kDeinstall, installation=kInstalled.
+      "Package: tzdata\n"
+      "Status: deinstall ok installed\n"
+      "Architecture: all\n"
+      "Version: 2024a-2\n"
+      "\n"
+      // 5. Residual config only (removed) -> EXCLUDED.
+      "Package: removed-rc\n"
+      "Status: deinstall ok config-files\n"
+      "Architecture: amd64\n"
+      "Version: 1.0-1\n"
+      "\n"
+      // 6. Not installed -> EXCLUDED.
+      "Package: purged-pkg\n"
+      "Status: purge ok not-installed\n"
+      "Architecture: amd64\n"
+      "\n"
+      // 7. Broken reinstreq -> EXCLUDED even if status says installed!
+      "Package: broken-reinstreq\n"
+      "Status: install reinstreq installed\n"
+      "Architecture: amd64\n"
+      "Version: 1.0-1\n"
+      "\n"
+      // 8. Half-installed / unpacked / half-configured -> ALL EXCLUDED.
+      "Package: partial-half-inst\n"
+      "Status: install ok half-installed\n"
+      "Architecture: amd64\n"
+      "Version: 1.0-1\n"
+      "\n"
+      "Package: partial-unpacked\n"
+      "Status: install ok unpacked\n"
+      "Architecture: amd64\n"
+      "Version: 1.0-1\n"
+      "\n"
+      "Package: partial-half-conf\n"
+      "Status: install ok half-configured\n"
+      "Architecture: amd64\n"
+      "Version: 1.0-1\n";
+
+  TempStatusFile db_file(status_db);
+  DpkgDiscoveryConfig cfg;
+  cfg.status_file_path = db_file.path();
+  DpkgDiscoveryProvider provider(cfg);
+  const PackageDiscoveryResult res = provider.discover_packages();
+
+  expect(res.ok && res.error_message.empty(),
+         "valid dpkg status DB should parse cleanly with no diagnostics");
+  expect(res.packages.size() == 5,
+         "must include installed, held, deinstall-still-installed, and "
+         "triggers-pending/awaited while excluding removed/broken/partial");
+  if (res.packages.size() != 5) return;
+
+  const auto& rg = res.packages[0];
+  const auto& vim = res.packages[1];
+  const auto& libc_amd64 = res.packages[2];
+  const auto& libc_i386 = res.packages[3];
+  const auto& tzdata = res.packages[4];
+
+  expect(rg.package_identity_id == "dpkg:ripgrep:system:amd64",
+         "dpkg identity must encode provider, package name, scope, and arch");
+  expect(rg.provenance.provider_id == "dpkg" &&
+             rg.provenance.native_id == "ripgrep" &&
+             rg.provenance.installation_source == InstallationSource::kDpkg &&
+             rg.provenance.installation_scope == InstallationScope::kSystem,
+         "DPKG provenance must match contract");
+  expect(rg.version.has_value() && rg.version.value() == "14.1.0-1",
+         "installed version must be parsed");
+  expect(rg.section.has_value() && rg.section.value() == "utils" &&
+             rg.priority.has_value() && rg.priority.value() == "optional" &&
+             rg.homepage.has_value() &&
+             rg.homepage.value() == "https://github.com/BurntSushi/ripgrep" &&
+             rg.maintainer.has_value() &&
+             rg.maintainer.value() ==
+                 "Debian Rust Maintainers <pkg-rust@example.org>",
+         "optional DPKG metadata fields must be preserved");
+  expect(rg.summary.has_value() &&
+             rg.summary.value() ==
+                 "Recursively searches directories for a regex pattern",
+         "first line of Description must populate summary");
+  expect(rg.description.has_value() &&
+             rg.description.value() ==
+                 "ripgrep is a line-oriented search tool.\n\nIt respects "
+                 "gitignore rules by default.",
+         "multiline continuation lines with '.' paragraph break must decode");
+  expect(rg.installation_state == PackageInstallationState::kInstalled &&
+             rg.selection_state == PackageSelectionState::kInstall &&
+             rg.classification == ApplicationClassification::kUnknown,
+         "state and unknown classification must be preserved");
+
+  // Held package with missing optional metadata.
+  expect(vim.package_identity_id == "dpkg:vim:system:amd64" &&
+             vim.selection_state == PackageSelectionState::kHold &&
+             vim.installation_state == PackageInstallationState::kInstalled,
+         "held installed package must preserve hold selection + installed state");
+  expect(!vim.summary.has_value() && !vim.description.has_value() &&
+             !vim.section.has_value() && !vim.priority.has_value() &&
+             !vim.homepage.has_value() && !vim.maintainer.has_value(),
+         "missing optional fields must remain unset");
+
+  // Multi-arch + trigger states.
+  expect(libc_amd64.package_identity_id == "dpkg:libc6:system:amd64" &&
+             libc_i386.package_identity_id == "dpkg:libc6:system:i386" &&
+             libc_amd64.package_identity_id != libc_i386.package_identity_id,
+         "multi-arch packages must have distinct identities");
+  expect(libc_amd64.installation_state ==
+             PackageInstallationState::kTriggersPending &&
+             libc_i386.installation_state ==
+                 PackageInstallationState::kTriggersAwaited &&
+             libc_i386.selection_state == PackageSelectionState::kHold,
+         "triggers-pending and triggers-awaited states must be distinguished");
+
+  expect(tzdata.package_identity_id == "dpkg:tzdata:system:all" &&
+             tzdata.selection_state == PackageSelectionState::kDeinstall &&
+             tzdata.installation_state == PackageInstallationState::kInstalled,
+         "deinstall-selected package that is still installed must preserve "
+         "actual installed state");
+
+  // Stable identity across version upgrade.
+  const std::string upgraded_db =
+      "Package: ripgrep\n"
+      "Status: install ok installed\n"
+      "Architecture: amd64\n"
+      "Version: 15.0.0-2\n";
+  TempStatusFile upgraded_file(upgraded_db);
+  DpkgDiscoveryConfig upgraded_cfg;
+  upgraded_cfg.status_file_path = upgraded_file.path();
+  const PackageDiscoveryResult upgraded_res =
+      DpkgDiscoveryProvider(upgraded_cfg).discover_packages();
+  expect(upgraded_res.ok && upgraded_res.packages.size() == 1 &&
+             upgraded_res.packages[0].package_identity_id ==
+                 rg.package_identity_id &&
+             upgraded_res.packages[0].version.value() == "15.0.0-2",
+         "DPKG package identity must stay stable across version upgrades");
+}
+
+void test_dpkg_malformed_duplicate_and_legacy_isolation() {
+  // Partial malformed + duplicate stanzas -> valid packages returned with
+  // partial-failure diagnostics.
+  const std::string mixed_db =
+      " this line starts with space before any field\n"
+      "Package: broken-stanza\n"
+      "\n"
+      "NotAValidHeaderLineWithoutColon\n"
+      "\n"
+      "Package: curl\n"
+      "Status: install ok installed\n"
+      "Architecture: amd64\n"
+      "Version: 8.5.0-1\n"
+      "\n"
+      "Package: curl\n"
+      "Status: install ok installed\n"
+      "Architecture: amd64\n"
+      "Version: 8.5.0-2\n";
+  TempStatusFile mixed_file(mixed_db);
+  DpkgDiscoveryConfig mixed_cfg;
+  mixed_cfg.status_file_path = mixed_file.path();
+
+  ApplicationDiscoveryService service;
+  service.register_provider(std::make_unique<FakeDiscoveryProvider>(
+      "gio", true, []() {
+        DiscoveryResult r;
+        r.applications.push_back(make_gio_app(
+            "org.example.Visible.desktop", "Visible", true, false, false));
+        return r;
+      }()));
+  service.register_package_provider(
+      std::make_unique<DpkgDiscoveryProvider>(mixed_cfg));
+
+  // Unified discovery separates confirmed applications from raw packages and
+  // surfaces partial-failure diagnostics on dpkg.
+  const DiscoveryPassResult unified =
+      service.discover_with_report(DiscoveryRequestOptions::all_providers());
+  expect(unified.applications.size() == 1 &&
+             unified.applications[0].provenance.provider_id == "gio",
+         "DPKG packages must NEVER appear in confirmed applications vector");
+  expect(unified.packages.size() == 1 &&
+             unified.packages[0].package_name == "curl" &&
+             unified.packages[0].version.value() == "8.5.0-2",
+         "duplicate package stanza should resolve deterministically");
+  expect(unified.provider_summaries.size() == 2 &&
+             unified.provider_summaries[1].provider_id == "dpkg" &&
+             unified.provider_summaries[1].status ==
+                 ProviderExecutionStatus::kPartiallyFailed &&
+             unified.provider_summaries[1].error_message.find("malformed") !=
+                 std::string::npos &&
+             unified.provider_summaries[1].error_message.find("duplicate") !=
+                 std::string::npos,
+         "malformed and duplicate stanzas must preserve partial diagnostics");
+
+  // All-malformed database -> fails cleanly instead of returning empty success.
+  TempStatusFile all_bad("garbage without colon\n\nPackage: missing-status\n");
+  DpkgDiscoveryConfig bad_cfg;
+  bad_cfg.status_file_path = all_bad.path();
+  const PackageDiscoveryResult bad_res =
+      DpkgDiscoveryProvider(bad_cfg).discover_packages();
+  expect(!bad_res.ok && bad_res.packages.empty(),
+         "all-malformed status file must fail rather than report empty success");
+
+  // Legacy listApps() GIO-only isolation via AsyncDiscoveryRunner: DPKG must
+  // NEVER check availability or read the database!
+  std::atomic<int> dpkg_avail{0};
+  std::atomic<int> dpkg_disc{0};
+  auto isolated_service = std::make_shared<ApplicationDiscoveryService>();
+  isolated_service->register_provider(
+      std::make_unique<FakeDiscoveryProvider>("gio", true, DiscoveryResult{}));
+  isolated_service->register_package_provider(
+      std::make_unique<CountingPackageProvider>(
+          "dpkg", true, PackageDiscoveryResult{}, &dpkg_avail, &dpkg_disc));
+
+  TestPlatformLoop loop;
+  WorkerPoolFixture pool;
+  AsyncDiscoveryRunner runner(
+      isolated_service, pool.scheduler(),
+      [&loop](std::function<void()> cb) { loop.post(std::move(cb)); });
+
+  DiscoveryExecutionOutcome legacy_outcome;
+  runner.discover_async(
+      [&](DiscoveryExecutionOutcome outcome) {
+        legacy_outcome = std::move(outcome);
+      },
+      DiscoveryRequestOptions::only_providers({"gio"}));
+  loop.run_one();
+  pool.join_all();
+
+  expect(dpkg_avail.load() == 0 && dpkg_disc.load() == 0,
+         "legacy GIO-only listApps() must not run DPKG availability or parsing");
+  expect(legacy_outcome.packages.empty(),
+         "legacy GIO-only outcome must contain no package inventory records");
+}
+
 }  // namespace
 
 int main() {
@@ -2236,6 +2606,9 @@ int main() {
   test_snapd_socket_backend_end_to_end();
   test_appstream_missing_library_unsupported_abi_and_malformed_errors();
   test_appstream_metadata_fields_ambiguous_candidates_and_install_evidence();
+  test_dpkg_missing_empty_and_unreadable_databases();
+  test_dpkg_states_multiarch_multiline_missing_fields_and_upgrade_id();
+  test_dpkg_malformed_duplicate_and_legacy_isolation();
 
   if (g_failures > 0) {
     std::cerr << g_failures << " test assertion(s) failed.\n";
