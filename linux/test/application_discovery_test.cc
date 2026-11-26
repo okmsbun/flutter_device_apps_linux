@@ -32,6 +32,7 @@
 #include "discovery/installed_package.h"
 #include "discovery/legacy_list_apps_adapter.h"
 #include "discovery/package_discovery_provider.h"
+#include "discovery/pacman_discovery_provider.h"
 #include "discovery/rpm_discovery_provider.h"
 #include "discovery/snap_discovery_provider.h"
 #include "discovery/snapd_socket_backend.h"
@@ -81,8 +82,16 @@ using flutter_device_apps_linux::OptionalString;
 using flutter_device_apps_linux::PackageDiscoveryProvider;
 using flutter_device_apps_linux::PackageDiscoveryResult;
 using flutter_device_apps_linux::PackageInstallationState;
+using flutter_device_apps_linux::PackageInstallReason;
 using flutter_device_apps_linux::PackageSelectionState;
+using flutter_device_apps_linux::PacmanBackend;
+using flutter_device_apps_linux::PacmanBackendQueryResult;
+using flutter_device_apps_linux::PacmanDiscoveryProvider;
+using flutter_device_apps_linux::PacmanInstalledPackageRecord;
+using flutter_device_apps_linux::PacmanQueryErrorKind;
+using flutter_device_apps_linux::PacmanResolvedPaths;
 using flutter_device_apps_linux::ProviderExecutionStatus;
+using flutter_device_apps_linux::resolve_pacman_db_paths;
 using flutter_device_apps_linux::RpmBackend;
 using flutter_device_apps_linux::RpmBackendQueryResult;
 using flutter_device_apps_linux::RpmDiscoveryProvider;
@@ -2836,6 +2845,319 @@ void test_rpm_metadata_multiarch_multi_version_and_legacy_isolation() {
          "missing optional RPM fields must stay unset");
 }
 
+// --- PacmanDiscoveryProvider tests ---
+
+class FakePacmanBackend final : public PacmanBackend {
+ public:
+  FakePacmanBackend(bool available, PacmanBackendQueryResult result,
+                    std::string abi = "libalpm.so.16",
+                    std::string availability_err = "",
+                    std::atomic<int>* avail_calls = nullptr,
+                    std::atomic<int>* list_calls = nullptr)
+      : available_(available),
+        result_(std::move(result)),
+        abi_(std::move(abi)),
+        availability_error_(std::move(availability_err)),
+        avail_calls_(avail_calls),
+        list_calls_(list_calls) {}
+
+  bool is_available() const override {
+    if (avail_calls_ != nullptr) avail_calls_->fetch_add(1);
+    return available_;
+  }
+
+  std::string availability_error() const override {
+    return availability_error_;
+  }
+
+  std::string abi_description() const override { return abi_; }
+
+  PacmanBackendQueryResult list_installed_packages() override {
+    if (list_calls_ != nullptr) list_calls_->fetch_add(1);
+    return result_;
+  }
+
+ private:
+  bool available_;
+  PacmanBackendQueryResult result_;
+  std::string abi_;
+  std::string availability_error_;
+  std::atomic<int>* avail_calls_;
+  std::atomic<int>* list_calls_;
+};
+
+void test_pacman_conf_resolution() {
+  // Missing pacman.conf -> standard defaults.
+  {
+    const PacmanResolvedPaths p =
+        resolve_pacman_db_paths("/tmp/fda-pacman-conf-missing-99999.conf");
+    expect(p.root_dir == "/" && p.db_path == "/var/lib/pacman/",
+           "missing pacman.conf must fall back to / and /var/lib/pacman/");
+  }
+
+  // RootDir without DBPath -> derives <RootDir>/var/lib/pacman/.
+  {
+    TempStatusFile conf(
+        "# Comment line\n"
+        "[options]\n"
+        "RootDir = /mnt/arch\n"
+        "[core]\n"
+        "DBPath = /should/be/ignored\n");
+    const PacmanResolvedPaths p = resolve_pacman_db_paths(conf.path());
+    expect(p.root_dir == "/mnt/arch" &&
+               p.db_path == "/mnt/arch/var/lib/pacman/",
+           "RootDir without explicit DBPath must derive <RootDir>/var/lib/pacman/");
+  }
+
+  // Explicit DBPath in [options] and non-[options] section isolation.
+  {
+    TempStatusFile conf(
+        "  # Leading comment\n"
+        "[core]\n"
+        "DBPath = /wrong/before/options\n"
+        "[options]\n"
+        "  DBPath = /custom/pacman/db  \n"
+        "  # DBPath = /commented/out\n"
+        "[extra]\n"
+        "DBPath = /wrong/after/options\n");
+    const PacmanResolvedPaths p = resolve_pacman_db_paths(conf.path());
+    expect(p.root_dir == "/" && p.db_path == "/custom/pacman/db",
+           "pacman.conf [options] DBPath must be respected while ignoring other sections");
+
+    // Explicit overrides take precedence over pacman.conf.
+    const PacmanResolvedPaths overridden =
+        resolve_pacman_db_paths(conf.path(), "/override/root", "/override/db");
+    expect(overridden.root_dir == "/override/root" &&
+               overridden.db_path == "/override/db",
+           "explicit root_dir/db_path overrides must take precedence over pacman.conf");
+  }
+}
+
+void test_pacman_availability_abi_empty_and_provider_failures() {
+  PacmanDiscoveryProvider null_provider(nullptr);
+  expect(std::string(null_provider.id()) == "pacman",
+         "PacmanDiscoveryProvider id() must be pacman");
+  expect(!null_provider.is_available(), "null Pacman backend is unavailable");
+  expect(!null_provider.discover_packages().ok,
+         "null Pacman backend discover_packages() must fail cleanly");
+
+  // Missing library / unsupported ABI diagnostic surfaced.
+  {
+    PacmanDiscoveryProvider provider(std::make_unique<FakePacmanBackend>(
+        false, PacmanBackendQueryResult{}, "unavailable",
+        "missing required symbols in libalpm.so.16: alpm_db_get_pkgcache"));
+    const PackageDiscoveryResult res = provider.discover_packages();
+    expect(!res.ok && res.error_message.find("missing required symbols") !=
+                          std::string::npos,
+           "Pacman availability_error() diagnostic must be surfaced");
+  }
+
+  // Empty local Pacman database -> kSucceeded with 0 packages.
+  {
+    ApplicationDiscoveryService service;
+    service.register_package_provider(std::make_unique<PacmanDiscoveryProvider>(
+        std::make_unique<FakePacmanBackend>(true,
+                                            PacmanBackendQueryResult{})));
+    const DiscoveryPassResult pass = service.discover_with_report();
+    expect(pass.packages.empty() && pass.provider_summaries.size() == 1 &&
+               pass.provider_summaries[0].provider_id == "pacman" &&
+               pass.provider_summaries[0].status ==
+                   ProviderExecutionStatus::kSucceeded,
+           "empty Pacman local database must succeed cleanly with 0 packages");
+  }
+
+  // Inaccessible DB / permission failure isolation alongside GIO.
+  {
+    PacmanBackendQueryResult perm_err;
+    perm_err.ok = false;
+    perm_err.error_kind = PacmanQueryErrorKind::kPermissionDenied;
+    perm_err.error_message = "/var/lib/pacman/local: Permission denied";
+
+    ApplicationDiscoveryService service;
+    service.register_provider(std::make_unique<FakeDiscoveryProvider>(
+        "gio", true, []() {
+          DiscoveryResult r;
+          r.applications.push_back(make_gio_app(
+              "org.example.Visible.desktop", "Visible", true, false, false));
+          return r;
+        }()));
+    service.register_package_provider(std::make_unique<PacmanDiscoveryProvider>(
+        std::make_unique<FakePacmanBackend>(true, std::move(perm_err))));
+
+    const DiscoveryPassResult pass = service.discover_with_report();
+    expect(pass.applications.size() == 1 && pass.packages.empty(),
+           "Pacman failure must not impact GIO discovery");
+    expect(pass.provider_summaries.size() == 2 &&
+               pass.provider_summaries[1].provider_id == "pacman" &&
+               pass.provider_summaries[1].status ==
+                   ProviderExecutionStatus::kFailed &&
+               pass.provider_summaries[1].error_message.find(
+                   "permission denied") != std::string::npos,
+           "Pacman permission failure must be reported cleanly");
+  }
+}
+
+void test_pacman_metadata_reasons_upgrade_id_malformed_and_legacy_isolation() {
+  PacmanBackendQueryResult query;
+
+  // 1. Explicitly installed package with full metadata (licenses, groups,
+  // packager, homepage, description).
+  {
+    PacmanInstalledPackageRecord pkg;
+    pkg.name = "ripgrep";
+    pkg.version = OptionalString::of("14.1.1-1");
+    pkg.architecture = OptionalString::of("x86_64");
+    pkg.description = OptionalString::of(
+        "A search tool that combines the usability of ag with the raw speed of grep");
+    pkg.homepage = OptionalString::of("https://github.com/BurntSushi/ripgrep");
+    pkg.licenses = {"MIT", "Unlicense"};
+    pkg.groups = {"cli-tools", "rust-utils"};
+    pkg.packager = OptionalString::of("Arch Packager <pkg@archlinux.org>");
+    pkg.install_reason = PackageInstallReason::kExplicit;
+    query.packages.push_back(std::move(pkg));
+  }
+  // 2. Dependency-installed package with minimal optional metadata.
+  {
+    PacmanInstalledPackageRecord pkg;
+    pkg.name = "pcre2";
+    pkg.version = OptionalString::of("10.44-1");
+    pkg.architecture = OptionalString::of("x86_64");
+    pkg.install_reason = PackageInstallReason::kDependency;
+    query.packages.push_back(std::move(pkg));
+  }
+  // 3. Package with unknown install reason and arch=any.
+  {
+    PacmanInstalledPackageRecord pkg;
+    pkg.name = "archlinux-keyring";
+    pkg.version = OptionalString::of("20250101-1");
+    pkg.architecture = OptionalString::of("any");
+    pkg.install_reason = PackageInstallReason::kUnknown;
+    query.packages.push_back(std::move(pkg));
+  }
+  // 4. Malformed empty-name record -> skipped with partial diagnostic.
+  {
+    PacmanInstalledPackageRecord bad;
+    bad.version = OptionalString::of("1.0-1");
+    query.packages.push_back(std::move(bad));
+  }
+  // 5. Duplicate record -> skipped with partial diagnostic.
+  {
+    PacmanInstalledPackageRecord dup;
+    dup.name = "ripgrep";
+    dup.version = OptionalString::of("14.1.1-1");
+    dup.architecture = OptionalString::of("x86_64");
+    query.packages.push_back(std::move(dup));
+  }
+
+  std::atomic<int> pacman_avail{0};
+  std::atomic<int> pacman_list{0};
+  auto service = std::make_shared<ApplicationDiscoveryService>();
+  service->register_provider(
+      std::make_unique<FakeDiscoveryProvider>("gio", true, DiscoveryResult{}));
+  service->register_package_provider(std::make_unique<PacmanDiscoveryProvider>(
+      std::make_unique<FakePacmanBackend>(true, std::move(query),
+                                          "libalpm.so.16", "", &pacman_avail,
+                                          &pacman_list)));
+
+  // Legacy GIO-only listApps() must NOT invoke Pacman availability or queries!
+  const DiscoveryPassResult legacy = service->discover_with_report(
+      DiscoveryRequestOptions::only_providers({"gio"}));
+  expect(pacman_avail.load() == 0 && pacman_list.load() == 0 &&
+             legacy.packages.empty(),
+         "legacy GIO-only path must never invoke Pacman provider");
+
+  // Also verify GIO-only isolation through AsyncDiscoveryRunner.
+  {
+    TestPlatformLoop loop;
+    WorkerPoolFixture pool;
+    AsyncDiscoveryRunner runner(
+        service, pool.scheduler(),
+        [&loop](std::function<void()> cb) { loop.post(std::move(cb)); });
+    DiscoveryExecutionOutcome async_legacy;
+    runner.discover_async(
+        [&](DiscoveryExecutionOutcome outcome) {
+          async_legacy = std::move(outcome);
+        },
+        DiscoveryRequestOptions::only_providers({"gio"}));
+    loop.run_one();
+    pool.join_all();
+    expect(pacman_avail.load() == 0 && pacman_list.load() == 0 &&
+               async_legacy.packages.empty(),
+           "async legacy GIO-only path must never invoke Pacman provider");
+  }
+
+  // Full unified discovery separates Pacman packages from applications.
+  const DiscoveryPassResult unified = service->discover_with_report(
+      DiscoveryRequestOptions::all_providers());
+  expect(unified.applications.empty(),
+         "Pacman packages must never appear in confirmed applications vector");
+  expect(unified.packages.size() == 3,
+         "3 valid Pacman packages must be returned while malformed/duplicate "
+         "entries are skipped");
+  expect(unified.provider_summaries.size() == 2 &&
+             unified.provider_summaries[1].provider_id == "pacman" &&
+             unified.provider_summaries[1].status ==
+                 ProviderExecutionStatus::kPartiallyFailed,
+         "malformed/duplicate Pacman entries must surface kPartiallyFailed");
+  if (unified.packages.size() != 3) return;
+
+  const auto& rg = unified.packages[0];
+  const auto& pcre2 = unified.packages[1];
+  const auto& keyring = unified.packages[2];
+
+  expect(rg.package_identity_id == "pacman:ripgrep:system:x86_64" &&
+             rg.provenance.provider_id == "pacman" &&
+             rg.provenance.native_id == "ripgrep" &&
+             rg.provenance.installation_source == InstallationSource::kPacman &&
+             rg.provenance.installation_scope == InstallationScope::kSystem &&
+             rg.installation_state == PackageInstallationState::kInstalled &&
+             rg.classification == ApplicationClassification::kUnknown,
+         "Pacman provenance, state, identity, and unknown classification must match");
+  expect(rg.version.has_value() && rg.version.value() == "14.1.1-1" &&
+             rg.architecture.has_value() &&
+             rg.architecture.value() == "x86_64" &&
+             rg.description.has_value() &&
+             rg.homepage.has_value() &&
+             rg.homepage.value() == "https://github.com/BurntSushi/ripgrep" &&
+             rg.packager.has_value() &&
+             rg.packager.value() == "Arch Packager <pkg@archlinux.org>" &&
+             rg.licenses.size() == 2 && rg.licenses[0] == "MIT" &&
+             rg.licenses[1] == "Unlicense" &&
+             rg.groups.size() == 2 && rg.groups[0] == "cli-tools" &&
+             rg.groups[1] == "rust-utils" &&
+             rg.install_reason == PackageInstallReason::kExplicit,
+         "authoritative Pacman metadata fields must be preserved");
+
+  expect(pcre2.install_reason == PackageInstallReason::kDependency &&
+             !pcre2.description.has_value() && !pcre2.homepage.has_value() &&
+             !pcre2.packager.has_value() && pcre2.licenses.empty() &&
+             pcre2.groups.empty(),
+         "dependency reason and missing optional fields must remain accurate");
+  expect(keyring.package_identity_id == "pacman:archlinux-keyring:system:any" &&
+             keyring.install_reason == PackageInstallReason::kUnknown,
+         "unknown install reason and arch=any identity must be preserved");
+
+  // Stable package_identity_id across version upgrade.
+  PacmanBackendQueryResult upgraded;
+  {
+    PacmanInstalledPackageRecord pkg;
+    pkg.name = "ripgrep";
+    pkg.version = OptionalString::of("15.0.0-1");
+    pkg.architecture = OptionalString::of("x86_64");
+    pkg.install_reason = PackageInstallReason::kExplicit;
+    upgraded.packages.push_back(std::move(pkg));
+  }
+  PacmanDiscoveryProvider upgraded_provider(std::make_unique<FakePacmanBackend>(
+      true, std::move(upgraded)));
+  const PackageDiscoveryResult upgraded_res =
+      upgraded_provider.discover_packages();
+  expect(upgraded_res.ok && upgraded_res.packages.size() == 1 &&
+             upgraded_res.packages[0].package_identity_id ==
+                 rg.package_identity_id &&
+             upgraded_res.packages[0].version.value() == "15.0.0-1",
+         "Pacman package_identity_id must stay stable across version upgrades");
+}
+
 }  // namespace
 
 int main() {
@@ -2869,6 +3191,9 @@ int main() {
   test_dpkg_malformed_duplicate_and_legacy_isolation();
   test_rpm_availability_abi_empty_and_provider_failures();
   test_rpm_metadata_multiarch_multi_version_and_legacy_isolation();
+  test_pacman_conf_resolution();
+  test_pacman_availability_abi_empty_and_provider_failures();
+  test_pacman_metadata_reasons_upgrade_id_malformed_and_legacy_isolation();
 
   if (g_failures > 0) {
     std::cerr << g_failures << " test assertion(s) failed.\n";

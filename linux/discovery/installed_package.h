@@ -2,6 +2,7 @@
 #define FLUTTER_DEVICE_APPS_LINUX_DISCOVERY_INSTALLED_PACKAGE_H_
 
 #include <string>
+#include <vector>
 
 #include "discovered_application.h"
 
@@ -23,6 +24,14 @@ enum class PackageSelectionState {
   kHold,
   kDeinstall,
   kPurge,
+};
+
+// Authoritative installation reason recorded by the package manager
+// (for example, libalpm ALPM_PKG_REASON_EXPLICIT / ALPM_PKG_REASON_DEPEND).
+enum class PackageInstallReason {
+  kUnknown,
+  kExplicit,
+  kDependency,
 };
 
 // Internal installed system-package inventory record.
@@ -54,16 +63,20 @@ struct InstalledPackageRecord {
   OptionalString description;
   OptionalString section;
   OptionalString package_group;
+  std::vector<std::string> groups;
   OptionalString priority;
   OptionalString license;
+  std::vector<std::string> licenses;
   OptionalString homepage;
   OptionalString maintainer;
+  OptionalString packager;
   OptionalString vendor;
 
-  // Actual installation state vs desired selection state.
+  // Actual installation state, desired selection state, and install reason.
   PackageInstallationState installation_state =
       PackageInstallationState::kUnknown;
   PackageSelectionState selection_state = PackageSelectionState::kUnknown;
+  PackageInstallReason install_reason = PackageInstallReason::kUnknown;
 
   // Classification remains kUnknown unless authoritative evidence (such as
   // future AppStream or desktop integration matching) establishes it.

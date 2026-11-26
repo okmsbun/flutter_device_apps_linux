@@ -62,10 +62,11 @@ jobs:
       - name: Install Linux build and test dependencies
         run: |
           sudo apt-get update
-          # Note: intentionally install flatpak, libflatpak0, rpm, and
-          # libappstream runtime shared libraries without -dev packages, proving
-          # the plugin builds without compile-time or link-time headers.
-          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev libstdc++-12-dev libgl1-mesa-dri shared-mime-info xvfb xauth flatpak libflatpak0 rpm
+          # Note: intentionally install flatpak, libflatpak0, rpm,
+          # pacman-package-manager, and libappstream runtime shared libraries
+          # without -dev packages, proving the plugin builds without
+          # compile-time or link-time headers.
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev libstdc++-12-dev libgl1-mesa-dri shared-mime-info xvfb xauth flatpak libflatpak0 rpm pacman-package-manager
           sudo apt-get install -y libappstream5 || sudo apt-get install -y libappstream4
 
       - name: Install dependencies
@@ -83,6 +84,7 @@ jobs:
             linux/discovery/dpkg_discovery_provider.cc \
             linux/discovery/flatpak_discovery_provider.cc \
             linux/discovery/legacy_list_apps_adapter.cc \
+            linux/discovery/pacman_discovery_provider.cc \
             linux/discovery/rpm_discovery_provider.cc \
             linux/discovery/snap_discovery_provider.cc \
             linux/discovery/snapd_socket_backend.cc \
@@ -100,6 +102,7 @@ jobs:
             linux/discovery/dpkg_discovery_provider.cc \
             linux/discovery/flatpak_discovery_provider.cc \
             linux/discovery/legacy_list_apps_adapter.cc \
+            linux/discovery/pacman_discovery_provider.cc \
             linux/discovery/rpm_discovery_provider.cc \
             linux/discovery/snap_discovery_provider.cc \
             linux/discovery/snapd_socket_backend.cc \
@@ -478,6 +481,164 @@ jobs:
             "$rpm_work/rpmbuild/RPMS/noarch/example-tool-3.1.4-1.noarch.rpm"
 
           /tmp/rpm_discovery_provider_test --fixture "$rpm_work/fixture_root"
+
+      - name: Run native Pacman discovery integration tests
+        run: |
+          clang++ -std=c++14 -Wall -Wextra -Wpedantic -Werror \
+            -Ilinux \
+            $(pkg-config --cflags gmodule-2.0) \
+            linux/discovery/application_identity.cc \
+            linux/discovery/pacman_discovery_provider.cc \
+            linux/discovery/libalpm_backend.cc \
+            linux/test/pacman_discovery_provider_test.cc \
+            $(pkg-config --libs gmodule-2.0) \
+            -o /tmp/pacman_discovery_provider_test
+
+          # Verify no mandatory DT_NEEDED ELF dependency on libalpm.
+          if readelf -d /tmp/pacman_discovery_provider_test | grep -q 'libalpm'; then
+            echo "Unexpected mandatory DT_NEEDED dependency on libalpm"
+            exit 1
+          fi
+
+          # Verify runtime libalpm shared library and required exported symbols.
+          libalpm_path="$(ldconfig -p | awk '/libalpm\.so\.(16|15|14|13) / { print $NF; exit }')"
+          if [ -z "$libalpm_path" ] || [ ! -r "$libalpm_path" ]; then
+            echo "No supported libalpm.so.{16,15,14,13} found in ldconfig cache"
+            exit 1
+          fi
+          echo "Resolved runtime libalpm: $libalpm_path"
+          for sym in \
+            alpm_initialize \
+            alpm_release \
+            alpm_errno \
+            alpm_strerror \
+            alpm_get_localdb \
+            alpm_db_get_pkgcache \
+            alpm_list_next \
+            alpm_pkg_get_name \
+            alpm_pkg_get_version \
+            alpm_pkg_get_arch \
+            alpm_pkg_get_desc \
+            alpm_pkg_get_url \
+            alpm_pkg_get_packager \
+            alpm_pkg_get_licenses \
+            alpm_pkg_get_groups \
+            alpm_pkg_get_reason; do
+            if ! nm -D --defined-only "$libalpm_path" | grep -q " ${sym}$"; then
+              echo "Required libalpm symbol not exported: $sym"
+              exit 1
+            fi
+          done
+
+          pacman_work="$(mktemp -d)"
+          trap 'rm -rf -- "$pacman_work"' EXIT
+
+          printf '%s\n' 'void unrelated_symbol(void) {}' | \
+            clang -x c - -fPIC -shared -o "$pacman_work/libincomplete.so"
+
+          /tmp/pacman_discovery_provider_test --missing-lib
+          /tmp/pacman_discovery_provider_test --unsupported-abi "$pacman_work/libincomplete.so"
+
+          # Verify empty isolated Pacman local database.
+          mkdir -p "$pacman_work/root" "$pacman_work/empty_db/local"
+          printf '9\n' > "$pacman_work/empty_db/local/ALPM_DB_VERSION"
+          /tmp/pacman_discovery_provider_test --empty "$pacman_work/root" "$pacman_work/empty_db"
+
+          # Create an offline local Pacman database fixture matching libalpm's
+          # documented ALPM_DB_VERSION 9 local desc layout plus a pacman.conf
+          # with custom DBPath.
+          mkdir -p \
+            "$pacman_work/fixture_db/local/example-app-1.2.3-1" \
+            "$pacman_work/fixture_db/local/example-lib-0.9.0-2"
+          printf '9\n' > "$pacman_work/fixture_db/local/ALPM_DB_VERSION"
+
+          cat > "$pacman_work/fixture_db/local/example-app-1.2.3-1/desc" <<'EOF'
+          %NAME%
+          example-app
+
+          %VERSION%
+          1.2.3-1
+
+          %BASE%
+          example-app
+
+          %DESC%
+          Example explicit Arch package
+
+          %URL%
+          https://example.org/app
+
+          %ARCH%
+          x86_64
+
+          %BUILDDATE%
+          1700000000
+
+          %INSTALLDATE%
+          1700000100
+
+          %PACKAGER%
+          Example Packager <packager@example.org>
+
+          %SIZE%
+          4096
+
+          %GROUPS%
+          base-devel
+          example-tools
+
+          %LICENSE%
+          MIT
+          Apache-2.0
+          EOF
+
+          cat > "$pacman_work/fixture_db/local/example-lib-0.9.0-2/desc" <<'EOF'
+          %NAME%
+          example-lib
+
+          %VERSION%
+          0.9.0-2
+
+          %BASE%
+          example-lib
+
+          %DESC%
+          Example dependency library
+
+          %ARCH%
+          any
+
+          %BUILDDATE%
+          1700000000
+
+          %INSTALLDATE%
+          1700000200
+
+          %PACKAGER%
+          Unknown Packager
+
+          %SIZE%
+          1024
+
+          %REASON%
+          1
+
+          %LICENSE%
+          GPL-3.0-or-later
+          EOF
+
+          cat > "$pacman_work/pacman.conf" <<EOF
+          # Offline Pacman fixture config
+          [options]
+          RootDir = $pacman_work/root
+          DBPath = $pacman_work/fixture_db
+
+          [core]
+          Server = file:///nonexistent/should-never-be-read
+          EOF
+
+          /tmp/pacman_discovery_provider_test --fixture \
+            "$pacman_work/root" "$pacman_work/fixture_db" "$pacman_work/pacman.conf"
 
       - name: Run Linux integration tests
         run: bash example/tool/test_linux.sh
