@@ -5216,6 +5216,9 @@ void test_async_resolved_discovery_lifecycle_serialization_and_legacy_isolation(
     Latch release_slow(1);
     DiscoveryExecutionStatus queued_status =
         DiscoveryExecutionStatus::kCompleted;
+    DiscoveryExecutionStatus inflight_status =
+        DiscoveryExecutionStatus::kCompleted;
+    bool inflight_empty_inventory = false;
     std::atomic<int> inflight_callbacks{0};
 
     TestPlatformLoop loop;
@@ -5226,7 +5229,10 @@ void test_async_resolved_discovery_lifecycle_serialization_and_legacy_isolation(
           "gio", [&]() {
             slow_started.count_down();
             release_slow.wait();
-            return DiscoveryResult{};
+            DiscoveryResult res;
+            res.applications.push_back(make_gio_app(
+                "org.example.Slow.desktop", "Slow", true, false, false));
+            return res;
           }));
 
       auto runner = std::make_unique<AsyncDiscoveryRunner>(
@@ -5234,9 +5240,12 @@ void test_async_resolved_discovery_lifecycle_serialization_and_legacy_isolation(
           [&loop](std::function<void()> cb) { loop.post(std::move(cb)); });
       service.reset();
 
-      runner->discover_resolved_async([&](ResolvedDiscoveryExecutionOutcome) {
-        inflight_callbacks.fetch_add(1);
-      });
+      runner->discover_resolved_async(
+          [&](ResolvedDiscoveryExecutionOutcome out) {
+            inflight_status = out.status;
+            inflight_empty_inventory = out.inventory.applications.empty();
+            inflight_callbacks.fetch_add(1);
+          });
       slow_started.wait();
 
       runner->discover_resolved_async([&](ResolvedDiscoveryExecutionOutcome out) {
@@ -5246,13 +5255,18 @@ void test_async_resolved_discovery_lifecycle_serialization_and_legacy_isolation(
       runner.reset();
       expect(queued_status == DiscoveryExecutionStatus::kCancelled,
              "queued resolved request must cancel immediately on teardown");
+      expect(inflight_callbacks.load() == 0,
+             "in-flight resolved request has not completed before release");
     }
 
     release_slow.count_down();
     pool.join_all();
     loop.drain_available();
-    expect(inflight_callbacks.load() == 0,
-           "in-flight resolved request must not invoke callback after teardown");
+    expect(inflight_callbacks.load() == 1 &&
+               inflight_status == DiscoveryExecutionStatus::kCancelled &&
+               inflight_empty_inventory,
+           "in-flight resolved request during teardown must deliver kCancelled "
+           "once with empty inventory");
   }
 }
 
