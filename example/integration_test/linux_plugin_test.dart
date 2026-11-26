@@ -1,8 +1,10 @@
 import 'dart:io';
 
 import 'package:flutter_device_apps_linux/flutter_device_apps_linux.dart';
+import 'package:flutter_device_apps_linux_example/main.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
+import 'package:material_ui/material_ui.dart';
 
 const _id = 'org.example.DeviceAppsFixture.desktop';
 const _hiddenId = 'org.example.HiddenFixture.desktop';
@@ -158,5 +160,22 @@ void main() {
     final legacyApps = concurrent[1]! as List<LinuxAppInfo>;
     expect(legacyApps.any((app) => app.desktopFileId == _id), isTrue);
     expect(legacyApps.any((app) => app.desktopFileId == _hiddenId), isFalse);
+  });
+
+  testWidgets('explorer example loads fixture through discoverApps', (
+    tester,
+  ) async {
+    await tester.pumpWidget(const LinuxDeviceAppsExample());
+    await tester.pumpAndSettle(const Duration(seconds: 5));
+
+    // Switch to Applications and search for the known fixture.
+    await tester.tap(find.byIcon(Icons.apps_outlined));
+    await tester.pumpAndSettle();
+    await tester.enterText(
+      find.byKey(const ValueKey('apps_search_field')),
+      'Device Apps Linux Fixture',
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('Device Apps Linux Fixture'), findsWidgets);
   });
 }
