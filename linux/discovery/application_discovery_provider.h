@@ -4,19 +4,9 @@
 #include <string>
 #include <vector>
 
-namespace flutter_device_apps_linux {
+#include "discovered_application.h"
 
-// Minimal internal representation of a discovered desktop application.
-// Preserves the existing listApps() contract without coupling discovery
-// providers to Flutter serialization types.
-struct DiscoveredApplication {
-  std::string desktop_file_id;
-  std::string app_name;
-  bool has_app_name = false;
-  bool supports_files = false;
-  bool supports_uris = false;
-  bool requires_terminal = false;
-};
+namespace flutter_device_apps_linux {
 
 // Result of a single provider's discovery pass.
 // Establishes an explicit boundary for provider failure isolation.

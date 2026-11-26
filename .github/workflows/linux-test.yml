@@ -29,5 +29,17 @@ jobs:
       - name: Install dependencies
         run: flutter pub get
 
+      - name: Run native discovery unit tests
+        run: |
+          clang++ -std=c++14 -Wall -Wextra -Werror \
+            -fsanitize=address,undefined \
+            -Ilinux \
+            linux/discovery/application_identity.cc \
+            linux/discovery/application_discovery_service.cc \
+            linux/discovery/legacy_list_apps_adapter.cc \
+            linux/test/application_discovery_test.cc \
+            -o /tmp/application_discovery_test
+          /tmp/application_discovery_test
+
       - name: Run Linux integration tests
         run: bash example/tool/test_linux.sh

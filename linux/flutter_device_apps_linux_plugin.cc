@@ -2,6 +2,7 @@
 
 #include "discovery/application_discovery_service.h"
 #include "discovery/gio_discovery_provider.h"
+#include "discovery/legacy_list_apps_adapter.h"
 #include "elf_dependencies.h"
 
 #include <gio/gdesktopappinfo.h>
@@ -70,12 +71,12 @@ static FlValue* app_list(GList* infos, bool only_visible) {
   return apps;
 }
 
-static FlValue* discovered_app_value(
-    const flutter_device_apps_linux::DiscoveredApplication& app) {
+static FlValue* legacy_app_value(
+    const flutter_device_apps_linux::LegacyDesktopAppRecord& app) {
   FlValue* value = fl_value_new_map();
   set_string(value, "desktopFileId", app.desktop_file_id.c_str());
-  if (app.has_app_name) {
-    set_string(value, "appName", app.app_name.c_str());
+  if (app.app_name.has_value()) {
+    set_string(value, "appName", app.app_name.value().c_str());
   }
   fl_value_set_string_take(value, "supportsFiles",
                            fl_value_new_bool(app.supports_files));
@@ -86,11 +87,13 @@ static FlValue* discovered_app_value(
   return value;
 }
 
-static FlValue* discovered_app_list(
+static FlValue* legacy_list_apps_value(
     const std::vector<flutter_device_apps_linux::DiscoveredApplication>& apps) {
+  const auto legacy_records =
+      flutter_device_apps_linux::adapt_for_legacy_list_apps(apps);
   FlValue* list = fl_value_new_list();
-  for (const auto& app : apps) {
-    fl_value_append_take(list, discovered_app_value(app));
+  for (const auto& record : legacy_records) {
+    fl_value_append_take(list, legacy_app_value(record));
   }
   return list;
 }
@@ -336,6 +339,9 @@ static void handle_method_call(FlMethodChannel*, FlMethodCall* call,
                                gpointer user_data) {
   const char* method = fl_method_call_get_name(call);
   if (g_str_equal(method, "listApps")) {
+    // Synchronous execution is preserved while GIO is the only registered
+    // provider. Introduce an async worker boundary (such as GTask) before
+    // registering blocking disk, IPC, or network-backed providers.
     auto* discovery_service =
         static_cast<flutter_device_apps_linux::ApplicationDiscoveryService*>(
             user_data);
@@ -343,7 +349,7 @@ static void handle_method_call(FlMethodChannel*, FlMethodCall* call,
         discovery_service == nullptr
             ? std::vector<flutter_device_apps_linux::DiscoveredApplication>{}
             : discovery_service->discover_applications();
-    g_autoptr(FlValue) apps = discovered_app_list(discovered);
+    g_autoptr(FlValue) apps = legacy_list_apps_value(discovered);
     fl_method_call_respond_success(call, apps, nullptr);
     return;
   }

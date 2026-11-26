@@ -92,6 +92,34 @@ void main() {
     expect(await FlutterDeviceAppsLinux.listApps(), isEmpty);
   });
 
+  test('preserves empty appName and ignores unknown internal fields', () async {
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      expect(call.method, 'listApps');
+      expect(call.arguments, isNull);
+      return [
+        {
+          'desktopFileId': id,
+          'appName': '',
+          'supportsFiles': false,
+          'supportsUris': true,
+          'requiresTerminal': false,
+          'applicationId': 'gio:$id',
+          'providerId': 'gio',
+        },
+      ];
+    });
+    final app = (await FlutterDeviceAppsLinux.listApps()).single;
+    expect(app.desktopFileId, id);
+    expect(app.appName, '');
+    expect(app.supportsFiles, isFalse);
+    expect(app.supportsUris, isTrue);
+    expect(app.requiresTerminal, isFalse);
+    expect(app.description, isNull);
+    expect(app.desktopFilePath, isNull);
+    expect(app.categories, isEmpty);
+    expect(app.mimeTypes, isEmpty);
+  });
+
   test('rejects paths and invalid IDs before invoking the channel', () async {
     messenger.setMockMethodCallHandler(
       channel,

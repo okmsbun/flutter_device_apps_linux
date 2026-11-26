@@ -9,7 +9,9 @@ add_library(${PLUGIN_NAME} SHARED
   flutter_device_apps_linux_plugin.cc
   elf_dependencies.cc
   discovery/application_discovery_service.cc
+  discovery/application_identity.cc
   discovery/gio_discovery_provider.cc
+  discovery/legacy_list_apps_adapter.cc
 )
 apply_standard_settings(${PLUGIN_NAME})
 set_target_properties(${PLUGIN_NAME} PROPERTIES CXX_VISIBILITY_PRESET hidden)

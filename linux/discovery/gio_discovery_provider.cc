@@ -5,6 +5,8 @@
 #include <memory>
 #include <utility>
 
+#include "application_identity.h"
+
 namespace flutter_device_apps_linux {
 namespace {
 
@@ -41,21 +43,29 @@ DiscoveryResult GioDiscoveryProvider::discover() {
     if (desktop_file_id == nullptr) continue;
 
     DiscoveredApplication app;
-    app.desktop_file_id = desktop_file_id;
+    app.provenance.provider_id = id();
+    app.provenance.native_id = desktop_file_id;
+    app.provenance.installation_source = InstallationSource::kUnknown;
+    app.provenance.installation_scope = InstallationScope::kUnknown;
+    app.application_id = build_application_id(
+        app.provenance.provider_id, app.provenance.native_id,
+        app.provenance.installation_scope, app.installation_id);
+    app.desktop_file_id = OptionalString::of(desktop_file_id);
 
     const char* display_name = g_app_info_get_display_name(info);
     if (display_name != nullptr) {
-      app.app_name = display_name;
-      app.has_app_name = true;
+      app.metadata.name = OptionalString::of(display_name);
     }
 
     auto* desktop =
         G_IS_DESKTOP_APP_INFO(info) ? G_DESKTOP_APP_INFO(info) : nullptr;
-    app.supports_files = g_app_info_supports_files(info) != FALSE;
-    app.supports_uris = g_app_info_supports_uris(info) != FALSE;
-    app.requires_terminal =
+    app.capabilities.supports_files =
+        capability_from_bool(g_app_info_supports_files(info) != FALSE);
+    app.capabilities.supports_uris =
+        capability_from_bool(g_app_info_supports_uris(info) != FALSE);
+    app.capabilities.requires_terminal = capability_from_bool(
         desktop != nullptr &&
-        g_desktop_app_info_get_boolean(desktop, "Terminal") != FALSE;
+        g_desktop_app_info_get_boolean(desktop, "Terminal") != FALSE);
 
     result.applications.push_back(std::move(app));
   }
