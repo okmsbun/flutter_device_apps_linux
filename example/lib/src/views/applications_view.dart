@@ -147,20 +147,23 @@ class _ApplicationsViewState extends State<ApplicationsView> {
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
           child: Row(
             children: [
-              Text(
-                'Showing ${filtered.length} of $totalCount applications',
-                style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+              Expanded(
+                child: Text(
+                  'Showing ${filtered.length} of $totalCount applications',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
                 ),
               ),
-              const Spacer(),
               if (controller.hasActiveAppFilters)
                 TextButton(
                   onPressed: () {
                     _searchController.clear();
                     controller.clearAppFilters();
                   },
-                  child: const Text('Reset filters'),
+                  child: const Text('Reset'),
                 ),
             ],
           ),

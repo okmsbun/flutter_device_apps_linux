@@ -265,7 +265,8 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.text('2.1.0'), findsWidgets);
       expect(find.text('2.3.0'), findsWidgets);
-      expect(find.textContaining('Lib: qtCore'), findsOneWidget);
+      expect(find.text('Framework: qt'), findsOneWidget);
+      expect(find.text('Lib: qt'), findsOneWidget);
       expect(find.textContaining('Field "summary"'), findsOneWidget);
 
       await tester.tap(find.text('Open app'));
@@ -291,7 +292,12 @@ void main() {
       await tester.pumpAndSettle();
 
       // Switch to Packages view and inspect package record.
-      await tester.tap(find.byIcon(Icons.inventory_2_outlined));
+      await tester.tap(
+        find.descendant(
+          of: find.byType(NavigationRail),
+          matching: find.text('Packages'),
+        ),
+      );
       await tester.pumpAndSettle();
       expect(find.text('coreutils'), findsOneWidget);
       await tester.tap(find.text('coreutils'));
@@ -299,13 +305,23 @@ void main() {
       expect(find.text('dpkg:system:coreutils:amd64'), findsOneWidget);
 
       // Switch to Diagnostics view.
-      await tester.tap(find.byIcon(Icons.monitor_heart_outlined));
+      await tester.tap(
+        find.descendant(
+          of: find.byType(NavigationRail),
+          matching: find.text('Diagnostics'),
+        ),
+      );
       await tester.pumpAndSettle();
       expect(find.text('system installation unreadable'), findsOneWidget);
       expect(find.text('ambiguous_file_ownership'), findsOneWidget);
 
       // Switch to Handlers view and query MIME type & file path.
-      await tester.tap(find.byIcon(Icons.find_in_page_outlined));
+      await tester.tap(
+        find.descendant(
+          of: find.byType(NavigationRail),
+          matching: find.text('Handlers'),
+        ),
+      );
       await tester.pumpAndSettle();
       await tester.enterText(
         find.byKey(const ValueKey('handlers_input_field')),

@@ -211,20 +211,23 @@ class _PackagesViewState extends State<PackagesView> {
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
           child: Row(
             children: [
-              Text(
-                'Showing ${filtered.length} of $totalCount packages',
-                style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+              Expanded(
+                child: Text(
+                  'Showing ${filtered.length} of $totalCount packages',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
                 ),
               ),
-              const Spacer(),
               if (controller.hasActivePackageFilters)
                 TextButton(
                   onPressed: () {
                     _searchController.clear();
                     controller.clearPackageFilters();
                   },
-                  child: const Text('Reset filters'),
+                  child: const Text('Reset'),
                 ),
             ],
           ),

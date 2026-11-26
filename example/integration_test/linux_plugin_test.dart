@@ -169,7 +169,16 @@ void main() {
     await tester.pumpAndSettle(const Duration(seconds: 5));
 
     // Switch to Applications and search for the known fixture.
-    await tester.tap(find.byIcon(Icons.apps_outlined));
+    final navFinder = find.byType(NavigationRail).evaluate().isNotEmpty
+        ? find.descendant(
+            of: find.byType(NavigationRail),
+            matching: find.text('Applications'),
+          )
+        : find.descendant(
+            of: find.byType(NavigationBar),
+            matching: find.text('Applications'),
+          );
+    await tester.tap(navFinder);
     await tester.pumpAndSettle();
     await tester.enterText(
       find.byKey(const ValueKey('apps_search_field')),
