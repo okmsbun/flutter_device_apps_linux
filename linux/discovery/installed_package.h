@@ -31,8 +31,14 @@ enum class PackageSelectionState {
 // as confirmed user applications without authoritative evidence.
 struct InstalledPackageRecord {
   // Deterministic provider-scoped package identity, stable across version
-  // upgrades (for example, "dpkg:ripgrep:system:amd64").
+  // upgrades (for example, "dpkg:ripgrep:system:amd64" or
+  // "rpm:kernel-core:system:x86_64").
   std::string package_identity_id;
+
+  // Optional version-specific installation identity used when a package
+  // manager allows multiple versions of the same package to be installed
+  // simultaneously (for example, parallel RPM kernels).
+  OptionalString installation_identity_id;
 
   // Source provenance (provider ID, native package name, installation source,
   // and installation scope).
@@ -41,13 +47,18 @@ struct InstalledPackageRecord {
   // Authoritative package fields.
   std::string package_name;
   OptionalString architecture;
+  OptionalString epoch;
   OptionalString version;
+  OptionalString release;
   OptionalString summary;
   OptionalString description;
   OptionalString section;
+  OptionalString package_group;
   OptionalString priority;
+  OptionalString license;
   OptionalString homepage;
   OptionalString maintainer;
+  OptionalString vendor;
 
   // Actual installation state vs desired selection state.
   PackageInstallationState installation_state =

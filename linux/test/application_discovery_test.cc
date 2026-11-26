@@ -32,6 +32,7 @@
 #include "discovery/installed_package.h"
 #include "discovery/legacy_list_apps_adapter.h"
 #include "discovery/package_discovery_provider.h"
+#include "discovery/rpm_discovery_provider.h"
 #include "discovery/snap_discovery_provider.h"
 #include "discovery/snapd_socket_backend.h"
 
@@ -82,6 +83,11 @@ using flutter_device_apps_linux::PackageDiscoveryResult;
 using flutter_device_apps_linux::PackageInstallationState;
 using flutter_device_apps_linux::PackageSelectionState;
 using flutter_device_apps_linux::ProviderExecutionStatus;
+using flutter_device_apps_linux::RpmBackend;
+using flutter_device_apps_linux::RpmBackendQueryResult;
+using flutter_device_apps_linux::RpmDiscoveryProvider;
+using flutter_device_apps_linux::RpmInstalledPackageRecord;
+using flutter_device_apps_linux::RpmQueryErrorKind;
 using flutter_device_apps_linux::SnapBackend;
 using flutter_device_apps_linux::SnapBackendQueryResult;
 using flutter_device_apps_linux::SnapDiscoveryProvider;
@@ -2594,6 +2600,242 @@ void test_dpkg_malformed_duplicate_and_legacy_isolation() {
          "legacy GIO-only outcome must contain no package inventory records");
 }
 
+// --- RpmDiscoveryProvider tests ---
+
+class FakeRpmBackend final : public RpmBackend {
+ public:
+  FakeRpmBackend(bool available, RpmBackendQueryResult result,
+                 std::string abi = "librpm.so.10",
+                 std::string availability_err = "",
+                 std::atomic<int>* avail_calls = nullptr,
+                 std::atomic<int>* list_calls = nullptr)
+      : available_(available),
+        result_(std::move(result)),
+        abi_(std::move(abi)),
+        availability_error_(std::move(availability_err)),
+        avail_calls_(avail_calls),
+        list_calls_(list_calls) {}
+
+  bool is_available() const override {
+    if (avail_calls_ != nullptr) avail_calls_->fetch_add(1);
+    return available_;
+  }
+
+  std::string availability_error() const override {
+    return availability_error_;
+  }
+
+  std::string abi_description() const override { return abi_; }
+
+  RpmBackendQueryResult list_installed_packages() override {
+    if (list_calls_ != nullptr) list_calls_->fetch_add(1);
+    return result_;
+  }
+
+ private:
+  bool available_;
+  RpmBackendQueryResult result_;
+  std::string abi_;
+  std::string availability_error_;
+  std::atomic<int>* avail_calls_;
+  std::atomic<int>* list_calls_;
+};
+
+void test_rpm_availability_abi_empty_and_provider_failures() {
+  RpmDiscoveryProvider null_provider(nullptr);
+  expect(std::string(null_provider.id()) == "rpm",
+         "RpmDiscoveryProvider id() must be rpm");
+  expect(!null_provider.is_available(), "null RPM backend is unavailable");
+  expect(!null_provider.discover_packages().ok,
+         "null RPM backend discover_packages() must fail cleanly");
+
+  // Missing library / unsupported ABI diagnostic surfaced.
+  {
+    RpmDiscoveryProvider provider(std::make_unique<FakeRpmBackend>(
+        false, RpmBackendQueryResult{}, "unavailable",
+        "missing required symbols in librpm.so.10: rpmtsOpenDB"));
+    const PackageDiscoveryResult res = provider.discover_packages();
+    expect(!res.ok && res.error_message.find("missing required symbols") !=
+                          std::string::npos,
+           "RPM availability_error() diagnostic must be surfaced");
+  }
+
+  // Empty RPM database -> kSucceeded with 0 packages.
+  {
+    ApplicationDiscoveryService service;
+    service.register_package_provider(std::make_unique<RpmDiscoveryProvider>(
+        std::make_unique<FakeRpmBackend>(true, RpmBackendQueryResult{})));
+    const DiscoveryPassResult pass = service.discover_with_report();
+    expect(pass.packages.empty() && pass.provider_summaries.size() == 1 &&
+               pass.provider_summaries[0].provider_id == "rpm" &&
+               pass.provider_summaries[0].status ==
+                   ProviderExecutionStatus::kSucceeded,
+           "empty RPM database must succeed cleanly with 0 packages");
+  }
+
+  // Absent DB / permission error failure isolation alongside GIO.
+  {
+    RpmBackendQueryResult perm_err;
+    perm_err.ok = false;
+    perm_err.error_kind = RpmQueryErrorKind::kPermissionDenied;
+    perm_err.error_message = "Permission denied";
+
+    ApplicationDiscoveryService service;
+    service.register_provider(std::make_unique<FakeDiscoveryProvider>(
+        "gio", true, []() {
+          DiscoveryResult r;
+          r.applications.push_back(make_gio_app(
+              "org.example.Visible.desktop", "Visible", true, false, false));
+          return r;
+        }()));
+    service.register_package_provider(std::make_unique<RpmDiscoveryProvider>(
+        std::make_unique<FakeRpmBackend>(true, std::move(perm_err))));
+
+    const DiscoveryPassResult pass = service.discover_with_report();
+    expect(pass.applications.size() == 1 && pass.packages.empty(),
+           "RPM failure must not impact GIO discovery");
+    expect(pass.provider_summaries.size() == 2 &&
+               pass.provider_summaries[1].provider_id == "rpm" &&
+               pass.provider_summaries[1].status ==
+                   ProviderExecutionStatus::kFailed &&
+               pass.provider_summaries[1].error_message.find(
+                   "permission denied") != std::string::npos,
+           "RPM permission failure must be reported cleanly");
+  }
+}
+
+void test_rpm_metadata_multiarch_multi_version_and_legacy_isolation() {
+  RpmBackendQueryResult query;
+
+  // 1. Package with full RPM metadata including Epoch, Vendor, Group, License.
+  {
+    RpmInstalledPackageRecord pkg;
+    pkg.name = "kernel-core";
+    pkg.epoch = OptionalString::of("1");
+    pkg.version = OptionalString::of("6.8.1");
+    pkg.release = OptionalString::of("100.fc40");
+    pkg.architecture = OptionalString::of("x86_64");
+    pkg.summary = OptionalString::of("The Linux kernel");
+    pkg.description = OptionalString::of("Core Linux kernel image.");
+    pkg.license = OptionalString::of("GPL-2.0-only");
+    pkg.homepage = OptionalString::of("https://www.kernel.org/");
+    pkg.vendor = OptionalString::of("Fedora Project");
+    pkg.package_group = OptionalString::of("System Environment/Kernel");
+    query.packages.push_back(std::move(pkg));
+  }
+  // 2. Second simultaneously installed version of the SAME package!
+  {
+    RpmInstalledPackageRecord pkg;
+    pkg.name = "kernel-core";
+    pkg.epoch = OptionalString::of("1");
+    pkg.version = OptionalString::of("6.9.2");
+    pkg.release = OptionalString::of("200.fc40");
+    pkg.architecture = OptionalString::of("x86_64");
+    pkg.summary = OptionalString::of("The Linux kernel");
+    query.packages.push_back(std::move(pkg));
+  }
+  // 3. Multi-arch sibling (glibc x86_64 + glibc i686) with missing optional
+  // metadata (no Epoch, no Homepage, no Vendor).
+  {
+    RpmInstalledPackageRecord pkg;
+    pkg.name = "glibc";
+    pkg.version = OptionalString::of("2.39");
+    pkg.release = OptionalString::of("12.fc40");
+    pkg.architecture = OptionalString::of("x86_64");
+    query.packages.push_back(std::move(pkg));
+  }
+  {
+    RpmInstalledPackageRecord pkg;
+    pkg.name = "glibc";
+    pkg.version = OptionalString::of("2.39");
+    pkg.release = OptionalString::of("12.fc40");
+    pkg.architecture = OptionalString::of("i686");
+    query.packages.push_back(std::move(pkg));
+  }
+  // 4. Malformed empty-name record -> skipped with partial diagnostics.
+  {
+    RpmInstalledPackageRecord bad;
+    bad.version = OptionalString::of("1.0");
+    query.packages.push_back(std::move(bad));
+  }
+
+  std::atomic<int> rpm_avail{0};
+  std::atomic<int> rpm_list{0};
+  auto service = std::make_shared<ApplicationDiscoveryService>();
+  service->register_provider(
+      std::make_unique<FakeDiscoveryProvider>("gio", true, DiscoveryResult{}));
+  service->register_package_provider(std::make_unique<RpmDiscoveryProvider>(
+      std::make_unique<FakeRpmBackend>(true, std::move(query), "librpm.so.10",
+                                       "", &rpm_avail, &rpm_list)));
+
+  // Legacy GIO-only listApps() must NOT invoke RPM availability or DB queries!
+  const DiscoveryPassResult legacy = service->discover_with_report(
+      DiscoveryRequestOptions::only_providers({"gio"}));
+  expect(rpm_avail.load() == 0 && rpm_list.load() == 0 &&
+             legacy.packages.empty(),
+         "legacy GIO-only path must never invoke RPM provider");
+
+  // Full unified discovery separates RPM packages from applications and
+  // preserves all 4 valid RPM installations (including multi-version kernels).
+  const DiscoveryPassResult unified = service->discover_with_report(
+      DiscoveryRequestOptions::all_providers());
+  expect(unified.applications.empty(),
+         "RPM packages must never appear in confirmed applications vector");
+  expect(unified.packages.size() == 4,
+         "all 4 valid RPM installations (2 kernels + 2 multiarch glibc) must "
+         "be preserved while malformed header is skipped");
+  expect(unified.provider_summaries.size() == 2 &&
+             unified.provider_summaries[1].provider_id == "rpm" &&
+             unified.provider_summaries[1].status ==
+                 ProviderExecutionStatus::kPartiallyFailed,
+         "skipped malformed RPM header should surface kPartiallyFailed");
+  if (unified.packages.size() != 4) return;
+
+  const auto& k1 = unified.packages[0];
+  const auto& k2 = unified.packages[1];
+  const auto& glibc64 = unified.packages[2];
+  const auto& glibc32 = unified.packages[3];
+
+  expect(k1.provenance.provider_id == "rpm" &&
+             k1.provenance.installation_source == InstallationSource::kRpm &&
+             k1.provenance.installation_scope == InstallationScope::kSystem &&
+             k1.classification == ApplicationClassification::kUnknown &&
+             k1.installation_state == PackageInstallationState::kInstalled,
+         "RPM provenance, state, and unknown classification must match");
+  expect(k1.epoch.has_value() && k1.epoch.value() == "1" &&
+             k1.version.has_value() && k1.version.value() == "6.8.1" &&
+             k1.release.has_value() && k1.release.value() == "100.fc40" &&
+             k1.license.has_value() && k1.license.value() == "GPL-2.0-only" &&
+             k1.homepage.has_value() &&
+             k1.homepage.value() == "https://www.kernel.org/" &&
+             k1.vendor.has_value() && k1.vendor.value() == "Fedora Project" &&
+             k1.package_group.has_value() &&
+             k1.package_group.value() == "System Environment/Kernel",
+         "authoritative RPM metadata fields must be preserved");
+
+  // Multi-version identity contract:
+  // - Stable package_identity_id is IDENTICAL across versions of kernel-core.
+  // - Version-specific installation_identity_id is DISTINCT across versions.
+  expect(k1.package_identity_id == "rpm:kernel-core:system:x86_64" &&
+             k1.package_identity_id == k2.package_identity_id,
+         "stable package_identity_id must stay identical across RPM versions");
+  expect(k1.installation_identity_id.has_value() &&
+             k2.installation_identity_id.has_value() &&
+             k1.installation_identity_id.value() !=
+                 k2.installation_identity_id.value(),
+         "multiple installed versions must have distinct "
+         "installation_identity_ids without collisions");
+
+  // Multi-arch sibling check + missing optional fields.
+  expect(glibc64.package_identity_id == "rpm:glibc:system:x86_64" &&
+             glibc32.package_identity_id == "rpm:glibc:system:i686" &&
+             glibc64.package_identity_id != glibc32.package_identity_id,
+         "multiarch RPM packages must have distinct package_identity_ids");
+  expect(!glibc64.epoch.has_value() && !glibc64.vendor.has_value() &&
+             !glibc64.homepage.has_value(),
+         "missing optional RPM fields must stay unset");
+}
+
 }  // namespace
 
 int main() {
@@ -2625,6 +2867,8 @@ int main() {
   test_dpkg_missing_empty_and_unreadable_databases();
   test_dpkg_states_multiarch_multiline_missing_fields_and_upgrade_id();
   test_dpkg_malformed_duplicate_and_legacy_isolation();
+  test_rpm_availability_abi_empty_and_provider_failures();
+  test_rpm_metadata_multiarch_multi_version_and_legacy_isolation();
 
   if (g_failures > 0) {
     std::cerr << g_failures << " test assertion(s) failed.\n";

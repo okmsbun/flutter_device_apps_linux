@@ -9,6 +9,8 @@
 #include "discovery/legacy_list_apps_adapter.h"
 #include "discovery/libappstream_backend.h"
 #include "discovery/libflatpak_backend.h"
+#include "discovery/librpm_backend.h"
+#include "discovery/rpm_discovery_provider.h"
 #include "discovery/snap_discovery_provider.h"
 #include "discovery/snapd_socket_backend.h"
 #include "elf_dependencies.h"
@@ -550,6 +552,9 @@ static std::unique_ptr<DiscoveryPluginContext> create_discovery_context() {
           flutter_device_apps_linux::create_snapd_socket_backend()));
   context->service->register_package_provider(
       std::make_unique<flutter_device_apps_linux::DpkgDiscoveryProvider>());
+  context->service->register_package_provider(
+      std::make_unique<flutter_device_apps_linux::RpmDiscoveryProvider>(
+          flutter_device_apps_linux::create_librpm_backend()));
   context->service->set_metadata_provider(
       std::make_unique<flutter_device_apps_linux::AppStreamMetadataProvider>(
           flutter_device_apps_linux::create_libappstream_backend()));

@@ -19,6 +19,8 @@ add_library(${PLUGIN_NAME} SHARED
   discovery/legacy_list_apps_adapter.cc
   discovery/libappstream_backend.cc
   discovery/libflatpak_backend.cc
+  discovery/librpm_backend.cc
+  discovery/rpm_discovery_provider.cc
   discovery/snap_discovery_provider.cc
   discovery/snapd_socket_backend.cc
 )
