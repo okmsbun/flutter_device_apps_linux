@@ -72,7 +72,10 @@ class AsyncDiscoveryRunner {
 
   // Enqueues an asynchronous discovery request. Every accepted request invokes
   // on_complete at most once on the completion context.
-  DiscoveryRequestHandle discover_async(CompletionCallback on_complete);
+  DiscoveryRequestHandle discover_async(
+      CompletionCallback on_complete,
+      DiscoveryRequestOptions options =
+          DiscoveryRequestOptions::all_providers());
 
   // Initiates non-blocking teardown. Queued requests that have not started are
   // immediately cancelled on the caller's thread; any currently running worker

@@ -121,6 +121,9 @@ struct SourceProvenance {
 struct ApplicationMetadata {
   OptionalString name;
   OptionalString version;
+  OptionalString revision;
+  OptionalString channel;
+  OptionalString summary;
   OptionalString description;
   OptionalString executable;
   OptionalString homepage;

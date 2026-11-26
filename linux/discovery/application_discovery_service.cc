@@ -1,8 +1,19 @@
 #include "application_discovery_service.h"
 
+#include <algorithm>
 #include <utility>
 
 namespace flutter_device_apps_linux {
+namespace {
+
+bool is_provider_selected(const DiscoveryRequestOptions& options,
+                          const std::string& provider_id) {
+  if (options.provider_ids.empty()) return true;
+  return std::find(options.provider_ids.begin(), options.provider_ids.end(),
+                   provider_id) != options.provider_ids.end();
+}
+
+}  // namespace
 
 void ApplicationDiscoveryService::register_provider(
     std::unique_ptr<ApplicationDiscoveryProvider> provider) {
@@ -16,15 +27,22 @@ size_t ApplicationDiscoveryService::provider_count() const {
   return providers_.size();
 }
 
-DiscoveryPassResult ApplicationDiscoveryService::discover_with_report() {
+DiscoveryPassResult ApplicationDiscoveryService::discover_with_report(
+    const DiscoveryRequestOptions& options) {
   std::lock_guard<std::mutex> lock(mutex_);
   DiscoveryPassResult pass_result;
   pass_result.provider_summaries.reserve(providers_.size());
 
   for (const auto& provider : providers_) {
-    ProviderExecutionSummary summary;
     const char* raw_id = provider->id();
-    summary.provider_id = raw_id == nullptr ? "" : raw_id;
+    const std::string provider_id = raw_id == nullptr ? "" : raw_id;
+    if (!is_provider_selected(options, provider_id)) {
+      // Unselected providers must not perform availability checks or discovery.
+      continue;
+    }
+
+    ProviderExecutionSummary summary;
+    summary.provider_id = provider_id;
 
     if (!provider->is_available()) {
       summary.status = ProviderExecutionStatus::kUnavailable;
@@ -60,8 +78,9 @@ DiscoveryPassResult ApplicationDiscoveryService::discover_with_report() {
 }
 
 std::vector<DiscoveredApplication>
-ApplicationDiscoveryService::discover_applications() {
-  return discover_with_report().applications;
+ApplicationDiscoveryService::discover_applications(
+    const DiscoveryRequestOptions& options) {
+  return discover_with_report(options).applications;
 }
 
 }  // namespace flutter_device_apps_linux

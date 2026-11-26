@@ -6,6 +6,8 @@
 #include "discovery/gio_discovery_provider.h"
 #include "discovery/legacy_list_apps_adapter.h"
 #include "discovery/libflatpak_backend.h"
+#include "discovery/snap_discovery_provider.h"
+#include "discovery/snapd_socket_backend.h"
 #include "elf_dependencies.h"
 
 #include <gio/gdesktopappinfo.h>
@@ -447,7 +449,9 @@ static void handle_method_call(FlMethodChannel*, FlMethodCall* call,
           }
           g_autoptr(FlValue) apps = legacy_list_apps_value(outcome.applications);
           fl_method_call_respond_success(method_call.call, apps, nullptr);
-        });
+        },
+        flutter_device_apps_linux::DiscoveryRequestOptions::only_providers(
+            {"gio"}));
     return;
   }
 
@@ -538,6 +542,9 @@ static std::unique_ptr<DiscoveryPluginContext> create_discovery_context() {
   context->service->register_provider(
       std::make_unique<flutter_device_apps_linux::FlatpakDiscoveryProvider>(
           flutter_device_apps_linux::create_libflatpak_backend()));
+  context->service->register_provider(
+      std::make_unique<flutter_device_apps_linux::SnapDiscoveryProvider>(
+          flutter_device_apps_linux::create_snapd_socket_backend()));
 
   std::shared_ptr<GMainContext> platform_context(
       g_main_context_ref_thread_default(), g_main_context_unref);

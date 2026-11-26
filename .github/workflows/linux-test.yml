@@ -43,6 +43,8 @@ jobs:
             linux/discovery/async_discovery_runner.cc \
             linux/discovery/flatpak_discovery_provider.cc \
             linux/discovery/legacy_list_apps_adapter.cc \
+            linux/discovery/snap_discovery_provider.cc \
+            linux/discovery/snapd_socket_backend.cc \
             linux/test/application_discovery_test.cc \
             -o /tmp/application_discovery_test_asan
           /tmp/application_discovery_test_asan
@@ -55,6 +57,8 @@ jobs:
             linux/discovery/async_discovery_runner.cc \
             linux/discovery/flatpak_discovery_provider.cc \
             linux/discovery/legacy_list_apps_adapter.cc \
+            linux/discovery/snap_discovery_provider.cc \
+            linux/discovery/snapd_socket_backend.cc \
             linux/test/application_discovery_test.cc \
             -o /tmp/application_discovery_test_tsan
           /tmp/application_discovery_test_tsan

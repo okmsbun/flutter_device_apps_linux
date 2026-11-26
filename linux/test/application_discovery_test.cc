@@ -1,5 +1,12 @@
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+#include <unistd.h>
+
 #include <atomic>
 #include <condition_variable>
+#include <cstdio>
+#include <cstring>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -19,6 +26,8 @@
 #include "discovery/discovered_application.h"
 #include "discovery/flatpak_discovery_provider.h"
 #include "discovery/legacy_list_apps_adapter.h"
+#include "discovery/snap_discovery_provider.h"
+#include "discovery/snapd_socket_backend.h"
 
 namespace {
 
@@ -29,12 +38,14 @@ using flutter_device_apps_linux::AsyncDiscoveryRunner;
 using flutter_device_apps_linux::build_application_id;
 using flutter_device_apps_linux::capability_from_bool;
 using flutter_device_apps_linux::CapabilityState;
+using flutter_device_apps_linux::create_snapd_socket_backend;
 using flutter_device_apps_linux::DesktopMenuVisibility;
 using flutter_device_apps_linux::DiscoveredApplication;
 using flutter_device_apps_linux::DiscoveryExecutionOutcome;
 using flutter_device_apps_linux::DiscoveryExecutionStatus;
 using flutter_device_apps_linux::DiscoveryPassResult;
 using flutter_device_apps_linux::DiscoveryRequestHandle;
+using flutter_device_apps_linux::DiscoveryRequestOptions;
 using flutter_device_apps_linux::DiscoveryResult;
 using flutter_device_apps_linux::FlatpakBackend;
 using flutter_device_apps_linux::FlatpakBackendQueryResult;
@@ -48,6 +59,12 @@ using flutter_device_apps_linux::kFlatpakRefKindApp;
 using flutter_device_apps_linux::kFlatpakRefKindRuntime;
 using flutter_device_apps_linux::OptionalString;
 using flutter_device_apps_linux::ProviderExecutionStatus;
+using flutter_device_apps_linux::SnapBackend;
+using flutter_device_apps_linux::SnapBackendQueryResult;
+using flutter_device_apps_linux::SnapDiscoveryProvider;
+using flutter_device_apps_linux::SnapdSocketConfig;
+using flutter_device_apps_linux::SnapInstalledRecord;
+using flutter_device_apps_linux::SnapQueryErrorKind;
 
 std::mutex g_failure_mutex;
 int g_failures = 0;
@@ -1322,6 +1339,638 @@ void test_flatpak_ownership_and_legacy_list_apps_compatibility() {
          "FlatpakBackend must be deterministically destroyed with service");
 }
 
+// --- Provider filtering and SnapDiscoveryProvider tests ---
+
+class CountingProvider final : public ApplicationDiscoveryProvider {
+ public:
+  CountingProvider(std::string id, bool available, DiscoveryResult result,
+                   std::atomic<int>* availability_calls,
+                   std::atomic<int>* discover_calls)
+      : id_(std::move(id)),
+        available_(available),
+        result_(std::move(result)),
+        availability_calls_(availability_calls),
+        discover_calls_(discover_calls) {}
+
+  const char* id() const override { return id_.c_str(); }
+
+  bool is_available() const override {
+    if (availability_calls_ != nullptr) {
+      availability_calls_->fetch_add(1);
+    }
+    return available_;
+  }
+
+  DiscoveryResult discover() override {
+    if (discover_calls_ != nullptr) {
+      discover_calls_->fetch_add(1);
+    }
+    return result_;
+  }
+
+ private:
+  std::string id_;
+  bool available_;
+  DiscoveryResult result_;
+  std::atomic<int>* availability_calls_;
+  std::atomic<int>* discover_calls_;
+};
+
+void test_provider_filtering_legacy_gio_only_vs_unified() {
+  std::atomic<int> gio_avail{0};
+  std::atomic<int> gio_disc{0};
+  std::atomic<int> flatpak_avail{0};
+  std::atomic<int> flatpak_disc{0};
+  std::atomic<int> snap_avail{0};
+  std::atomic<int> snap_disc{0};
+
+  DiscoveryResult gio_result;
+  gio_result.applications.push_back(make_gio_app(
+      "org.example.Visible.desktop", "Visible", true, false, false));
+
+  DiscoveryResult flatpak_result;
+  flatpak_result.applications.push_back(make_non_desktop_app(
+      "flatpak", "org.example.FlatpakApp", InstallationSource::kFlatpak,
+      InstallationScope::kUser));
+
+  DiscoveryResult snap_result;
+  snap_result.applications.push_back(make_non_desktop_app(
+      "snap", "blender", InstallationSource::kSnap,
+      InstallationScope::kSystem));
+
+  auto service = std::make_shared<ApplicationDiscoveryService>();
+  service->register_provider(std::make_unique<CountingProvider>(
+      "gio", true, std::move(gio_result), &gio_avail, &gio_disc));
+  service->register_provider(std::make_unique<CountingProvider>(
+      "flatpak", true, std::move(flatpak_result), &flatpak_avail,
+      &flatpak_disc));
+  service->register_provider(std::make_unique<CountingProvider>(
+      "snap", true, std::move(snap_result), &snap_avail, &snap_disc));
+
+  // 1. Legacy GIO-only path via AsyncDiscoveryRunner: Flatpak and Snap must
+  // NOT perform availability checks or discovery.
+  TestPlatformLoop loop;
+  WorkerPoolFixture pool;
+  AsyncDiscoveryRunner runner(
+      service, pool.scheduler(),
+      [&loop](std::function<void()> cb) { loop.post(std::move(cb)); });
+
+  DiscoveryExecutionOutcome gio_only_outcome;
+  runner.discover_async(
+      [&](DiscoveryExecutionOutcome outcome) {
+        gio_only_outcome = std::move(outcome);
+      },
+      DiscoveryRequestOptions::only_providers({"gio"}));
+  loop.run_one();
+
+  expect(gio_avail.load() == 1 && gio_disc.load() == 1,
+         "GIO-only filter must execute GIO provider once");
+  expect(flatpak_avail.load() == 0 && flatpak_disc.load() == 0,
+         "unselected Flatpak provider must not check availability or discover");
+  expect(snap_avail.load() == 0 && snap_disc.load() == 0,
+         "unselected Snap provider must not check availability or discover");
+  expect(gio_only_outcome.applications.size() == 1 &&
+             gio_only_outcome.applications[0].provenance.provider_id == "gio",
+         "GIO-only discovery must return only GIO records");
+  expect(gio_only_outcome.provider_summaries.size() == 1 &&
+             gio_only_outcome.provider_summaries[0].provider_id == "gio",
+         "GIO-only summary must include only selected provider");
+
+  // 2. Unified discovery (all_providers) executes all registered providers.
+  DiscoveryExecutionOutcome unified_outcome;
+  runner.discover_async(
+      [&](DiscoveryExecutionOutcome outcome) {
+        unified_outcome = std::move(outcome);
+      },
+      DiscoveryRequestOptions::all_providers());
+  loop.run_one();
+  pool.join_all();
+
+  expect(gio_avail.load() == 2 && gio_disc.load() == 2,
+         "unified discovery must execute GIO");
+  expect(flatpak_avail.load() == 1 && flatpak_disc.load() == 1,
+         "unified discovery must execute Flatpak");
+  expect(snap_avail.load() == 1 && snap_disc.load() == 1,
+         "unified discovery must execute Snap");
+  expect(unified_outcome.applications.size() == 3,
+         "unified discovery must collect results from all 3 providers");
+}
+
+class FakeSnapBackend final : public SnapBackend {
+ public:
+  FakeSnapBackend(bool available, SnapBackendQueryResult result,
+                  int* list_calls = nullptr)
+      : available_(available),
+        result_(std::move(result)),
+        list_calls_(list_calls) {}
+
+  bool is_available() const override { return available_; }
+
+  SnapBackendQueryResult list_enabled_snaps() override {
+    if (list_calls_ != nullptr) {
+      ++(*list_calls_);
+    }
+    return result_;
+  }
+
+ private:
+  bool available_;
+  SnapBackendQueryResult result_;
+  int* list_calls_;
+};
+
+void test_snap_missing_backend_filtering_parallel_metadata_and_stable_id() {
+  // Missing / null backend.
+  SnapDiscoveryProvider null_provider(nullptr);
+  expect(std::string(null_provider.id()) == "snap",
+         "SnapDiscoveryProvider id() must be snap");
+  expect(!null_provider.is_available(), "null Snap backend is unavailable");
+  expect(!null_provider.discover().ok,
+         "discover() on unavailable Snap backend must fail cleanly");
+
+  int list_calls = 0;
+  {
+    ApplicationDiscoveryService service;
+    service.register_provider(std::make_unique<SnapDiscoveryProvider>(
+        std::make_unique<FakeSnapBackend>(false, SnapBackendQueryResult{},
+                                          &list_calls)));
+    const DiscoveryPassResult pass = service.discover_with_report();
+    expect(list_calls == 0,
+           "unavailable Snap backend must not invoke list_enabled_snaps()");
+    expect(pass.provider_summaries.size() == 1 &&
+               pass.provider_summaries[0].status ==
+                   ProviderExecutionStatus::kUnavailable,
+           "unavailable Snap provider must report kUnavailable");
+  }
+
+  // Filtering, parallel instances, missing optional metadata, and exclusions.
+  SnapBackendQueryResult query;
+  {
+    SnapInstalledRecord app;
+    app.instance_name = "blender";
+    app.package_name = "blender";
+    app.type = "app";
+    app.status = OptionalString::of("active");
+    app.title = OptionalString::of("Blender");
+    app.version = OptionalString::of("4.2.0");
+    app.revision = OptionalString::of("4800");
+    app.channel = OptionalString::of("latest/stable");
+    app.summary = OptionalString::of("3D creation suite");
+    app.description = OptionalString::of("Full 3D modeling and rendering.");
+    app.license = OptionalString::of("GPL-3.0");
+    query.snaps.push_back(std::move(app));
+  }
+  {
+    // Parallel instance with missing optional metadata (no title/version/etc.).
+    SnapInstalledRecord parallel;
+    parallel.instance_name = "blender_nightly";
+    parallel.package_name = "blender_nightly";
+    parallel.type = "app";
+    parallel.status = OptionalString::of("active");
+    query.snaps.push_back(std::move(parallel));
+  }
+  {
+    // Disabled / inactive revision must be excluded.
+    SnapInstalledRecord disabled;
+    disabled.instance_name = "old-app";
+    disabled.package_name = "old-app";
+    disabled.type = "app";
+    disabled.status = OptionalString::of("installed");
+    query.snaps.push_back(std::move(disabled));
+  }
+  for (const char* non_app_type :
+       {"base", "core", "os", "kernel", "gadget", "snapd"}) {
+    SnapInstalledRecord system_pkg;
+    system_pkg.instance_name = std::string("sys-") + non_app_type;
+    system_pkg.package_name = system_pkg.instance_name;
+    system_pkg.type = non_app_type;
+    system_pkg.status = OptionalString::of("active");
+    query.snaps.push_back(std::move(system_pkg));
+  }
+
+  SnapDiscoveryProvider provider(
+      std::make_unique<FakeSnapBackend>(true, std::move(query)));
+  const DiscoveryResult result = provider.discover();
+  expect(result.ok, "Snap discovery should succeed");
+  expect(result.applications.size() == 2,
+         "only active app-type snaps should be included");
+  if (result.applications.size() != 2) return;
+
+  const auto& main_app = result.applications[0];
+  const auto& parallel_app = result.applications[1];
+
+  expect(main_app.application_id == "snap:blender:system",
+         "standard snap application_id should match contract");
+  expect(main_app.provenance.provider_id == "snap" &&
+             main_app.provenance.native_id == "blender" &&
+             main_app.provenance.installation_source ==
+                 InstallationSource::kSnap &&
+             main_app.provenance.installation_scope ==
+                 InstallationScope::kSystem,
+         "Snap provenance must match contract");
+  expect(main_app.package_id.has_value() &&
+             main_app.package_id.value() == "blender",
+         "base package_id should be blender");
+  expect(!main_app.installation_id.has_value(),
+         "non-parallel snap should have unset installation_id");
+  expect(main_app.metadata.name.has_value() &&
+             main_app.metadata.name.value() == "Blender",
+         "title should populate metadata.name");
+  expect(main_app.metadata.version.has_value() &&
+             main_app.metadata.version.value() == "4.2.0",
+         "version should be populated");
+  expect(main_app.metadata.revision.has_value() &&
+             main_app.metadata.revision.value() == "4800",
+         "revision should be populated");
+  expect(main_app.metadata.channel.has_value() &&
+             main_app.metadata.channel.value() == "latest/stable",
+         "channel should be populated");
+  expect(main_app.metadata.summary.has_value() &&
+             main_app.metadata.summary.value() == "3D creation suite",
+         "summary should be populated");
+  expect(main_app.metadata.description.has_value() &&
+             main_app.metadata.description.value() ==
+                 "Full 3D modeling and rendering.",
+         "description should be populated");
+  expect(main_app.metadata.license.has_value() &&
+             main_app.metadata.license.value() == "GPL-3.0",
+         "license should be populated");
+  expect(!main_app.desktop_file_id.has_value() &&
+             !main_app.metadata.executable.has_value() &&
+             main_app.classification == ApplicationClassification::kUnknown &&
+             main_app.desktop_menu_visibility ==
+                 DesktopMenuVisibility::kUnknown &&
+             main_app.capabilities.launchable == CapabilityState::kUnknown,
+         "Snap provider must not fabricate desktop ID, executable, "
+         "classification, visibility, or capabilities");
+
+  // Parallel install checks.
+  expect(parallel_app.application_id == "snap:blender_nightly:system:nightly",
+         "parallel snap must preserve distinct instance identity");
+  expect(parallel_app.application_id != main_app.application_id,
+         "parallel install must not collide with default install");
+  expect(parallel_app.package_id.has_value() &&
+             parallel_app.package_id.value() == "blender",
+         "parallel install package_id should resolve to base snap name");
+  expect(parallel_app.installation_id.has_value() &&
+             parallel_app.installation_id.value() == "nightly",
+         "parallel install should record instance key in installation_id");
+  expect(parallel_app.metadata.name.has_value() &&
+             parallel_app.metadata.name.value() == "blender_nightly",
+         "missing title should fall back to instance name");
+  expect(!parallel_app.metadata.version.has_value() &&
+             !parallel_app.metadata.revision.has_value() &&
+             !parallel_app.metadata.channel.has_value() &&
+             !parallel_app.metadata.summary.has_value() &&
+             !parallel_app.metadata.description.has_value() &&
+             !parallel_app.metadata.license.has_value(),
+         "missing optional Snap metadata must stay unset");
+
+  // Identity stability across version, revision, and title updates.
+  SnapBackendQueryResult updated_query;
+  SnapInstalledRecord updated;
+  updated.instance_name = "blender";
+  updated.package_name = "blender";
+  updated.type = "app";
+  updated.status = OptionalString::of("active");
+  updated.title = OptionalString::of("Blender Studio");
+  updated.version = OptionalString::of("4.3.1");
+  updated.revision = OptionalString::of("5120");
+  updated_query.snaps.push_back(std::move(updated));
+
+  SnapDiscoveryProvider updated_provider(
+      std::make_unique<FakeSnapBackend>(true, std::move(updated_query)));
+  const DiscoveryResult updated_result = updated_provider.discover();
+  expect(updated_result.ok && updated_result.applications.size() == 1 &&
+             updated_result.applications[0].application_id ==
+                 main_app.application_id,
+         "Snap application_id must remain stable across updates and revisions");
+}
+
+void test_snap_provider_failure_isolation() {
+  DiscoveryResult gio_result;
+  gio_result.applications.push_back(make_gio_app(
+      "org.example.Editor.desktop", "Editor", true, false, false));
+
+  SnapBackendQueryResult snap_err;
+  snap_err.ok = false;
+  snap_err.error_kind = SnapQueryErrorKind::kPermissionDenied;
+  snap_err.error_message = "access denied";
+
+  ApplicationDiscoveryService service;
+  service.register_provider(std::make_unique<FakeDiscoveryProvider>(
+      "gio", true, std::move(gio_result)));
+  service.register_provider(std::make_unique<SnapDiscoveryProvider>(
+      std::make_unique<FakeSnapBackend>(true, std::move(snap_err))));
+
+  const DiscoveryPassResult pass = service.discover_with_report();
+  expect(pass.applications.size() == 1 &&
+             pass.applications[0].provenance.provider_id == "gio",
+         "Snap failure must not break GIO discovery");
+  expect(pass.provider_summaries.size() == 2 &&
+             pass.provider_summaries[1].provider_id == "snap" &&
+             pass.provider_summaries[1].status ==
+                 ProviderExecutionStatus::kFailed &&
+             pass.provider_summaries[1].error_message.find(
+                 "permission denied") != std::string::npos,
+         "Snap failure must be reported accurately");
+}
+
+// --- Real mock UNIX domain socket server tests for SnapdSocketBackend ---
+
+class MockUnixSocketServer {
+ public:
+  explicit MockUnixSocketServer(
+      std::function<void(int client_fd, const std::string& request)> handler)
+      : handler_(std::move(handler)) {
+    static std::atomic<int> counter{0};
+    socket_path_ = "/tmp/fda-snap-" + std::to_string(getpid()) + "-" +
+                   std::to_string(counter.fetch_add(1)) + ".sock";
+    unlink(socket_path_.c_str());
+
+    listen_fd_ = socket(AF_UNIX, SOCK_STREAM, 0);
+    expect(listen_fd_ >= 0, "mock unix socket creation must succeed");
+    if (listen_fd_ < 0) return;
+
+    struct sockaddr_un addr {};
+    addr.sun_family = AF_UNIX;
+    std::memcpy(addr.sun_path, socket_path_.c_str(), socket_path_.size() + 1);
+    const bool bound =
+        bind(listen_fd_, reinterpret_cast<struct sockaddr*>(&addr),
+             sizeof(addr)) == 0;
+    expect(bound, "mock unix socket bind must succeed");
+    const bool listening = bound && listen(listen_fd_, 4) == 0;
+    expect(listening, "mock unix socket listen must succeed");
+    if (!listening) {
+      close(listen_fd_);
+      listen_fd_ = -1;
+      return;
+    }
+
+    server_thread_ = std::thread([this]() {
+      const int client = accept(listen_fd_, nullptr, nullptr);
+      if (client < 0) return;
+      std::string request;
+      char buf[1024];
+      while (request.find("\r\n\r\n") == std::string::npos) {
+        const ssize_t n = recv(client, buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        request.append(buf, static_cast<size_t>(n));
+      }
+      if (handler_) {
+        handler_(client, request);
+      }
+      close(client);
+    });
+  }
+
+  ~MockUnixSocketServer() {
+    if (listen_fd_ >= 0) {
+      shutdown(listen_fd_, SHUT_RDWR);
+      close(listen_fd_);
+    }
+    if (server_thread_.joinable()) {
+      server_thread_.join();
+    }
+    if (!socket_path_.empty()) {
+      unlink(socket_path_.c_str());
+    }
+  }
+
+  const std::string& path() const { return socket_path_; }
+
+ private:
+  std::string socket_path_;
+  int listen_fd_ = -1;
+  std::function<void(int, const std::string&)> handler_;
+  std::thread server_thread_;
+};
+
+void send_all(int fd, const std::string& payload) {
+  size_t offset = 0;
+#ifdef MSG_NOSIGNAL
+  const int flags = MSG_NOSIGNAL;
+#else
+  const int flags = 0;
+#endif
+  while (offset < payload.size()) {
+    const ssize_t n = send(fd, payload.data() + offset,
+                           payload.size() - offset, flags);
+    if (n <= 0) break;
+    offset += static_cast<size_t>(n);
+  }
+}
+
+void test_snapd_socket_backend_end_to_end() {
+  // 1. Missing socket -> unavailable.
+  {
+    SnapdSocketConfig cfg;
+    cfg.socket_path = "/tmp/fda-snap-does-not-exist-99999.sock";
+    auto backend = create_snapd_socket_backend(cfg);
+    expect(!backend->is_available(),
+           "missing snapd socket must report is_available() == false");
+    const auto res = backend->list_enabled_snaps();
+    expect(!res.ok && res.error_kind == SnapQueryErrorKind::kDaemonUnavailable,
+           "missing socket query must report kDaemonUnavailable");
+  }
+
+  // 2. Stale socket (nobody listening -> ECONNREFUSED).
+  {
+    const std::string stale_path =
+        "/tmp/fda-snap-stale-" + std::to_string(getpid()) + ".sock";
+    unlink(stale_path.c_str());
+    const int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un addr {};
+    addr.sun_family = AF_UNIX;
+    std::memcpy(addr.sun_path, stale_path.c_str(), stale_path.size() + 1);
+    const bool bound =
+        fd >= 0 &&
+        bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0;
+    if (fd >= 0) close(fd);
+    expect(bound, "stale unix socket setup must succeed");
+
+    SnapdSocketConfig cfg;
+    cfg.socket_path = stale_path;
+    auto backend = create_snapd_socket_backend(cfg);
+    expect(backend->is_available(), "stale socket file exists as a socket");
+    const auto res = backend->list_enabled_snaps();
+    unlink(stale_path.c_str());
+    expect(!res.ok && res.error_kind == SnapQueryErrorKind::kDaemonUnavailable,
+           "refused snapd socket must report kDaemonUnavailable");
+  }
+
+  // 3. Valid HTTP/1.1 chunked response with app, parallel install, UTF-8
+  // escapes, and excluded non-app types.
+  {
+    std::string observed_request;
+    const std::string json_body =
+        R"({"type":"sync","status-code":200,"status":"OK","result":[)"
+        R"({"name":"code","type":"app","status":"active","title":"VS Code \u2713",)"
+        R"("version":"1.90.0","revision":"160","tracking-channel":"latest/stable",)"
+        R"("summary":"Code editor","description":"Extensible editor","license":"MIT"},)"
+        R"({"name":"code_insiders","instance-name":"code_insiders","instance-key":"insiders",)"
+        R"("type":"app","status":"active","version":"1.91.0","revision":161,"channel":"latest/edge"},)"
+        R"({"name":"core22","type":"base","status":"active"},)"
+        R"({"name":"snapd","type":"snapd","status":"active"})"
+        R"(]})";
+
+    // Split body into two HTTP chunks to exercise chunked decoding.
+    const size_t split = json_body.size() / 2;
+    char hex1[32];
+    char hex2[32];
+    std::snprintf(hex1, sizeof(hex1), "%zx", split);
+    std::snprintf(hex2, sizeof(hex2), "%zx", json_body.size() - split);
+    const std::string http =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/json\r\n"
+        "Transfer-Encoding: chunked\r\n\r\n" +
+        std::string(hex1) + "\r\n" + json_body.substr(0, split) + "\r\n" +
+        std::string(hex2) + "\r\n" + json_body.substr(split) + "\r\n0\r\n\r\n";
+
+    MockUnixSocketServer server([&](int client_fd, const std::string& req) {
+      observed_request = req;
+      send_all(client_fd, http);
+    });
+
+    SnapdSocketConfig cfg;
+    cfg.socket_path = server.path();
+    SnapDiscoveryProvider provider(create_snapd_socket_backend(cfg));
+    expect(provider.is_available(), "mock snapd socket must be available");
+    const DiscoveryResult result = provider.discover();
+
+    expect(observed_request.find("GET /v2/snaps?select=enabled HTTP/1.1\r\n") ==
+               0,
+           "backend must request GET /v2/snaps?select=enabled");
+    expect(result.ok && result.applications.size() == 2,
+           "chunked snapd response should yield 2 app-type snaps");
+    if (result.applications.size() == 2) {
+      expect(result.applications[0].application_id == "snap:code:system",
+             "first snap ID must match");
+      expect(result.applications[0].metadata.name.has_value() &&
+                 result.applications[0].metadata.name.value() ==
+                     "VS Code \xE2\x9C\x93",
+             "JSON \\u2713 escape must decode to UTF-8");
+      expect(result.applications[0].metadata.channel.has_value() &&
+                 result.applications[0].metadata.channel.value() ==
+                     "latest/stable",
+             "tracking-channel must be preferred");
+      expect(result.applications[1].application_id ==
+                 "snap:code_insiders:system:insiders",
+             "parallel snap over socket must keep distinct identity");
+      expect(result.applications[1].metadata.revision.has_value() &&
+                 result.applications[1].metadata.revision.value() == "161",
+             "numeric revision must decode cleanly");
+    }
+  }
+
+  // 4. Successful empty result.
+  {
+    const std::string body =
+        R"({"type":"sync","status-code":200,"status":"OK","result":[]})";
+    const std::string http =
+        "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(body.size()) +
+        "\r\n\r\n" + body;
+    MockUnixSocketServer server([&](int client_fd, const std::string&) {
+      send_all(client_fd, http);
+    });
+
+    SnapdSocketConfig cfg;
+    cfg.socket_path = server.path();
+    SnapDiscoveryProvider provider(create_snapd_socket_backend(cfg));
+    const DiscoveryResult result = provider.discover();
+    expect(result.ok && result.applications.empty(),
+           "empty snapd result array must succeed with 0 apps");
+  }
+
+  // 5. Permission denied (HTTP 403 error envelope).
+  {
+    const std::string body =
+        R"({"type":"error","status-code":403,"status":"Forbidden","result":{"message":"access denied"}})";
+    const std::string http =
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: " +
+        std::to_string(body.size()) + "\r\n\r\n" + body;
+    MockUnixSocketServer server([&](int client_fd, const std::string&) {
+      send_all(client_fd, http);
+    });
+
+    SnapdSocketConfig cfg;
+    cfg.socket_path = server.path();
+    auto backend = create_snapd_socket_backend(cfg);
+    const auto res = backend->list_enabled_snaps();
+    expect(!res.ok && res.error_kind == SnapQueryErrorKind::kPermissionDenied,
+           "HTTP 403 from snapd must report kPermissionDenied");
+  }
+
+  // 6. Request timeout (server holds socket open until client times out).
+  {
+    Latch release_server(1);
+    MockUnixSocketServer server([&](int, const std::string&) {
+      release_server.wait();
+    });
+
+    SnapdSocketConfig cfg;
+    cfg.socket_path = server.path();
+    cfg.connect_timeout_ms = 200;
+    cfg.request_timeout_ms = 60;
+    auto backend = create_snapd_socket_backend(cfg);
+    const auto res = backend->list_enabled_snaps();
+    release_server.count_down();
+    expect(!res.ok && res.error_kind == SnapQueryErrorKind::kTimeout,
+           "hung snapd server must trigger bounded kTimeout");
+  }
+
+  // 7. Malformed HTTP response.
+  {
+    MockUnixSocketServer server([&](int client_fd, const std::string&) {
+      send_all(client_fd, "NOT-HTTP\r\n\r\n{}");
+    });
+
+    SnapdSocketConfig cfg;
+    cfg.socket_path = server.path();
+    auto backend = create_snapd_socket_backend(cfg);
+    const auto res = backend->list_enabled_snaps();
+    expect(!res.ok && res.error_kind == SnapQueryErrorKind::kProtocolError,
+           "malformed HTTP response must report kProtocolError");
+  }
+
+  // 8. Malformed JSON response.
+  {
+    const std::string body = "{\"type\":\"sync\",\"result\":[unterminated";
+    const std::string http =
+        "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(body.size()) +
+        "\r\n\r\n" + body;
+    MockUnixSocketServer server([&](int client_fd, const std::string&) {
+      send_all(client_fd, http);
+    });
+
+    SnapdSocketConfig cfg;
+    cfg.socket_path = server.path();
+    auto backend = create_snapd_socket_backend(cfg);
+    const auto res = backend->list_enabled_snaps();
+    expect(!res.ok && res.error_kind == SnapQueryErrorKind::kProtocolError,
+           "malformed JSON must report kProtocolError");
+  }
+
+  // 9. Oversized response rejected cleanly.
+  {
+    const std::string body(2048, 'a');
+    const std::string http =
+        "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(body.size()) +
+        "\r\n\r\n" + body;
+    MockUnixSocketServer server([&](int client_fd, const std::string&) {
+      send_all(client_fd, http);
+    });
+
+    SnapdSocketConfig cfg;
+    cfg.socket_path = server.path();
+    cfg.max_response_bytes = 256;
+    auto backend = create_snapd_socket_backend(cfg);
+    const auto res = backend->list_enabled_snaps();
+    expect(!res.ok && res.error_kind == SnapQueryErrorKind::kProtocolError,
+           "oversized snapd response must be rejected with kProtocolError");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -1344,6 +1993,10 @@ int main() {
   test_flatpak_scopes_named_installs_branches_arches_metadata_and_runtimes();
   test_flatpak_partial_and_total_installation_failures();
   test_flatpak_ownership_and_legacy_list_apps_compatibility();
+  test_provider_filtering_legacy_gio_only_vs_unified();
+  test_snap_missing_backend_filtering_parallel_metadata_and_stable_id();
+  test_snap_provider_failure_isolation();
+  test_snapd_socket_backend_end_to_end();
 
   if (g_failures > 0) {
     std::cerr << g_failures << " test assertion(s) failed.\n";

@@ -16,6 +16,8 @@ add_library(${PLUGIN_NAME} SHARED
   discovery/gio_discovery_provider.cc
   discovery/legacy_list_apps_adapter.cc
   discovery/libflatpak_backend.cc
+  discovery/snap_discovery_provider.cc
+  discovery/snapd_socket_backend.cc
 )
 apply_standard_settings(${PLUGIN_NAME})
 set_target_properties(${PLUGIN_NAME} PROPERTIES CXX_VISIBILITY_PRESET hidden)

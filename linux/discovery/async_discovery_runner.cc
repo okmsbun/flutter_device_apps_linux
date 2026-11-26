@@ -13,6 +13,7 @@ namespace {
 
 struct PendingDiscoveryRequest {
   std::shared_ptr<std::atomic<bool>> cancelled;
+  DiscoveryRequestOptions options;
   AsyncDiscoveryRunner::CompletionCallback on_complete;
 };
 
@@ -58,7 +59,7 @@ AsyncDiscoveryRunner::~AsyncDiscoveryRunner() {
 }
 
 DiscoveryRequestHandle AsyncDiscoveryRunner::discover_async(
-    CompletionCallback on_complete) {
+    CompletionCallback on_complete, DiscoveryRequestOptions options) {
   auto cancelled = std::make_shared<std::atomic<bool>>(false);
   DiscoveryRequestHandle handle(cancelled);
 
@@ -71,6 +72,7 @@ DiscoveryRequestHandle AsyncDiscoveryRunner::discover_async(
     } else {
       PendingDiscoveryRequest request;
       request.cancelled = cancelled;
+      request.options = std::move(options);
       request.on_complete = std::move(on_complete);
       state_->queue.push(std::move(request));
       if (!state_->worker_active) {
@@ -191,7 +193,8 @@ void AsyncDiscoveryRunner::run_worker_loop(
       outcome.status = DiscoveryExecutionStatus::kCompleted;
     } else {
       try {
-        DiscoveryPassResult pass = state->service->discover_with_report();
+        DiscoveryPassResult pass =
+            state->service->discover_with_report(request.options);
         outcome.status = DiscoveryExecutionStatus::kCompleted;
         outcome.applications = std::move(pass.applications);
         outcome.provider_summaries = std::move(pass.provider_summaries);

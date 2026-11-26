@@ -5,11 +5,30 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "application_discovery_provider.h"
 
 namespace flutter_device_apps_linux {
+
+// Controls which registered providers execute during a discovery pass.
+// Empty provider_ids selects all registered providers; non-empty selects only
+// providers whose id() matches an entry, without touching unselected providers.
+struct DiscoveryRequestOptions {
+  std::vector<std::string> provider_ids;
+
+  static DiscoveryRequestOptions all_providers() {
+    return DiscoveryRequestOptions{};
+  }
+
+  static DiscoveryRequestOptions only_providers(
+      std::vector<std::string> ids) {
+    DiscoveryRequestOptions options;
+    options.provider_ids = std::move(ids);
+    return options;
+  }
+};
 
 // Per-provider outcome recorded during a discovery pass.
 enum class ProviderExecutionStatus {
@@ -27,7 +46,7 @@ struct ProviderExecutionSummary {
   std::string error_message;
 };
 
-// Aggregated result of a discovery pass across all registered providers.
+// Aggregated result of a discovery pass across all selected providers.
 struct DiscoveryPassResult {
   std::vector<DiscoveredApplication> applications;
   std::vector<ProviderExecutionSummary> provider_summaries;
@@ -60,12 +79,17 @@ class ApplicationDiscoveryService {
   // Returns the number of registered discovery providers.
   size_t provider_count() const;
 
-  // Invokes available registered providers in registration order and returns
-  // both discovered applications and per-provider execution summaries.
-  DiscoveryPassResult discover_with_report();
+  // Invokes selected available registered providers in registration order and
+  // returns both discovered applications and per-provider execution summaries.
+  // Unselected providers do not perform availability checks or discovery.
+  DiscoveryPassResult discover_with_report(
+      const DiscoveryRequestOptions& options =
+          DiscoveryRequestOptions::all_providers());
 
   // Convenience entry point returning only collected applications.
-  std::vector<DiscoveredApplication> discover_applications();
+  std::vector<DiscoveredApplication> discover_applications(
+      const DiscoveryRequestOptions& options =
+          DiscoveryRequestOptions::all_providers());
 
  private:
   mutable std::mutex mutex_;
