@@ -1,10 +1,14 @@
 #include "include/flutter_device_apps_linux/flutter_device_apps_linux_plugin.h"
 
+#include "discovery/application_discovery_service.h"
+#include "discovery/gio_discovery_provider.h"
 #include "elf_dependencies.h"
 
 #include <gio/gdesktopappinfo.h>
 
+#include <memory>
 #include <string>
+#include <vector>
 
 static void set_string(FlValue* map, const char* key, const char* value) {
   if (value != nullptr) {
@@ -64,6 +68,31 @@ static FlValue* app_list(GList* infos, bool only_visible) {
   }
   g_list_free_full(infos, g_object_unref);
   return apps;
+}
+
+static FlValue* discovered_app_value(
+    const flutter_device_apps_linux::DiscoveredApplication& app) {
+  FlValue* value = fl_value_new_map();
+  set_string(value, "desktopFileId", app.desktop_file_id.c_str());
+  if (app.has_app_name) {
+    set_string(value, "appName", app.app_name.c_str());
+  }
+  fl_value_set_string_take(value, "supportsFiles",
+                           fl_value_new_bool(app.supports_files));
+  fl_value_set_string_take(value, "supportsUris",
+                           fl_value_new_bool(app.supports_uris));
+  fl_value_set_string_take(value, "requiresTerminal",
+                           fl_value_new_bool(app.requires_terminal));
+  return value;
+}
+
+static FlValue* discovered_app_list(
+    const std::vector<flutter_device_apps_linux::DiscoveredApplication>& apps) {
+  FlValue* list = fl_value_new_list();
+  for (const auto& app : apps) {
+    fl_value_append_take(list, discovered_app_value(app));
+  }
+  return list;
 }
 
 static FlValue* search_apps(const char* query) {
@@ -303,10 +332,18 @@ static void schedule_query(FlMethodCall* call, QueryKind kind, const char* targe
   g_task_run_in_thread(task, run_query);
 }
 
-static void handle_method_call(FlMethodChannel*, FlMethodCall* call, gpointer) {
+static void handle_method_call(FlMethodChannel*, FlMethodCall* call,
+                               gpointer user_data) {
   const char* method = fl_method_call_get_name(call);
   if (g_str_equal(method, "listApps")) {
-    g_autoptr(FlValue) apps = app_list(g_app_info_get_all(), true);
+    auto* discovery_service =
+        static_cast<flutter_device_apps_linux::ApplicationDiscoveryService*>(
+            user_data);
+    const auto discovered =
+        discovery_service == nullptr
+            ? std::vector<flutter_device_apps_linux::DiscoveredApplication>{}
+            : discovery_service->discover_applications();
+    g_autoptr(FlValue) apps = discovered_app_list(discovered);
     fl_method_call_respond_success(call, apps, nullptr);
     return;
   }
@@ -389,12 +426,26 @@ static void handle_method_call(FlMethodChannel*, FlMethodCall* call, gpointer) {
   fl_method_call_respond_success(call, response, nullptr);
 }
 
+static std::unique_ptr<flutter_device_apps_linux::ApplicationDiscoveryService>
+create_discovery_service() {
+  auto service = std::make_unique<
+      flutter_device_apps_linux::ApplicationDiscoveryService>();
+  service->register_provider(
+      std::make_unique<flutter_device_apps_linux::GioDiscoveryProvider>());
+  return service;
+}
+
 void flutter_device_apps_linux_plugin_register_with_registrar(
     FlPluginRegistrar* registrar) {
   g_autoptr(FlStandardMethodCodec) codec = fl_standard_method_codec_new();
   g_autoptr(FlMethodChannel) channel = fl_method_channel_new(
       fl_plugin_registrar_get_messenger(registrar),
       "flutter_device_apps_linux/methods", FL_METHOD_CODEC(codec));
-  fl_method_channel_set_method_call_handler(channel, handle_method_call, nullptr,
-                                            nullptr);
+  auto discovery_service = create_discovery_service();
+  fl_method_channel_set_method_call_handler(
+      channel, handle_method_call, discovery_service.release(),
+      [](gpointer data) {
+        delete static_cast<
+            flutter_device_apps_linux::ApplicationDiscoveryService*>(data);
+      });
 }

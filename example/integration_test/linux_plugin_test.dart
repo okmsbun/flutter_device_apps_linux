@@ -13,7 +13,16 @@ void main() {
 
   testWidgets('lists and searches visible desktop entries', (_) async {
     final apps = await FlutterDeviceAppsLinux.listApps();
-    expect(apps.any((app) => app.desktopFileId == _id), isTrue);
+    final fixture = apps.where((app) => app.desktopFileId == _id).toList();
+    expect(fixture, hasLength(1));
+    expect(fixture.single.appName, 'Device Apps Linux Fixture');
+    expect(fixture.single.supportsFiles, isTrue);
+    expect(fixture.single.supportsUris, isFalse);
+    expect(fixture.single.requiresTerminal, isFalse);
+    expect(fixture.single.description, isNull);
+    expect(fixture.single.desktopFilePath, isNull);
+    expect(fixture.single.categories, isEmpty);
+    expect(fixture.single.mimeTypes, isEmpty);
     expect(apps.any((app) => app.desktopFileId == _hiddenId), isFalse);
 
     final search = await FlutterDeviceAppsLinux.searchApps('deviceappsfixture');
