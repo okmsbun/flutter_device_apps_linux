@@ -141,6 +141,16 @@ struct ApplicationCapabilities {
   CapabilityState launchable = CapabilityState::kUnknown;
 };
 
+// Non-authoritative desktop-entry markers (such as X-Flatpak,
+// X-SnapInstanceName, X-AppImage-*) preserved strictly as correlation hints,
+// never as independent proof of installation source.
+struct DesktopCorrelationHints {
+  OptionalString flatpak_app_id;
+  OptionalString snap_instance_name;
+  bool has_appimage_marker = false;
+  OptionalString appimage_version;
+};
+
 // Unified internal representation of a discovered application.
 // Owns all data directly and stays independent of Flutter, GTK, GIO, and
 // provider-specific native handles so records can later cross worker threads.
@@ -158,6 +168,9 @@ struct DiscoveredApplication {
 
   // Optional absolute path to the .desktop file when discovered via GIO.
   OptionalString desktop_file_path;
+
+  // Optional non-authoritative correlation hints parsed from desktop entries.
+  DesktopCorrelationHints correlation_hints;
 
   // Optional package identifier (for example, Flatpak app ID or DPKG package).
   OptionalString package_id;

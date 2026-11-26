@@ -234,6 +234,43 @@ int run_fixture(const char* root_dir, const char* fixture_dbpath,
   expect(parsed_pairs == expected_pairs,
          "PacmanDiscoveryProvider output must match pacman -Q reference output");
 
+  // --- Runtime file ownership via alpm_pkg_get_files (exact paths only) ---
+  {
+    LibAlpmConfig own_cfg;
+    own_cfg.pacman_conf_path = pacman_conf_path;
+    auto own_backend = create_libalpm_backend(own_cfg);
+    const std::string owned_path =
+        std::string(root_dir) + "/usr/share/applications/example-app.desktop";
+    const std::string unowned_path =
+        std::string(root_dir) + "/usr/share/applications/unowned.desktop";
+    const auto own = own_backend->find_file_owners({owned_path, unowned_path});
+    expect(own.ok, "libalpm file ownership query must succeed");
+    expect(own.owners.size() == 1 && own.owners[0].path == owned_path &&
+               own.owners[0].package_name == "example-app",
+           "alpm_pkg_get_files must attribute only the exact owned path");
+    expect(!path_exists(lock_path),
+           "ownership query must not create db.lck");
+
+    const std::string oracle_cmd = std::string("pacman --root '") + root_dir +
+                                   "' --dbpath '" + fixture_dbpath +
+                                   "' -Qoq '" + owned_path + "'";
+    FILE* own_pipe = popen(oracle_cmd.c_str(), "r");
+    std::string oracle_name;
+    if (own_pipe != nullptr) {
+      char name_buf[512];
+      if (std::fgets(name_buf, sizeof(name_buf), own_pipe) != nullptr) {
+        oracle_name = name_buf;
+        while (!oracle_name.empty() &&
+               (oracle_name.back() == '\n' || oracle_name.back() == '\r')) {
+          oracle_name.pop_back();
+        }
+      }
+      pclose(own_pipe);
+    }
+    expect(oracle_name == "example-app",
+           "pacman -Qoq reference must agree with libalpm file ownership");
+  }
+
   if (g_failures > 0) return 1;
   std::cout << "Pacman local fixture, db.lck non-interference, and pacman -Q "
                "parity test passed ("

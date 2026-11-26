@@ -7,36 +7,12 @@
 #include "appstream_metadata.h"
 #include "discovered_application.h"
 #include "installed_package.h"
+#include "package_ownership.h"
 
 namespace flutter_device_apps_linux {
 
 struct ProviderExecutionSummary;
 struct DiscoveryPassResult;
-
-// Authoritative file-to-package ownership evidence returned by a documented
-// package database lookup (for example, RPM RPMDBI_BASENAMES, libalpm file
-// list, DPKG info lists, or Nix store path ownership).
-struct PackageOwnershipEvidence {
-  std::string package_provider_id;  // "dpkg", "rpm", "pacman", "nix"
-  OptionalString package_identity_id;
-  std::string package_name;
-  OptionalString architecture;
-  InstallationScope scope = InstallationScope::kSystem;
-  OptionalString profile_path;
-};
-
-// Optional seam for querying documented package ownership databases for a
-// specific file path (such as a .desktop file). Implementations must never use
-// filesystem heuristics, recursive scanning, or shell commands.
-class PackageOwnershipLookup {
- public:
-  virtual ~PackageOwnershipLookup() = default;
-
-  // Returns all authoritative package owners for `file_path`. Returns empty if
-  // unknown, or multiple entries if ownership is shared/ambiguous.
-  virtual std::vector<PackageOwnershipEvidence> lookup_file_owners(
-      const std::string& file_path) const = 0;
-};
 
 // Preserves field-level metadata disagreements between authoritative sources
 // without silently dropping conflicting values.

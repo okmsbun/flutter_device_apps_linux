@@ -24,6 +24,8 @@ add_library(${PLUGIN_NAME} SHARED
   discovery/libflatpak_backend.cc
   discovery/librpm_backend.cc
   discovery/nix_discovery_provider.cc
+  discovery/package_ownership.cc
+  discovery/package_ownership_indexers.cc
   discovery/pacman_discovery_provider.cc
   discovery/rpm_discovery_provider.cc
   discovery/snap_discovery_provider.cc

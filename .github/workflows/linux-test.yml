@@ -94,6 +94,8 @@ jobs:
             linux/discovery/json_parser.cc \
             linux/discovery/legacy_list_apps_adapter.cc \
             linux/discovery/nix_discovery_provider.cc \
+            linux/discovery/package_ownership.cc \
+            linux/discovery/package_ownership_indexers.cc \
             linux/discovery/pacman_discovery_provider.cc \
             linux/discovery/rpm_discovery_provider.cc \
             linux/discovery/snap_discovery_provider.cc \
@@ -115,6 +117,8 @@ jobs:
             linux/discovery/json_parser.cc \
             linux/discovery/legacy_list_apps_adapter.cc \
             linux/discovery/nix_discovery_provider.cc \
+            linux/discovery/package_ownership.cc \
+            linux/discovery/package_ownership_indexers.cc \
             linux/discovery/pacman_discovery_provider.cc \
             linux/discovery/rpm_discovery_provider.cc \
             linux/discovery/snap_discovery_provider.cc \
@@ -316,6 +320,7 @@ jobs:
             linux/discovery/appstream_metadata_provider.cc \
             linux/discovery/discovery_resolution.cc \
             linux/discovery/libappstream_backend.cc \
+            linux/discovery/package_ownership.cc \
             linux/test/appstream_metadata_provider_test.cc \
             $(pkg-config --libs gio-unix-2.0 gmodule-2.0) \
             -o /tmp/appstream_metadata_provider_test
@@ -387,6 +392,10 @@ jobs:
             -Ilinux \
             linux/discovery/application_identity.cc \
             linux/discovery/dpkg_discovery_provider.cc \
+            linux/discovery/package_ownership.cc \
+            linux/discovery/package_ownership_indexers.cc \
+            linux/discovery/pacman_discovery_provider.cc \
+            linux/discovery/rpm_discovery_provider.cc \
             linux/test/dpkg_discovery_provider_test.cc \
             -o /tmp/dpkg_discovery_provider_test
           /tmp/dpkg_discovery_provider_test
@@ -480,7 +489,12 @@ jobs:
           %description
           Minimal fixture package without epoch or vendor.
 
+          %install
+          mkdir -p %{buildroot}/usr/share/applications
+          printf '[Desktop Entry]\nName=Tool\n' > %{buildroot}/usr/share/applications/example-tool.desktop
+
           %files
+          /usr/share/applications/example-tool.desktop
           EOF
 
           rpmbuild --define "_topdir $rpm_work/rpmbuild" -bb "$rpm_work/rpmbuild/SPECS/example-multi-1.spec"
@@ -538,7 +552,8 @@ jobs:
             alpm_pkg_get_packager \
             alpm_pkg_get_licenses \
             alpm_pkg_get_groups \
-            alpm_pkg_get_reason; do
+            alpm_pkg_get_reason \
+            alpm_pkg_get_files; do
             if ! nm -D --defined-only "$libalpm_path" | grep -q " ${sym}$"; then
               echo "Required libalpm symbol not exported: $sym"
               exit 1
@@ -641,6 +656,11 @@ jobs:
           %LICENSE%
           GPL-3.0-or-later
           EOF
+
+          # File list and on-disk file for exact ownership verification.
+          mkdir -p "$pacman_work/root/usr/share/applications"
+          printf '[Desktop Entry]\nName=Example\n' > "$pacman_work/root/usr/share/applications/example-app.desktop"
+          printf '%%FILES%%\nusr/\nusr/share/\nusr/share/applications/\nusr/share/applications/example-app.desktop\n' > "$pacman_work/fixture_db/local/example-app-1.2.3-1/files"
 
           cat > "$pacman_work/pacman.conf" <<EOF
           # Offline Pacman fixture config

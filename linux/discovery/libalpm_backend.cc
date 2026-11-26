@@ -2,13 +2,17 @@
 
 #include <gmodule.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -22,6 +26,20 @@ struct AlpmListNode {
   void* data;
   AlpmListNode* prev;
   AlpmListNode* next;
+};
+
+// alpm_filelist_t / alpm_file_t layout (alpm.h, stable across so.13-16):
+//   typedef struct { size_t count; alpm_file_t* files; } alpm_filelist_t;
+//   typedef struct { char* name; off_t size; mode_t mode; } alpm_file_t;
+// The element stride relies on a 64-bit off_t, which is verified at runtime.
+struct AlpmFileEntry {
+  char* name;
+  off_t size;
+  mode_t mode;
+};
+struct AlpmFileList {
+  size_t count;
+  AlpmFileEntry* files;
 };
 
 // alpm_pkgreason_t values in alpm.h across libalpm.so.13-16.
@@ -45,6 +63,7 @@ struct LibAlpmSymbols {
   AlpmListNode* (*pkg_get_licenses)(void*) = nullptr;
   AlpmListNode* (*pkg_get_groups)(void*) = nullptr;
   int (*pkg_get_reason)(void*) = nullptr;
+  AlpmFileList* (*pkg_get_files)(void*) = nullptr;
 };
 
 template <typename Fn>
@@ -277,6 +296,95 @@ class LibAlpmBackend final : public PacmanBackend {
     return result;
   }
 
+  PacmanFileOwnershipResult find_file_owners(
+      const std::vector<std::string>& absolute_paths) override {
+    ensure_initialized();
+    PacmanFileOwnershipResult result;
+    if (!available_) {
+      result.ok = false;
+      result.error_kind = init_error_kind_;
+      result.error_message = unavailable_reason_;
+      return result;
+    }
+    if (symbols_.pkg_get_files == nullptr || sizeof(off_t) != 8) {
+      result.ok = false;
+      result.error_kind = PacmanQueryErrorKind::kUnsupportedAbi;
+      result.error_message =
+          "alpm_pkg_get_files is unavailable or off_t is not 64-bit";
+      return result;
+    }
+
+    const PacmanResolvedPaths paths = resolve_pacman_db_paths(
+        config_.pacman_conf_path, config_.root_dir, config_.db_path);
+    const std::string local_dir = join_path(paths.db_path, "local");
+    struct stat st;
+    errno = 0;
+    if (stat(local_dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode) ||
+        access(local_dir.c_str(), R_OK | X_OK) != 0) {
+      const int err = errno;
+      result.ok = false;
+      result.error_kind = (err == EACCES || err == EPERM)
+                              ? PacmanQueryErrorKind::kPermissionDenied
+                              : PacmanQueryErrorKind::kDatabaseUnavailable;
+      result.error_message =
+          local_dir + (err != 0 ? std::string(": ") + std::strerror(err)
+                                : std::string(" is not a readable directory"));
+      return result;
+    }
+
+    // libalpm file names are relative to RootDir without a leading slash.
+    std::string root = paths.root_dir;
+    while (root.size() > 1 && root.back() == '/') root.pop_back();
+    const std::string root_prefix = root == "/" ? "/" : root + "/";
+    std::unordered_map<std::string, std::string> relative_to_target;
+    for (const auto& target : absolute_paths) {
+      if (target.compare(0, root_prefix.size(), root_prefix) != 0) continue;
+      const std::string rel = target.substr(root_prefix.size());
+      if (!rel.empty()) relative_to_target[rel] = target;
+    }
+    if (relative_to_target.empty()) return result;
+
+    int init_err = 0;
+    void* handle = symbols_.initialize(paths.root_dir.c_str(),
+                                       paths.db_path.c_str(), &init_err);
+    if (handle == nullptr) {
+      const char* msg = symbols_.strerror(init_err);
+      result.ok = false;
+      result.error_kind = PacmanQueryErrorKind::kDatabaseUnavailable;
+      result.error_message = (msg != nullptr && *msg != '\0')
+                                 ? std::string(msg)
+                                 : std::string("alpm_initialize() failed");
+      return result;
+    }
+
+    void* localdb = symbols_.get_localdb(handle);
+    AlpmListNode* pkgcache =
+        localdb != nullptr ? symbols_.db_get_pkgcache(localdb) : nullptr;
+    for (AlpmListNode* node = pkgcache; node != nullptr;
+         node = symbols_.list_next(node)) {
+      void* pkg = node->data;
+      if (pkg == nullptr) continue;
+      const AlpmFileList* files = symbols_.pkg_get_files(pkg);
+      if (files == nullptr || files->files == nullptr) continue;
+      const char* raw_name = symbols_.pkg_get_name(pkg);
+      if (raw_name == nullptr || *raw_name == '\0') continue;
+      for (size_t i = 0; i < files->count; ++i) {
+        const char* fname = files->files[i].name;
+        if (fname == nullptr) continue;
+        const auto hit = relative_to_target.find(fname);
+        if (hit == relative_to_target.end()) continue;
+        PacmanFileOwnerRecord owner;
+        owner.path = hit->second;
+        owner.package_name = raw_name;
+        owner.architecture = to_optional_string(symbols_.pkg_get_arch(pkg));
+        result.owners.push_back(std::move(owner));
+      }
+    }
+    symbols_.release(handle);
+    result.ok = true;
+    return result;
+  }
+
  private:
   bool try_load_candidate(const std::string& library_name) const {
     if (library_name.empty()) return false;
@@ -345,6 +453,8 @@ class LibAlpmBackend final : public PacmanBackend {
     if (!load_symbol(module, "alpm_pkg_get_reason", &syms.pkg_get_reason)) {
       missing.emplace_back("alpm_pkg_get_reason");
     }
+    // Optional: file ownership lookup degrades gracefully when absent.
+    load_symbol(module, "alpm_pkg_get_files", &syms.pkg_get_files);
 
     if (!missing.empty()) {
       g_module_close(module);

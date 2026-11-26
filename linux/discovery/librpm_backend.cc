@@ -34,6 +34,12 @@ struct LibRpmSymbols {
   uint64_t (*header_get_number)(void*, int) = nullptr;
   int (*header_is_entry)(void*, int) = nullptr;
   int (*tag_get_value)(const char*) = nullptr;
+  // Optional file-ownership symbols (rpmfi API).
+  void* (*fi_new)(const void*, void*, int, unsigned int) = nullptr;
+  void* (*fi_free)(void*) = nullptr;
+  void* (*fi_init)(void*, int) = nullptr;
+  int (*fi_next)(void*) = nullptr;
+  const char* (*fi_fn)(void*) = nullptr;
 };
 
 struct ResolvedRpmTags {
@@ -48,6 +54,7 @@ struct ResolvedRpmTags {
   int url = kRpmTagNotFound;
   int vendor = kRpmTagNotFound;
   int group = kRpmTagNotFound;
+  int basenames = kRpmTagNotFound;
 };
 
 template <typename Fn>
@@ -230,6 +237,120 @@ class LibRpmBackend final : public RpmBackend {
     return result;
   }
 
+  RpmFileOwnershipResult find_file_owners(
+      const std::vector<std::string>& absolute_paths) override {
+    ensure_initialized();
+    RpmFileOwnershipResult result;
+    if (!available_) {
+      result.ok = false;
+      result.error_kind = init_error_kind_;
+      result.error_message = unavailable_reason_;
+      return result;
+    }
+    if (symbols_.fi_new == nullptr || symbols_.fi_free == nullptr ||
+        symbols_.fi_init == nullptr || symbols_.fi_next == nullptr ||
+        symbols_.fi_fn == nullptr || tags_.basenames == kRpmTagNotFound) {
+      result.ok = false;
+      result.error_kind = RpmQueryErrorKind::kUnsupportedAbi;
+      result.error_message = "librpm rpmfi file ownership API is unavailable";
+      return result;
+    }
+    if (!ensure_rpm_config_initialized(symbols_.read_config_files)) {
+      result.ok = false;
+      result.error_kind = RpmQueryErrorKind::kQueryFailed;
+      result.error_message = "rpmReadConfigFiles() failed";
+      return result;
+    }
+
+    void* ts = symbols_.ts_create();
+    if (ts == nullptr) {
+      result.ok = false;
+      result.error_kind = RpmQueryErrorKind::kQueryFailed;
+      result.error_message = "rpmtsCreate() returned null";
+      return result;
+    }
+    bool db_open = false;
+    auto cleanup = [&]() {
+      if (db_open && symbols_.ts_close_db != nullptr) symbols_.ts_close_db(ts);
+      symbols_.ts_free(ts);
+    };
+
+    if (!config_.root_dir.empty()) {
+      if (symbols_.ts_set_root_dir == nullptr ||
+          symbols_.ts_set_root_dir(ts, config_.root_dir.c_str()) != 0) {
+        result.ok = false;
+        result.error_kind = RpmQueryErrorKind::kQueryFailed;
+        result.error_message = "rpmtsSetRootDir() failed or unavailable";
+        cleanup();
+        return result;
+      }
+    }
+
+    errno = 0;
+    if (symbols_.ts_open_db(ts, O_RDONLY) != 0) {
+      const int err = errno;
+      result.ok = false;
+      result.error_kind = (err == EACCES || err == EPERM)
+                              ? RpmQueryErrorKind::kPermissionDenied
+                              : RpmQueryErrorKind::kDatabaseUnavailable;
+      result.error_message = err != 0 ? std::strerror(err)
+                                      : "Unable to open RPM database";
+      cleanup();
+      return result;
+    }
+    db_open = true;
+
+    for (const auto& target : absolute_paths) {
+      const size_t slash = target.rfind('/');
+      if (slash == std::string::npos || slash + 1 >= target.size()) continue;
+      const std::string basename = target.substr(slash + 1);
+
+      // RPMDBI_BASENAMES == RPMTAG_BASENAMES; the index keys on basenames only,
+      // so every candidate is verified against the exact full path via rpmfi.
+      void* mi = symbols_.ts_init_iterator(ts, tags_.basenames,
+                                           basename.c_str(), 0);
+      if (mi == nullptr) continue;
+      while (void* header = symbols_.db_next_iterator(mi)) {
+        void* fi = symbols_.fi_new(ts, header, tags_.basenames, 0);
+        if (fi == nullptr) continue;
+        bool matched = false;
+        symbols_.fi_init(fi, 0);
+        while (symbols_.fi_next(fi) >= 0) {
+          const char* fn = symbols_.fi_fn(fi);
+          if (fn != nullptr && target == fn) {
+            matched = true;
+            break;
+          }
+        }
+        symbols_.fi_free(fi);
+        if (!matched) continue;
+
+        const char* raw_name = symbols_.header_get_string(header, tags_.name);
+        if (raw_name == nullptr || *raw_name == '\0') continue;
+        RpmFileOwnerRecord owner;
+        owner.path = target;
+        owner.package.name = raw_name;
+        if (tags_.epoch != kRpmTagNotFound &&
+            symbols_.header_is_entry(header, tags_.epoch) != 0) {
+          owner.package.epoch = OptionalString::of(std::to_string(
+              symbols_.header_get_number(header, tags_.epoch)));
+        }
+        owner.package.version =
+            read_optional_string(symbols_, header, tags_.version);
+        owner.package.release =
+            read_optional_string(symbols_, header, tags_.release);
+        owner.package.architecture =
+            read_optional_string(symbols_, header, tags_.arch);
+        result.owners.push_back(std::move(owner));
+      }
+      symbols_.db_free_iterator(mi);
+    }
+
+    cleanup();
+    result.ok = true;
+    return result;
+  }
+
  private:
   bool try_load_candidate(const std::string& library_name) const {
     if (library_name.empty()) return false;
@@ -296,6 +417,11 @@ class LibRpmBackend final : public RpmBackend {
       return false;
     }
 
+    load_symbol(module, "rpmfiNew", &syms.fi_new);
+    load_symbol(module, "rpmfiFree", &syms.fi_free);
+    load_symbol(module, "rpmfiInit", &syms.fi_init);
+    load_symbol(module, "rpmfiNext", &syms.fi_next);
+    load_symbol(module, "rpmfiFN", &syms.fi_fn);
     load_symbol(module, "rpmtsCloseDB", &syms.ts_close_db);
     load_symbol(module, "rpmtsSetRootDir", &syms.ts_set_root_dir);
 
@@ -311,6 +437,7 @@ class LibRpmBackend final : public RpmBackend {
     tags.url = syms.tag_get_value("url");
     tags.vendor = syms.tag_get_value("vendor");
     tags.group = syms.tag_get_value("group");
+    tags.basenames = syms.tag_get_value("basenames");
 
     if (tags.name == kRpmTagNotFound || tags.version == kRpmTagNotFound) {
       g_module_close(module);

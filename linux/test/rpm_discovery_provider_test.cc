@@ -187,6 +187,44 @@ int run_fixture(const char* populated_root) {
   expect(parsed_tuples == expected_tuples,
          "RpmDiscoveryProvider output must match rpm -qa reference output");
 
+  // --- Runtime file ownership via librpm basename index + rpmfi ---
+  {
+    auto own_backend = create_librpm_backend(cfg);
+    const auto own = own_backend->find_file_owners(
+        {"/usr/share/applications/example-tool.desktop",
+         "/usr/share/applications/not-owned.desktop",
+         "/other/dir/example-tool.desktop"});
+    expect(own.ok, "librpm file ownership query must succeed");
+    expect(own.owners.size() == 1 &&
+               own.owners[0].path ==
+                   "/usr/share/applications/example-tool.desktop" &&
+               own.owners[0].package.name == "example-tool" &&
+               own.owners[0].package.version.has_value() &&
+               own.owners[0].package.version.value() == "3.1.4",
+           "rpmfi full-path verification must own only the exact path (same "
+           "basename in another directory must not match)");
+
+    const std::string list_cmd =
+        std::string("rpm --root '") + populated_root + "' -ql example-tool";
+    FILE* list_pipe = popen(list_cmd.c_str(), "r");
+    bool oracle_has_path = false;
+    if (list_pipe != nullptr) {
+      char line_buf[1024];
+      while (std::fgets(line_buf, sizeof(line_buf), list_pipe) != nullptr) {
+        std::string line(line_buf);
+        while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
+          line.pop_back();
+        }
+        if (line == "/usr/share/applications/example-tool.desktop") {
+          oracle_has_path = true;
+        }
+      }
+      pclose(list_pipe);
+    }
+    expect(oracle_has_path,
+           "rpm -ql reference must list the owned desktop file path");
+  }
+
   if (g_failures > 0) return 1;
   std::cout << "RPM local fixture and rpm -qa parity test passed ("
             << parsed_tuples.size() << " packages matched, ABI="

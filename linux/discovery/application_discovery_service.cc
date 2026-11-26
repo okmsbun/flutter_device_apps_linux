@@ -1,7 +1,9 @@
 #include "application_discovery_service.h"
 
 #include <algorithm>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace flutter_device_apps_linux {
 namespace {
@@ -199,8 +201,70 @@ ResolvedDiscoveryInventory ApplicationDiscoveryService::discover_resolved(
     }
   }
 
+  // Build bounded ownership indexes ONCE for this pass (never per desktop
+  // entry), only for providers that actually produced packages.
+  CompositePackageOwnershipLookup composite_lookup;
+  const PackageOwnershipLookup* effective_lookup = ownership_lookup;
+  if (ownership_lookup == nullptr) {
+    std::vector<std::string> targets;
+    for (const auto& app : pass_result.applications) {
+      if (!app.desktop_file_path.has_value()) continue;
+      const std::string normalized =
+          normalize_ownership_path(app.desktop_file_path.value());
+      if (normalized.empty()) continue;
+      targets.push_back(normalized);
+      const std::string canonical = resolve_canonical_file_path(normalized);
+      if (!canonical.empty() && canonical != normalized) {
+        targets.push_back(canonical);
+      }
+    }
+    std::sort(targets.begin(), targets.end());
+    targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
+
+    if (!targets.empty()) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      for (const auto& indexer : ownership_indexers_) {
+        const std::string indexer_id = indexer->id();
+        bool has_packages = false;
+        for (const auto& pkg : pass_result.packages) {
+          if (pkg.provenance.provider_id == indexer_id) {
+            has_packages = true;
+            break;
+          }
+        }
+        if (!has_packages) continue;
+
+        ProviderExecutionSummary summary;
+        summary.provider_id = indexer_id + "-ownership";
+        PackageOwnershipIndexResult index =
+            indexer->build_index(targets, pass_result.packages);
+        if (!index.ok) {
+          // Conservative: no ownership evidence from a failed index.
+          summary.status = ProviderExecutionStatus::kFailed;
+          summary.error_message = std::move(index.error_message);
+        } else {
+          summary.status = index.error_message.empty()
+                               ? ProviderExecutionStatus::kSucceeded
+                               : ProviderExecutionStatus::kPartiallyFailed;
+          summary.discovered_count = index.owners_by_path.size();
+          summary.error_message = index.error_message;
+          composite_lookup.merge(index);
+        }
+        pass_result.provider_summaries.push_back(std::move(summary));
+      }
+      effective_lookup = &composite_lookup;
+    }
+  }
+
   return resolve_discovery_inventory(pass_result, appstream_records,
-                                     ownership_lookup);
+                                     effective_lookup);
+}
+
+void ApplicationDiscoveryService::register_ownership_indexer(
+    std::unique_ptr<PackageOwnershipIndexer> indexer) {
+  if (indexer == nullptr) return;
+  std::lock_guard<std::mutex> lock(mutex_);
+  ownership_indexers_.push_back(std::move(indexer));
 }
 
 }  // namespace flutter_device_apps_linux

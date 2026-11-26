@@ -9,6 +9,7 @@
 #include <string>
 
 #include "discovery/dpkg_discovery_provider.h"
+#include "discovery/package_ownership_indexers.h"
 
 namespace {
 
@@ -100,7 +101,49 @@ int main() {
     return 1;
   }
 
-  std::cout << "DPKG dpkg-query parity test passed (" << parsed.size()
-            << " installed packages matched).\n";
+  // Verify runtime DPKG file ownership indexer against real /var/lib/dpkg/info
+  // using `dpkg -S /usr/bin/dpkg` as a test-only oracle.
+  {
+    auto indexer = flutter_device_apps_linux::create_dpkg_ownership_indexer();
+    const auto own = indexer->build_index(
+        {"/usr/bin/dpkg",
+         "/usr/share/applications/fda-definitely-not-owned.desktop"},
+        result.packages);
+    if (!own.ok) {
+      std::cerr << "FAIL: DPKG ownership indexer failed: " << own.error_message
+                << "\n";
+      return 1;
+    }
+    const auto it = own.owners_by_path.find("/usr/bin/dpkg");
+    if (it == own.owners_by_path.end() || it->second.empty() ||
+        it->second[0].package_name != "dpkg") {
+      std::cerr << "FAIL: DPKG ownership indexer did not attribute "
+                   "/usr/bin/dpkg to package dpkg\n";
+      return 1;
+    }
+    if (own.owners_by_path.count(
+            "/usr/share/applications/fda-definitely-not-owned.desktop") != 0) {
+      std::cerr << "FAIL: unowned path must not be attributed by DPKG indexer\n";
+      return 1;
+    }
+
+    FILE* own_pipe = popen("dpkg -S /usr/bin/dpkg", "r");
+    std::string oracle_line;
+    if (own_pipe != nullptr) {
+      char own_buf[512];
+      if (std::fgets(own_buf, sizeof(own_buf), own_pipe) != nullptr) {
+        oracle_line = own_buf;
+      }
+      pclose(own_pipe);
+    }
+    if (oracle_line.compare(0, 5, "dpkg:") != 0) {
+      std::cerr << "FAIL: unexpected dpkg -S oracle output: " << oracle_line
+                << "\n";
+      return 1;
+    }
+  }
+
+  std::cout << "DPKG dpkg-query & ownership parity test passed ("
+            << parsed.size() << " installed packages matched).\n";
   return 0;
 }

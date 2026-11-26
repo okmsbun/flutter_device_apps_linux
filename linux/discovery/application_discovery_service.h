@@ -123,6 +123,12 @@ class ApplicationDiscoveryService {
   // application discovery.
   AppStreamMetadataResult load_appstream_metadata();
 
+  // Registers an ownership indexer (DPKG, RPM, Pacman, Nix). Indexers run at
+  // most once per discover_resolved() pass, only when their package provider
+  // produced packages, and only for the desktop-entry paths found by GIO.
+  void register_ownership_indexer(
+      std::unique_ptr<PackageOwnershipIndexer> indexer);
+
   // Executes selected providers, optionally loads AppStream metadata, and
   // runs indexed identity resolution, deduplication, enrichment, and
   // classification without altering raw discover_with_report() or legacy
@@ -137,6 +143,7 @@ class ApplicationDiscoveryService {
   mutable std::mutex mutex_;
   std::vector<std::unique_ptr<ApplicationDiscoveryProvider>> providers_;
   std::vector<std::unique_ptr<PackageDiscoveryProvider>> package_providers_;
+  std::vector<std::unique_ptr<PackageOwnershipIndexer>> ownership_indexers_;
   std::unique_ptr<AppStreamMetadataProvider> metadata_provider_;
 };
 

@@ -5,6 +5,7 @@
 #include <gmodule.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <memory>
 #include <mutex>

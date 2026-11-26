@@ -42,6 +42,19 @@ struct RpmBackendQueryResult {
   std::vector<RpmInstalledPackageRecord> packages;
 };
 
+// Exact file ownership record verified through rpmfi full-path comparison.
+struct RpmFileOwnerRecord {
+  std::string path;
+  RpmInstalledPackageRecord package;
+};
+
+struct RpmFileOwnershipResult {
+  bool ok = true;
+  RpmQueryErrorKind error_kind = RpmQueryErrorKind::kNone;
+  std::string error_message;
+  std::vector<RpmFileOwnerRecord> owners;
+};
+
 // Testable backend seam decoupling RPM discovery logic from runtime librpm
 // dynamic loading.
 class RpmBackend {
@@ -59,6 +72,18 @@ class RpmBackend {
 
   // Reads the installed RPM database in read-only mode via librpm APIs.
   virtual RpmBackendQueryResult list_installed_packages() = 0;
+
+  // Exact full-path file ownership lookup for a fixed batch of absolute
+  // target paths (librpm basename index + rpmfi verification). The default
+  // implementation reports the capability as unsupported.
+  virtual RpmFileOwnershipResult find_file_owners(
+      const std::vector<std::string>& /*absolute_paths*/) {
+    RpmFileOwnershipResult result;
+    result.ok = false;
+    result.error_kind = RpmQueryErrorKind::kUnsupportedAbi;
+    result.error_message = "file ownership lookup is not supported";
+    return result;
+  }
 };
 
 // Builds a collision-free version-specific installation identity for an RPM

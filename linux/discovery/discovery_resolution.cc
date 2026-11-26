@@ -1,6 +1,7 @@
 #include "discovery_resolution.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstring>
 #include <map>
 #include <set>
@@ -849,9 +850,13 @@ ResolvedDiscoveryInventory resolve_discovery_inventory(
     const DiscoveredApplication& gio = *gio_ptr;
 
     // 4a. GIO -> Flatpak via authoritative X-Flatpak marker.
-    if (gio.provenance.installation_source == InstallationSource::kFlatpak &&
-        gio.package_id.has_value() && !gio.package_id.value().empty()) {
-      const auto it = flatpak_by_app_id.find(gio.package_id.value());
+    // X-Flatpak is correlation evidence only; it never proves installation by
+    // itself and only links to an installation verified by the Flatpak provider.
+    if (gio.correlation_hints.flatpak_app_id.has_value() &&
+        !gio.correlation_hints.flatpak_app_id.value().empty()) {
+      const std::string& hint_app_id =
+          gio.correlation_hints.flatpak_app_id.value();
+      const auto it = flatpak_by_app_id.find(hint_app_id);
       if (it != flatpak_by_app_id.end()) {
         std::vector<size_t> compatible;
         for (size_t idx : it->second) {
@@ -880,7 +885,7 @@ ResolvedDiscoveryInventory resolve_discovery_inventory(
           amb.reason =
               "ambiguous Flatpak installation for desktop entry " +
               optional_or_empty(gio.desktop_file_id) + " (X-Flatpak=" +
-              gio.package_id.value() + ")";
+              hint_app_id + ")";
           for (size_t idx : compatible) {
             amb.candidate_ids.push_back(entries[idx].app.resolved_id);
           }
@@ -889,7 +894,6 @@ ResolvedDiscoveryInventory resolve_discovery_inventory(
           standalone.app.resolved_id = gio.application_id;
           standalone.app.primary_provenance = gio.provenance;
           standalone.app.classification = gio.classification;
-          standalone.flatpak_app_id = gio.package_id;
           standalone.app.ambiguities.push_back(amb);
           attach_desktop_entry(&standalone, gio);
           entry_by_resolved_id[standalone.app.resolved_id] = entries.size();
@@ -901,9 +905,11 @@ ResolvedDiscoveryInventory resolve_discovery_inventory(
     }
 
     // 4b. GIO -> Snap via authoritative X-SnapInstanceName marker.
-    if (gio.provenance.installation_source == InstallationSource::kSnap &&
-        gio.package_id.has_value() && !gio.package_id.value().empty()) {
-      const auto it = snap_by_instance.find(gio.package_id.value());
+    if (gio.correlation_hints.snap_instance_name.has_value() &&
+        !gio.correlation_hints.snap_instance_name.value().empty()) {
+      const std::string& hint_instance =
+          gio.correlation_hints.snap_instance_name.value();
+      const auto it = snap_by_instance.find(hint_instance);
       if (it != snap_by_instance.end()) {
         if (it->second.size() == 1) {
           attach_desktop_entry(&entries[it->second.front()], gio);
@@ -914,7 +920,7 @@ ResolvedDiscoveryInventory resolve_discovery_inventory(
           amb.reason =
               "ambiguous Snap installation for desktop entry " +
               optional_or_empty(gio.desktop_file_id) +
-              " (X-SnapInstanceName=" + gio.package_id.value() + ")";
+              " (X-SnapInstanceName=" + hint_instance + ")";
           for (size_t idx : it->second) {
             amb.candidate_ids.push_back(entries[idx].app.resolved_id);
           }
@@ -922,7 +928,6 @@ ResolvedDiscoveryInventory resolve_discovery_inventory(
           standalone.app.resolved_id = gio.application_id;
           standalone.app.primary_provenance = gio.provenance;
           standalone.app.classification = gio.classification;
-          standalone.snap_instance_name = gio.package_id;
           standalone.app.ambiguities.push_back(amb);
           attach_desktop_entry(&standalone, gio);
           entry_by_resolved_id[standalone.app.resolved_id] = entries.size();
@@ -944,15 +949,6 @@ ResolvedDiscoveryInventory resolve_discovery_inventory(
     entry.app.resolved_id = gio.application_id;
     entry.app.primary_provenance = gio.provenance;
     entry.app.classification = gio.classification;
-    if (gio.provenance.installation_source == InstallationSource::kFlatpak &&
-        gio.package_id.has_value()) {
-      entry.flatpak_app_id = gio.package_id;
-    } else if (gio.provenance.installation_source ==
-                   InstallationSource::kSnap &&
-               gio.package_id.has_value()) {
-      entry.snap_instance_name = gio.package_id;
-      entry.snap_package_name = gio.package_id;
-    }
     attach_desktop_entry(&entry, gio);
     entry_by_resolved_id[entry.app.resolved_id] = entries.size();
     entries.push_back(std::move(entry));
@@ -975,22 +971,49 @@ ResolvedDiscoveryInventory resolve_discovery_inventory(
         continue;
       }
 
-      // 5a. Authoritative Nix store-path ownership (O(1) hash lookup).
-      const std::string store_root =
-          extract_nix_store_root(desktop.desktop_file_path.value());
+      // 5a. Authoritative Nix store-path ownership (O(1) hash lookup),
+      // resolving symlinks (e.g. ~/.nix-profile/share/applications/*.desktop)
+      // and narrowing by active profile prefix when multiple profiles share
+      // the same store path.
+      const std::string logical_desktop_path =
+          normalize_ownership_path(desktop.desktop_file_path.value());
+      std::string store_root = extract_nix_store_root(logical_desktop_path);
+      if (store_root.empty()) {
+        const std::string canonical_desktop_path =
+            resolve_canonical_file_path(logical_desktop_path);
+        if (!canonical_desktop_path.empty()) {
+          store_root = extract_nix_store_root(canonical_desktop_path);
+        }
+      }
       if (!store_root.empty()) {
         const auto nix_it = nix_by_store_path.find(store_root);
         if (nix_it != nix_by_store_path.end()) {
-          if (nix_it->second.size() == 1) {
-            enrich_from_package(&entry, inventory.packages[nix_it->second[0]]);
+          std::vector<size_t> nix_candidates = nix_it->second;
+          if (nix_candidates.size() > 1) {
+            std::vector<size_t> profile_matched;
+            for (size_t pidx : nix_candidates) {
+              const auto& ppath = inventory.packages[pidx].profile_path;
+              if (!ppath.has_value() || ppath.value().empty()) continue;
+              const std::string prefix =
+                  normalize_ownership_path(ppath.value()) + "/";
+              if (logical_desktop_path.compare(0, prefix.size(), prefix) == 0) {
+                profile_matched.push_back(pidx);
+              }
+            }
+            if (profile_matched.size() == 1) {
+              nix_candidates = std::move(profile_matched);
+            }
+          }
+          if (nix_candidates.size() == 1) {
+            enrich_from_package(&entry, inventory.packages[nix_candidates[0]]);
             continue;
           }
-          if (nix_it->second.size() > 1) {
+          if (nix_candidates.size() > 1) {
             ResolutionAmbiguity amb;
             amb.reason =
                 "ambiguous Nix profile ownership for desktop entry " +
                 desktop.desktop_file_id;
-            for (size_t pidx : nix_it->second) {
+            for (size_t pidx : nix_candidates) {
               amb.candidate_ids.push_back(
                   inventory.packages[pidx].package_identity_id);
             }
@@ -1010,13 +1033,31 @@ ResolvedDiscoveryInventory resolve_discovery_inventory(
 
       std::vector<size_t> matched_pkgs;
       std::unordered_set<size_t> seen_pkg_idx;
+      std::vector<std::string> diverted_candidates;
+      bool diversion_ambiguity = false;
       for (const auto& owner : owners) {
+        if (owner.diverted_ambiguous) {
+          // Diverted paths cannot be attributed to a single owner.
+          diversion_ambiguity = true;
+          if (owner.package_identity_id.has_value()) {
+            add_unique_string(&diverted_candidates,
+                              owner.package_identity_id.value());
+          }
+          continue;
+        }
         if (owner.package_identity_id.has_value() &&
             !owner.package_identity_id.value().empty()) {
           const auto id_it =
               pkg_by_identity.find(owner.package_identity_id.value());
           if (id_it != pkg_by_identity.end()) {
             for (size_t pidx : id_it->second) {
+              // Parallel versions share a package identity; narrow to the exact
+              // installation when the owner evidence carries one.
+              if (owner.installation_identity_id.has_value() &&
+                  inventory.packages[pidx].installation_identity_id !=
+                      owner.installation_identity_id) {
+                continue;
+              }
               if (seen_pkg_idx.insert(pidx).second) {
                 matched_pkgs.push_back(pidx);
               }
@@ -1047,7 +1088,15 @@ ResolvedDiscoveryInventory resolve_discovery_inventory(
         }
       }
 
-      if (matched_pkgs.size() == 1) {
+      if (diversion_ambiguity) {
+        // Never link a diverted path; preserve the ambiguity explicitly.
+        ResolutionAmbiguity amb;
+        amb.reason = "diverted package ownership for desktop entry " +
+                     desktop.desktop_file_id;
+        amb.candidate_ids = diverted_candidates;
+        entry.app.ambiguities.push_back(amb);
+        inventory.ambiguities.push_back(std::move(amb));
+      } else if (matched_pkgs.size() == 1) {
         enrich_from_package(&entry, inventory.packages[matched_pkgs.front()]);
       } else if (matched_pkgs.size() > 1) {
         ResolutionAmbiguity amb;
@@ -1283,21 +1332,12 @@ ResolvedDiscoveryInventory resolve_discovery_inventory(
     }
   }
 
-  // 9. Finalize classification from authoritative desktop-entry evidence ONLY
-  // when AppStream did not already establish a classification. Never guess
-  // from names or sections!
+  // 9. Finalize. Classification is established only by authoritative evidence
+  // (AppStream component kind). The desktop-entry Terminal flag, desktop
+  // markers, names, sections, or executable names are never sufficient on their
+  // own, so records without strong evidence stay kUnknown.
   inventory.applications.reserve(entries.size());
   for (auto& entry : entries) {
-    if (entry.app.classification == ApplicationClassification::kUnknown &&
-        !entry.app.desktop_entries.empty()) {
-      if (entry.app.capabilities.requires_terminal ==
-          CapabilityState::kSupported) {
-        entry.app.classification = ApplicationClassification::kCliApplication;
-      } else if (entry.app.capabilities.requires_terminal ==
-                 CapabilityState::kUnsupported) {
-        entry.app.classification = ApplicationClassification::kGuiApplication;
-      }
-    }
     std::sort(entry.app.original_record_ids.begin(),
               entry.app.original_record_ids.end());
     std::sort(entry.app.linked_package_identity_ids.begin(),

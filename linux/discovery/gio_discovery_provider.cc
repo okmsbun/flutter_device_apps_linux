@@ -75,20 +75,19 @@ DiscoveryResult GioDiscoveryProvider::discover() {
         app.desktop_file_path = OptionalString::of(filename);
       }
 
-      // Preserve authoritative desktop-entry installation markers (X-Flatpak,
-      // X-SnapInstanceName, X-AppImage-*) without inferring scope or guessing
-      // package ownership from paths or names.
+      // Preserve desktop-entry markers (X-Flatpak, X-SnapInstanceName,
+      // X-AppImage-*) strictly as correlation hints, never as independent
+      // installation proof. provenance.installation_source remains kUnknown
+      // until corroborated by a verified installation provider.
       g_autofree char* x_flatpak =
           g_desktop_app_info_get_string(desktop, "X-Flatpak");
       if (x_flatpak != nullptr && *x_flatpak != '\0') {
-        app.provenance.installation_source = InstallationSource::kFlatpak;
-        app.package_id = OptionalString::of(x_flatpak);
+        app.correlation_hints.flatpak_app_id = OptionalString::of(x_flatpak);
       } else {
         g_autofree char* x_snap =
             g_desktop_app_info_get_string(desktop, "X-SnapInstanceName");
         if (x_snap != nullptr && *x_snap != '\0') {
-          app.provenance.installation_source = InstallationSource::kSnap;
-          app.package_id = OptionalString::of(x_snap);
+          app.correlation_hints.snap_instance_name = OptionalString::of(x_snap);
         } else {
           g_autofree char* ai_ver =
               g_desktop_app_info_get_string(desktop, "X-AppImage-Version");
@@ -99,9 +98,10 @@ DiscoveryResult GioDiscoveryProvider::discover() {
           if ((ai_ver != nullptr && *ai_ver != '\0') ||
               (ai_name != nullptr && *ai_name != '\0') ||
               (ai_arch != nullptr && *ai_arch != '\0')) {
-            app.provenance.installation_source = InstallationSource::kAppImage;
+            app.correlation_hints.has_appimage_marker = true;
             if (ai_ver != nullptr && *ai_ver != '\0') {
-              app.metadata.version = OptionalString::of(ai_ver);
+              app.correlation_hints.appimage_version =
+                  OptionalString::of(ai_ver);
             }
           }
         }

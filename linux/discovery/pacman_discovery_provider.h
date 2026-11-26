@@ -46,6 +46,20 @@ struct PacmanBackendQueryResult {
   std::vector<PacmanInstalledPackageRecord> packages;
 };
 
+// Exact file ownership record from the libalpm local package file list.
+struct PacmanFileOwnerRecord {
+  std::string path;  // Absolute target path that matched.
+  std::string package_name;
+  OptionalString architecture;
+};
+
+struct PacmanFileOwnershipResult {
+  bool ok = true;
+  PacmanQueryErrorKind error_kind = PacmanQueryErrorKind::kNone;
+  std::string error_message;
+  std::vector<PacmanFileOwnerRecord> owners;
+};
+
 // Testable backend seam decoupling Pacman discovery logic from runtime libalpm
 // dynamic loading.
 class PacmanBackend {
@@ -65,6 +79,18 @@ class PacmanBackend {
   // libalpm without starting transactions, modifying db.lck, or touching sync
   // repositories.
   virtual PacmanBackendQueryResult list_installed_packages() = 0;
+
+  // Single-pass exact file ownership lookup for a fixed batch of absolute
+  // target paths via the local package file lists (alpm_pkg_get_files). The
+  // default implementation reports the capability as unsupported.
+  virtual PacmanFileOwnershipResult find_file_owners(
+      const std::vector<std::string>& /*absolute_paths*/) {
+    PacmanFileOwnershipResult result;
+    result.ok = false;
+    result.error_kind = PacmanQueryErrorKind::kUnsupportedAbi;
+    result.error_message = "file ownership lookup is not supported";
+    return result;
+  }
 };
 
 // Parses RootDir and DBPath from the [options] section of pacman.conf(5) using

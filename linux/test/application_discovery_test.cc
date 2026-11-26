@@ -3,8 +3,10 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -34,6 +36,8 @@
 #include "discovery/legacy_list_apps_adapter.h"
 #include "discovery/nix_discovery_provider.h"
 #include "discovery/package_discovery_provider.h"
+#include "discovery/package_ownership.h"
+#include "discovery/package_ownership_indexers.h"
 #include "discovery/pacman_discovery_provider.h"
 #include "discovery/rpm_discovery_provider.h"
 #include "discovery/snap_discovery_provider.h"
@@ -3693,15 +3697,12 @@ void test_resolution_dedup_separate_installations_and_order_independence() {
 
   DiscoveredApplication gio_suite_main = make_gio_app(
       "org.example.Suite.desktop", "Suite", true, true, false);
-  gio_suite_main.provenance.installation_source = InstallationSource::kFlatpak;
-  gio_suite_main.package_id = OptionalString::of("org.example.Suite");
+  gio_suite_main.correlation_hints.flatpak_app_id = OptionalString::of("org.example.Suite");
   pass.applications.push_back(gio_suite_main);
 
   DiscoveredApplication gio_suite_viewer = make_gio_app(
       "org.example.Suite.Viewer.desktop", "Suite Viewer", true, false, false);
-  gio_suite_viewer.provenance.installation_source =
-      InstallationSource::kFlatpak;
-  gio_suite_viewer.package_id = OptionalString::of("org.example.Suite");
+  gio_suite_viewer.correlation_hints.flatpak_app_id = OptionalString::of("org.example.Suite");
   pass.applications.push_back(gio_suite_viewer);
 
   // 2. Same display name "Firefox" installed separately as Flatpak (system),
@@ -3752,8 +3753,7 @@ void test_resolution_dedup_separate_installations_and_order_independence() {
   // into snap_ff_beta or fp_ff!
   DiscoveredApplication gio_snap_ff =
       make_gio_app("firefox_firefox.desktop", "Firefox", true, true, false);
-  gio_snap_ff.provenance.installation_source = InstallationSource::kSnap;
-  gio_snap_ff.package_id = OptionalString::of("firefox");
+  gio_snap_ff.correlation_hints.snap_instance_name = OptionalString::of("firefox");
   pass.applications.push_back(gio_snap_ff);
 
   // Unmarked native GIO Firefox entry -> MUST stay separate (never merged by
@@ -3801,8 +3801,9 @@ void test_resolution_dedup_separate_installations_and_order_independence() {
     expect(suite->metadata.version.has_value() &&
                suite->metadata.version.value() == "2.4.0",
            "installed Flatpak version must be preserved");
-    expect(suite->classification == ApplicationClassification::kGuiApplication,
-           "desktop entries with Terminal=false classify Suite as GUI");
+    expect(suite->classification == ApplicationClassification::kUnknown,
+           "Terminal=false desktop entries alone must NOT classify Suite as "
+           "GUI without authoritative metadata");
   }
 
   const auto* resolved_snap_ff =
@@ -3850,8 +3851,7 @@ void test_resolution_ambiguous_matches_and_conflicting_metadata() {
 
   DiscoveredApplication gio_dual =
       make_gio_app("org.example.Dual.desktop", "Dual App", true, false, false);
-  gio_dual.provenance.installation_source = InstallationSource::kFlatpak;
-  gio_dual.package_id = OptionalString::of("org.example.Dual");
+  gio_dual.correlation_hints.flatpak_app_id = OptionalString::of("org.example.Dual");
   pass.applications.push_back(gio_dual);
 
   // 2. Conflicting metadata + installed vs catalog release version separation:
@@ -3874,8 +3874,7 @@ void test_resolution_ambiguous_matches_and_conflicting_metadata() {
 
   DiscoveredApplication gio_ed = make_gio_app(
       "editor_editor.desktop", "Editor Desktop", true, true, false);
-  gio_ed.provenance.installation_source = InstallationSource::kSnap;
-  gio_ed.package_id = OptionalString::of("editor");
+  gio_ed.correlation_hints.snap_instance_name = OptionalString::of("editor");
   pass.applications.push_back(gio_ed);
 
   AppStreamMetadataRecord as_ed;
@@ -3981,7 +3980,8 @@ void test_resolution_classification_ownership_catalog_only_and_isolation() {
       OptionalString::of("/usr/share/applications/libreoffice-calc.desktop");
   pass.applications.push_back(calc);
 
-  // 2. Terminal desktop entry -> classified as kCliApplication via Terminal=true.
+  // 2. Terminal desktop entry -> MUST stay kUnknown (Terminal flag alone is not
+  // sufficient evidence).
   DiscoveredApplication htop_desktop =
       make_gio_app("htop.desktop", "htop", false, false, true);
   pass.applications.push_back(htop_desktop);
@@ -4108,9 +4108,8 @@ void test_resolution_classification_ownership_catalog_only_and_isolation() {
   // Check Terminal=true desktop entry -> kCliApplication.
   const auto* res_htop = find_resolved_by_id(inv, htop_desktop.application_id);
   expect(res_htop != nullptr &&
-             res_htop->classification ==
-                 ApplicationClassification::kCliApplication,
-         "Terminal=true desktop entry must classify as kCliApplication");
+             res_htop->classification == ApplicationClassification::kUnknown,
+         "Terminal=true desktop entry alone must NOT classify as CLI");
 
   // Check Nix store-path ownership link.
   const auto* res_nix = find_resolved_by_id(inv, nix_gui.application_id);
@@ -4256,8 +4255,7 @@ void test_resolution_large_inventory_indexed_performance() {
     DiscoveredApplication gio =
         make_gio_app(desktop_id.c_str(), display_name.c_str(), true, false,
                      false);
-    gio.provenance.installation_source = InstallationSource::kFlatpak;
-    gio.package_id = OptionalString::of(app_id);
+    gio.correlation_hints.flatpak_app_id = OptionalString::of(app_id);
     pass.applications.push_back(std::move(gio));
 
     AppStreamMetadataRecord as;
@@ -4286,6 +4284,390 @@ void test_resolution_large_inventory_indexed_performance() {
          "all 400 catalog-only AppStream records must stay unmatched");
   expect(inv.ambiguities.empty(),
          "unambiguous large inventory must produce zero ambiguities");
+}
+
+
+// --- Step 9.1: runtime ownership adapters and hardening tests ---
+
+namespace fdal = flutter_device_apps_linux;
+
+InstalledPackageRecord make_owned_pkg(const char* provider,
+                                      InstallationSource source,
+                                      const char* name, const char* arch,
+                                      const char* version) {
+  InstalledPackageRecord p;
+  p.provenance.provider_id = provider;
+  p.provenance.native_id = name;
+  p.provenance.installation_source = source;
+  p.provenance.installation_scope = InstallationScope::kSystem;
+  p.package_name = name;
+  p.architecture = OptionalString::of(arch);
+  p.version = OptionalString::of(version);
+  p.installation_state = PackageInstallationState::kInstalled;
+  p.package_identity_id = build_application_id(
+      provider, name, InstallationScope::kSystem, p.architecture);
+  return p;
+}
+
+class CountingIndexer final : public fdal::PackageOwnershipIndexer {
+ public:
+  CountingIndexer(std::string id, bool ok, fdal::PackageOwnershipIndexResult r,
+                  std::atomic<int>* calls)
+      : id_(std::move(id)), ok_(ok), result_(std::move(r)), calls_(calls) {}
+  const char* id() const override { return id_.c_str(); }
+  fdal::PackageOwnershipIndexResult build_index(
+      const std::vector<std::string>&,
+      const std::vector<InstalledPackageRecord>&) override {
+    calls_->fetch_add(1);
+    fdal::PackageOwnershipIndexResult out = result_;
+    out.ok = ok_;
+    return out;
+  }
+
+ private:
+  std::string id_;
+  bool ok_;
+  fdal::PackageOwnershipIndexResult result_;
+  std::atomic<int>* calls_;
+};
+
+void test_ownership_dpkg_indexer_multiarch_diversions_and_symlinks() {
+  TempNixDir root;
+  root.make_dir("info");
+  root.write_file("info/libreoffice-core.list",
+                  "/.\n/usr\n/usr/share/applications/libreoffice-writer.desktop\n"
+                  "/usr/share/applications/libreoffice-calc.desktop\n");
+  root.write_file("info/shared:amd64.list",
+                  "/usr/share/applications/shared.desktop\n");
+  root.write_file("info/shared:i386.list",
+                  "/usr/share/applications/shared.desktop\n");
+  root.write_file("info/divpkg.list",
+                  "/usr/share/applications/diverted.desktop\n");
+  root.write_file("diversions",
+                  "/usr/share/applications/diverted.desktop\n"
+                  "/usr/share/applications/diverted.desktop.distrib\nlocal\n");
+
+  fdal::DpkgOwnershipConfig cfg;
+  cfg.info_dir = root.path() + "/info";
+  cfg.diversions_path = root.path() + "/diversions";
+  auto indexer = fdal::create_dpkg_ownership_indexer(cfg);
+
+  std::vector<InstalledPackageRecord> pkgs = {
+      make_owned_pkg("dpkg", InstallationSource::kDpkg, "libreoffice-core",
+                     "amd64", "24.2"),
+      make_owned_pkg("dpkg", InstallationSource::kDpkg, "shared", "amd64", "1"),
+      make_owned_pkg("dpkg", InstallationSource::kDpkg, "shared", "i386", "1"),
+      make_owned_pkg("dpkg", InstallationSource::kDpkg, "divpkg", "amd64", "1"),
+      make_owned_pkg("dpkg", InstallationSource::kDpkg, "ghost", "amd64", "1"),
+      make_owned_pkg("rpm", InstallationSource::kRpm, "ignored-rpm", "x86_64",
+                     "1")};
+
+  const auto idx = indexer->build_index(
+      {"//usr/share/applications//libreoffice-writer.desktop",
+       "/usr/share/applications/libreoffice-calc.desktop",
+       "/usr/share/applications/shared.desktop",
+       "/usr/share/applications/diverted.desktop",
+       "/usr/share/applications/unowned.desktop"},
+      pkgs);
+  expect(idx.ok, "dpkg ownership index must succeed with partial diagnostics");
+  expect(idx.error_message.find("without readable file list") !=
+             std::string::npos,
+         "missing dpkg file list must be reported as partial failure");
+
+  const auto writer =
+      idx.owners_by_path.find("/usr/share/applications/libreoffice-writer.desktop");
+  expect(writer != idx.owners_by_path.end() && writer->second.size() == 1 &&
+             writer->second[0].package_identity_id.value() ==
+                 pkgs[0].package_identity_id &&
+             !writer->second[0].diverted_ambiguous,
+         "exact full-path dpkg ownership must be recorded with package identity");
+  const auto shared =
+      idx.owners_by_path.find("/usr/share/applications/shared.desktop");
+  expect(shared != idx.owners_by_path.end() && shared->second.size() == 2,
+         "multiarch owners (amd64+i386) must both be preserved");
+  const auto diverted =
+      idx.owners_by_path.find("/usr/share/applications/diverted.desktop");
+  expect(diverted != idx.owners_by_path.end() &&
+             diverted->second[0].diverted_ambiguous,
+         "diverted paths must be flagged ambiguous");
+  expect(idx.owners_by_path.count("/usr/share/applications/unowned.desktop") ==
+             0,
+         "unowned paths must have no evidence (no heuristics)");
+
+  // Symlinked directory: ownership is keyed by canonical path.
+  root.write_file("real/x.desktop", "[Desktop Entry]\n");
+  root.make_symlink("link", root.path() + "/real");
+  fdal::PackageOwnershipIndexResult canonical_index;
+  fdal::PackageOwnershipEvidence ev;
+  ev.package_provider_id = "dpkg";
+  ev.package_name = "x";
+  canonical_index.owners_by_path[fdal::resolve_canonical_file_path(
+      root.path() + "/real/x.desktop")]
+      .push_back(ev);
+  fdal::CompositePackageOwnershipLookup lookup;
+  lookup.merge(canonical_index);
+  expect(lookup.lookup_file_owners(root.path() + "/link/x.desktop").size() == 1,
+         "symlinked desktop path must resolve to canonical package-owned file");
+  expect(lookup.lookup_file_owners(root.path() + "/link/missing.desktop")
+             .empty(),
+         "unknown symlinked path must stay unowned");
+}
+
+void test_ownership_nix_rpm_pacman_indexers() {
+  // Nix: verified active-profile store paths only.
+  {
+    InstalledPackageRecord nix_pkg =
+        make_owned_pkg("nix", InstallationSource::kNix, "nixapp",
+                       "x86_64-linux", "3.0");
+    nix_pkg.profile_path = OptionalString::of("/home/u/.nix-profile");
+    nix_pkg.provenance.installation_scope = InstallationScope::kUser;
+    nix_pkg.store_paths = {"/nix/store/0123456789abcdfghijklmnpqrsvwxyz-nixapp-3.0"};
+    auto indexer = fdal::create_nix_ownership_indexer();
+    const auto idx = indexer->build_index(
+        {"/nix/store/0123456789abcdfghijklmnpqrsvwxyz-nixapp-3.0/share/"
+         "applications/a.desktop",
+         "/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-other-1.0/share/b.desktop",
+         "/usr/share/applications/c.desktop"},
+        {nix_pkg});
+    expect(idx.owners_by_path.size() == 1,
+           "only store paths of active profile elements may be owned");
+    const auto& ev = idx.owners_by_path.begin()->second;
+    expect(ev.size() == 1 && ev[0].profile_path.has_value() &&
+               ev[0].profile_path.value() == "/home/u/.nix-profile" &&
+               ev[0].scope == InstallationScope::kUser,
+           "Nix ownership must preserve active profile and scope");
+  }
+
+  // RPM: installation identity distinguishes parallel versions.
+  class OwnershipRpmBackend final : public RpmBackend {
+   public:
+    bool is_available() const override { return true; }
+    RpmBackendQueryResult list_installed_packages() override { return {}; }
+    fdal::RpmFileOwnershipResult find_file_owners(
+        const std::vector<std::string>& paths) override {
+      fdal::RpmFileOwnershipResult r;
+      for (const auto& p : paths) {
+        fdal::RpmFileOwnerRecord o;
+        o.path = p;
+        o.package.name = "kernel-tools";
+        o.package.architecture = OptionalString::of("x86_64");
+        o.package.epoch = OptionalString::of("1");
+        o.package.version = OptionalString::of("6.8.1");
+        o.package.release = OptionalString::of("1");
+        r.owners.push_back(o);
+      }
+      return r;
+    }
+  };
+  {
+    auto indexer = fdal::create_rpm_ownership_indexer(
+        std::make_unique<OwnershipRpmBackend>());
+    const auto idx = indexer->build_index(
+        {"/usr/share/applications/k.desktop"}, {});
+    expect(idx.ok && idx.owners_by_path.size() == 1,
+           "RPM indexer must map backend owners by exact path");
+    const auto& ev = idx.owners_by_path.begin()->second[0];
+    expect(ev.package_identity_id.value() == "rpm:kernel-tools:system:x86_64" &&
+               ev.installation_identity_id.has_value(),
+           "RPM evidence must carry package and installation identities");
+    auto missing = fdal::create_rpm_ownership_indexer(nullptr);
+    expect(!missing->build_index({"/a"}, {}).ok,
+           "unavailable librpm must fail the RPM index conservatively");
+  }
+
+  // Pacman: default backend capability is unsupported -> conservative failure.
+  class OwnershipPacmanBackend final : public PacmanBackend {
+   public:
+    bool is_available() const override { return true; }
+    PacmanBackendQueryResult list_installed_packages() override { return {}; }
+    fdal::PacmanFileOwnershipResult find_file_owners(
+        const std::vector<std::string>& paths) override {
+      fdal::PacmanFileOwnershipResult r;
+      for (const auto& p : paths) {
+        fdal::PacmanFileOwnerRecord o;
+        o.path = p;
+        o.package_name = "example-app";
+        o.architecture = OptionalString::of("x86_64");
+        r.owners.push_back(o);
+      }
+      return r;
+    }
+  };
+  class PlainPacmanBackend final : public PacmanBackend {
+   public:
+    bool is_available() const override { return true; }
+    PacmanBackendQueryResult list_installed_packages() override { return {}; }
+  };
+  {
+    auto indexer = fdal::create_pacman_ownership_indexer(
+        std::make_unique<OwnershipPacmanBackend>());
+    const auto idx =
+        indexer->build_index({"/usr/share/applications/e.desktop"}, {});
+    expect(idx.ok && idx.owners_by_path.begin()->second[0]
+                             .package_identity_id.value() ==
+                         "pacman:example-app:system:x86_64",
+           "Pacman evidence must use the stable package identity");
+    auto plain = fdal::create_pacman_ownership_indexer(
+        std::make_unique<PlainPacmanBackend>());
+    expect(!plain->build_index({"/a"}, {}).ok,
+           "backend without file ownership support must fail conservatively");
+  }
+}
+
+void test_ownership_resolution_parallel_versions_diversions_and_hints() {
+  // Parallel RPM kernels share a package identity but differ by installation.
+  InstalledPackageRecord k1 = make_owned_pkg(
+      "rpm", InstallationSource::kRpm, "kernel-tools", "x86_64", "6.8.1");
+  InstalledPackageRecord k2 = make_owned_pkg(
+      "rpm", InstallationSource::kRpm, "kernel-tools", "x86_64", "6.9.2");
+  k1.installation_identity_id = OptionalString::of("inst-1");
+  k2.installation_identity_id = OptionalString::of("inst-2");
+
+  DiscoveredApplication gio =
+      make_gio_app("k.desktop", "Kernel Tools", false, false, false);
+  gio.desktop_file_path = OptionalString::of("/usr/share/applications/k.desktop");
+
+  DiscoveryPassResult pass;
+  pass.applications.push_back(gio);
+  pass.packages = {k1, k2};
+
+  FakeOwnershipLookup exact;
+  PackageOwnershipEvidence ev;
+  ev.package_provider_id = "rpm";
+  ev.package_identity_id = OptionalString::of(k1.package_identity_id);
+  ev.installation_identity_id = OptionalString::of("inst-1");
+  ev.package_name = "kernel-tools";
+  exact.add("/usr/share/applications/k.desktop", ev);
+  ResolvedDiscoveryInventory inv = resolve_discovery_inventory(pass, {}, &exact);
+  expect(inv.applications.size() == 1 &&
+             inv.applications[0].linked_package_identity_ids.size() == 1 &&
+             inv.applications[0].metadata.version.has_value() &&
+             inv.applications[0].metadata.version.value() == "6.8.1" &&
+             inv.ambiguities.empty(),
+         "installation identity must pick the exact parallel version");
+
+  FakeOwnershipLookup vague;
+  PackageOwnershipEvidence vague_ev = ev;
+  vague_ev.installation_identity_id = OptionalString::none();
+  vague.add("/usr/share/applications/k.desktop", vague_ev);
+  inv = resolve_discovery_inventory(pass, {}, &vague);
+  expect(inv.applications[0].linked_package_identity_ids.empty() &&
+             inv.ambiguities.size() == 1 &&
+             inv.ambiguities[0].candidate_ids.size() == 2,
+         "parallel versions without installation evidence must stay ambiguous");
+
+  FakeOwnershipLookup diverted;
+  PackageOwnershipEvidence div_ev = ev;
+  div_ev.diverted_ambiguous = true;
+  diverted.add("/usr/share/applications/k.desktop", div_ev);
+  inv = resolve_discovery_inventory(pass, {}, &diverted);
+  expect(inv.applications[0].linked_package_identity_ids.empty() &&
+             !inv.ambiguities.empty(),
+         "diverted ownership must never link a package");
+
+  // Desktop markers are correlation hints, never installation proof.
+  DiscoveryPassResult hint_pass;
+  DiscoveredApplication marked =
+      make_gio_app("ghost.desktop", "Ghost", false, false, false);
+  marked.correlation_hints.flatpak_app_id =
+      OptionalString::of("org.example.Ghost");
+  hint_pass.applications.push_back(marked);
+  const ResolvedDiscoveryInventory hinted = resolve_discovery_inventory(hint_pass);
+  expect(hinted.applications.size() == 1 &&
+             hinted.applications[0].primary_provenance.installation_source ==
+                 InstallationSource::kUnknown &&
+             hinted.applications[0].linked_package_identity_ids.empty() &&
+             hinted.applications[0].classification ==
+                 ApplicationClassification::kUnknown,
+         "X-Flatpak without a verified Flatpak installation must not set "
+         "installation source or classification");
+}
+
+void test_ownership_service_single_pass_failure_isolation_and_legacy() {
+  // Counters outlive every service created below (providers keep pointers).
+  std::atomic<int> pkg_avail_calls{0};
+  std::atomic<int> pkg_disc_calls{0};
+  auto make_service = [&pkg_avail_calls, &pkg_disc_calls](
+                          bool indexer_ok, std::atomic<int>* dpkg_calls,
+                          std::atomic<int>* pacman_calls) {
+    auto service = std::make_shared<ApplicationDiscoveryService>();
+    DiscoveryResult gio_result;
+    for (int i = 0; i < 40; ++i) {
+      const std::string id = "app" + std::to_string(i) + ".desktop";
+      DiscoveredApplication app =
+          make_gio_app(id.c_str(), "App", true, false, false);
+      app.desktop_file_path =
+          OptionalString::of("/usr/share/applications/" + id);
+      gio_result.applications.push_back(std::move(app));
+    }
+    service->register_provider(std::make_unique<FakeDiscoveryProvider>(
+        "gio", true, std::move(gio_result)));
+
+    PackageDiscoveryResult pkg_result;
+    pkg_result.packages.push_back(make_owned_pkg(
+        "dpkg", InstallationSource::kDpkg, "suite", "amd64", "1.0"));
+    service->register_package_provider(std::make_unique<CountingPackageProvider>(
+        "dpkg", true, std::move(pkg_result), &pkg_avail_calls,
+        &pkg_disc_calls));
+
+    fdal::PackageOwnershipIndexResult index;
+    fdal::PackageOwnershipEvidence ev;
+    ev.package_provider_id = "dpkg";
+    ev.package_name = "suite";
+    ev.package_identity_id = OptionalString::of(build_application_id(
+        "dpkg", "suite", InstallationScope::kSystem,
+        OptionalString::of("amd64")));
+    for (int i = 0; i < 40; ++i) {
+      index.owners_by_path["/usr/share/applications/app" + std::to_string(i) +
+                           ".desktop"]
+          .push_back(ev);
+    }
+    service->register_ownership_indexer(std::make_unique<CountingIndexer>(
+        "dpkg", indexer_ok, std::move(index), dpkg_calls));
+    service->register_ownership_indexer(std::make_unique<CountingIndexer>(
+        "pacman", true, fdal::PackageOwnershipIndexResult{}, pacman_calls));
+    return service;
+  };
+
+  std::atomic<int> dpkg_calls{0};
+  std::atomic<int> pacman_calls{0};
+  auto service = make_service(true, &dpkg_calls, &pacman_calls);
+  const ResolvedDiscoveryInventory ok_inv = service->discover_resolved();
+  expect(dpkg_calls.load() == 1,
+         "ownership index must be built once per pass, not per desktop entry");
+  expect(pacman_calls.load() == 0,
+         "indexers for providers without packages must not run");
+  size_t linked = 0;
+  for (const auto& app : ok_inv.applications) {
+    if (app.linked_package_identity_ids.size() == 1) ++linked;
+  }
+  expect(ok_inv.applications.size() == 40 && linked == 40,
+         "all 40 desktop entries must link to the owning package");
+
+  // Legacy GIO-only path never touches indexers.
+  (void)service->discover_with_report(
+      DiscoveryRequestOptions::only_providers({"gio"}));
+  expect(dpkg_calls.load() == 1,
+         "legacy GIO-only discovery must not run ownership indexers");
+
+  // Failing index: conservative (no links), reported, GIO apps preserved.
+  std::atomic<int> fail_calls{0};
+  std::atomic<int> unused{0};
+  auto failing = make_service(false, &fail_calls, &unused);
+  const ResolvedDiscoveryInventory bad_inv = failing->discover_resolved();
+  bool saw_failure = false;
+  for (const auto& summary : bad_inv.provider_summaries) {
+    if (summary.provider_id == "dpkg-ownership" &&
+        summary.status == ProviderExecutionStatus::kFailed) {
+      saw_failure = true;
+    }
+  }
+  size_t bad_linked = 0;
+  for (const auto& app : bad_inv.applications) {
+    if (!app.linked_package_identity_ids.empty()) ++bad_linked;
+  }
+  expect(saw_failure && bad_inv.applications.size() == 40 && bad_linked == 0,
+         "ownership index failure must be isolated and leave records unlinked");
 }
 
 }  // namespace
@@ -4331,6 +4713,10 @@ int main() {
   test_resolution_ambiguous_matches_and_conflicting_metadata();
   test_resolution_classification_ownership_catalog_only_and_isolation();
   test_resolution_large_inventory_indexed_performance();
+  test_ownership_dpkg_indexer_multiarch_diversions_and_symlinks();
+  test_ownership_nix_rpm_pacman_indexers();
+  test_ownership_resolution_parallel_versions_diversions_and_hints();
+  test_ownership_service_single_pass_failure_isolation_and_legacy();
 
   if (g_failures > 0) {
     std::cerr << g_failures << " test assertion(s) failed.\n";

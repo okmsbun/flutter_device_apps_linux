@@ -12,6 +12,7 @@
 #include "discovery/libflatpak_backend.h"
 #include "discovery/librpm_backend.h"
 #include "discovery/nix_discovery_provider.h"
+#include "discovery/package_ownership_indexers.h"
 #include "discovery/pacman_discovery_provider.h"
 #include "discovery/rpm_discovery_provider.h"
 #include "discovery/snap_discovery_provider.h"
@@ -563,6 +564,16 @@ static std::unique_ptr<DiscoveryPluginContext> create_discovery_context() {
           flutter_device_apps_linux::create_libalpm_backend()));
   context->service->register_package_provider(
       std::make_unique<flutter_device_apps_linux::NixDiscoveryProvider>());
+  context->service->register_ownership_indexer(
+      flutter_device_apps_linux::create_dpkg_ownership_indexer());
+  context->service->register_ownership_indexer(
+      flutter_device_apps_linux::create_nix_ownership_indexer());
+  context->service->register_ownership_indexer(
+      flutter_device_apps_linux::create_rpm_ownership_indexer(
+          flutter_device_apps_linux::create_librpm_backend()));
+  context->service->register_ownership_indexer(
+      flutter_device_apps_linux::create_pacman_ownership_indexer(
+          flutter_device_apps_linux::create_libalpm_backend()));
   context->service->set_metadata_provider(
       std::make_unique<flutter_device_apps_linux::AppStreamMetadataProvider>(
           flutter_device_apps_linux::create_libappstream_backend()));
