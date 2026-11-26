@@ -167,9 +167,11 @@ jobs:
             "$work_dir/libincomplete.so" "$work_dir/libcoreonly.so"
 
           # Build an offline local Flatpak repo with one runtime and one app
-          # (intentionally without any .desktop file).
+          # (intentionally without any .desktop file), matching upstream
+          # flatpak build-export / make-test-runtime.sh directory expectations.
           arch="$(flatpak --default-arch)"
-          mkdir -p "$work_dir/rt/usr/bin" "$work_dir/app/files/bin" \
+          mkdir -p "$work_dir/rt/usr/bin" "$work_dir/rt/files" \
+            "$work_dir/app/files/bin" "$work_dir/app/var" \
             "$work_dir/user" "$work_dir/system" "$work_dir/extra" "$work_dir/etc/installations.d"
 
           cat > "$work_dir/rt/metadata" <<EOF
@@ -186,6 +188,7 @@ jobs:
           [Application]
           name=org.example.NoDesktopApp
           runtime=org.example.Runtime/$arch/1.0
+          sdk=org.example.Runtime/$arch/1.0
           EOF
           flatpak build-finish --command=true "$work_dir/app"
           flatpak build-export "$work_dir/repo" "$work_dir/app" stable
@@ -202,18 +205,22 @@ jobs:
           export FLATPAK_CONFIG_DIR="$work_dir/etc"
 
           flatpak remote-add --user --no-gpg-verify local "file://$work_dir/repo"
-          flatpak install --user -y --no-deps --no-related local org.example.Runtime//1.0
-          flatpak install --user -y --no-deps --no-related local org.example.NoDesktopApp//stable
+          flatpak install --user -y --noninteractive --no-deps --no-related \
+            local "runtime/org.example.Runtime/$arch/1.0"
+          flatpak install --user -y --noninteractive --no-deps --no-related \
+            local "app/org.example.NoDesktopApp/$arch/stable"
 
           sudo FLATPAK_SYSTEM_DIR="$work_dir/system" FLATPAK_CONFIG_DIR="$work_dir/etc" \
             flatpak remote-add --system --no-gpg-verify local "file://$work_dir/repo"
           sudo FLATPAK_SYSTEM_DIR="$work_dir/system" FLATPAK_CONFIG_DIR="$work_dir/etc" \
-            flatpak install --system -y --no-deps --no-related local org.example.NoDesktopApp//stable
+            flatpak install --system -y --noninteractive --no-deps --no-related \
+            local "app/org.example.NoDesktopApp/$arch/stable"
 
           sudo FLATPAK_SYSTEM_DIR="$work_dir/system" FLATPAK_CONFIG_DIR="$work_dir/etc" \
             flatpak remote-add --installation=extra --no-gpg-verify local "file://$work_dir/repo"
           sudo FLATPAK_SYSTEM_DIR="$work_dir/system" FLATPAK_CONFIG_DIR="$work_dir/etc" \
-            flatpak install --installation=extra -y --no-deps --no-related local org.example.NoDesktopApp//stable
+            flatpak install --installation=extra -y --noninteractive --no-deps --no-related \
+            local "app/org.example.NoDesktopApp/$arch/stable"
 
           sudo chmod -R a+rX "$work_dir/system" "$work_dir/extra"
           /tmp/flatpak_discovery_provider_test --fixture
