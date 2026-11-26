@@ -42,8 +42,11 @@ DiscoveryPassResult ApplicationDiscoveryService::discover_with_report() {
       continue;
     }
 
-    summary.status = ProviderExecutionStatus::kSucceeded;
+    summary.status = result.error_message.empty()
+                         ? ProviderExecutionStatus::kSucceeded
+                         : ProviderExecutionStatus::kPartiallyFailed;
     summary.discovered_count = result.applications.size();
+    summary.error_message = std::move(result.error_message);
     pass_result.provider_summaries.push_back(std::move(summary));
 
     pass_result.applications.reserve(pass_result.applications.size() +

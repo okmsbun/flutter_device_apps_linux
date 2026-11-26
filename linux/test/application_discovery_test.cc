@@ -17,6 +17,7 @@
 #include "discovery/application_identity.h"
 #include "discovery/async_discovery_runner.h"
 #include "discovery/discovered_application.h"
+#include "discovery/flatpak_discovery_provider.h"
 #include "discovery/legacy_list_apps_adapter.h"
 
 namespace {
@@ -35,9 +36,16 @@ using flutter_device_apps_linux::DiscoveryExecutionStatus;
 using flutter_device_apps_linux::DiscoveryPassResult;
 using flutter_device_apps_linux::DiscoveryRequestHandle;
 using flutter_device_apps_linux::DiscoveryResult;
+using flutter_device_apps_linux::FlatpakBackend;
+using flutter_device_apps_linux::FlatpakBackendQueryResult;
+using flutter_device_apps_linux::FlatpakDiscoveryProvider;
+using flutter_device_apps_linux::FlatpakInstallationQueryResult;
+using flutter_device_apps_linux::FlatpakInstalledAppRecord;
 using flutter_device_apps_linux::InstallationScope;
 using flutter_device_apps_linux::InstallationSource;
 using flutter_device_apps_linux::is_valid_legacy_desktop_file_id;
+using flutter_device_apps_linux::kFlatpakRefKindApp;
+using flutter_device_apps_linux::kFlatpakRefKindRuntime;
 using flutter_device_apps_linux::OptionalString;
 using flutter_device_apps_linux::ProviderExecutionStatus;
 
@@ -989,6 +997,331 @@ void test_concurrent_registration_and_discovery_on_service() {
          "concurrent registration and discovery must not race");
 }
 
+// --- FlatpakDiscoveryProvider tests ---
+
+class FakeFlatpakBackend final : public FlatpakBackend {
+ public:
+  FakeFlatpakBackend(bool available, FlatpakBackendQueryResult result,
+                     int* list_calls = nullptr, int* destroyed_count = nullptr)
+      : available_(available),
+        result_(std::move(result)),
+        list_calls_(list_calls),
+        destroyed_count_(destroyed_count) {}
+
+  ~FakeFlatpakBackend() override {
+    if (destroyed_count_ != nullptr) {
+      ++(*destroyed_count_);
+    }
+  }
+
+  bool is_available() const override { return available_; }
+
+  FlatpakBackendQueryResult list_installed_apps() override {
+    if (list_calls_ != nullptr) {
+      ++(*list_calls_);
+    }
+    return result_;
+  }
+
+ private:
+  bool available_;
+  FlatpakBackendQueryResult result_;
+  int* list_calls_;
+  int* destroyed_count_;
+};
+
+FlatpakInstalledAppRecord make_flatpak_ref(
+    const std::string& app_id, const std::string& branch,
+    const std::string& arch, int kind = kFlatpakRefKindApp,
+    const OptionalString& name = OptionalString::none(),
+    const OptionalString& version = OptionalString::none(),
+    const OptionalString& summary = OptionalString::none()) {
+  FlatpakInstalledAppRecord ref;
+  ref.app_id = app_id;
+  ref.branch = branch;
+  ref.arch = arch;
+  ref.ref_kind = kind;
+  ref.name = name;
+  ref.version = version;
+  ref.summary = summary;
+  return ref;
+}
+
+void test_flatpak_missing_backend_or_library_is_unavailable() {
+  FlatpakDiscoveryProvider null_provider(nullptr);
+  expect(std::string(null_provider.id()) == "flatpak",
+         "FlatpakDiscoveryProvider id() must be flatpak");
+  expect(!null_provider.is_available(),
+         "null backend must report unavailable");
+  const DiscoveryResult null_result = null_provider.discover();
+  expect(!null_result.ok, "discover() on unavailable backend must not succeed");
+
+  int list_calls = 0;
+  ApplicationDiscoveryService service;
+  service.register_provider(std::make_unique<FlatpakDiscoveryProvider>(
+      std::make_unique<FakeFlatpakBackend>(false, FlatpakBackendQueryResult{},
+                                           &list_calls)));
+  const DiscoveryPassResult pass = service.discover_with_report();
+  expect(list_calls == 0,
+         "service must not invoke list_installed_apps() when libflatpak missing");
+  expect(pass.applications.empty(), "unavailable flatpak yields no apps");
+  expect(pass.provider_summaries.size() == 1 &&
+             pass.provider_summaries[0].provider_id == "flatpak" &&
+             pass.provider_summaries[0].status ==
+                 ProviderExecutionStatus::kUnavailable,
+         "missing libflatpak must report kUnavailable");
+}
+
+void test_flatpak_empty_installations() {
+  FlatpakBackendQueryResult query;
+  FlatpakInstallationQueryResult user;
+  user.installation_id = "user";
+  user.is_user = true;
+  FlatpakInstallationQueryResult sys;
+  sys.installation_id = "default";
+  sys.is_user = false;
+  query.installations.push_back(std::move(user));
+  query.installations.push_back(std::move(sys));
+
+  ApplicationDiscoveryService service;
+  service.register_provider(std::make_unique<FlatpakDiscoveryProvider>(
+      std::make_unique<FakeFlatpakBackend>(true, std::move(query))));
+
+  const DiscoveryPassResult pass = service.discover_with_report();
+  expect(pass.applications.empty(),
+         "empty Flatpak installations should return 0 apps");
+  expect(pass.provider_summaries.size() == 1 &&
+             pass.provider_summaries[0].status ==
+                 ProviderExecutionStatus::kSucceeded &&
+             pass.provider_summaries[0].discovered_count == 0 &&
+             pass.provider_summaries[0].error_message.empty(),
+         "empty healthy installations should report kSucceeded");
+}
+
+void test_flatpak_scopes_named_installs_branches_arches_metadata_and_runtimes() {
+  FlatpakBackendQueryResult query;
+
+  // User installation with full metadata + a runtime (must be excluded) +
+  // a second branch containing '/'.
+  FlatpakInstallationQueryResult user;
+  user.installation_id = "user";
+  user.is_user = true;
+  user.apps.push_back(make_flatpak_ref(
+      "org.example.Editor", "stable", "x86_64", kFlatpakRefKindApp,
+      OptionalString::of("Example Editor"), OptionalString::of("2.4.0"),
+      OptionalString::of("Fast text editor")));
+  user.apps.push_back(make_flatpak_ref(
+      "org.example.Editor", "beta/nightly", "x86_64", kFlatpakRefKindApp));
+  user.apps.push_back(make_flatpak_ref(
+      "org.freedesktop.Platform", "23.08", "x86_64", kFlatpakRefKindRuntime,
+      OptionalString::of("Platform Runtime")));
+  query.installations.push_back(std::move(user));
+
+  // Default system installation: same app_id with missing optional metadata
+  // (as on older libflatpak without appdata symbols) and two architectures.
+  FlatpakInstallationQueryResult sys_default;
+  sys_default.installation_id = "default";
+  sys_default.is_user = false;
+  sys_default.apps.push_back(
+      make_flatpak_ref("org.example.Editor", "stable", "x86_64"));
+  sys_default.apps.push_back(
+      make_flatpak_ref("org.example.Editor", "stable", "aarch64"));
+  query.installations.push_back(std::move(sys_default));
+
+  // Named extra system installation with the same app_id/branch/arch.
+  FlatpakInstallationQueryResult sys_extra;
+  sys_extra.installation_id = "extra-sys";
+  sys_extra.is_user = false;
+  sys_extra.apps.push_back(
+      make_flatpak_ref("org.example.Editor", "stable", "x86_64"));
+  query.installations.push_back(std::move(sys_extra));
+
+  FlatpakDiscoveryProvider provider(
+      std::make_unique<FakeFlatpakBackend>(true, std::move(query)));
+  const DiscoveryResult result = provider.discover();
+
+  expect(result.ok, "healthy Flatpak discovery should succeed");
+  expect(result.error_message.empty(),
+         "healthy Flatpak discovery should have no diagnostics");
+  expect(result.applications.size() == 5,
+         "runtime must be excluded while all 5 distinct app installs remain");
+  if (result.applications.size() != 5) return;
+
+  const auto& user_stable = result.applications[0];
+  const auto& user_beta = result.applications[1];
+  const auto& sys_x86 = result.applications[2];
+  const auto& sys_arm = result.applications[3];
+  const auto& extra_x86 = result.applications[4];
+
+  // Authoritative provenance, metadata, and unknown defaults on user_stable.
+  expect(user_stable.provenance.provider_id == "flatpak",
+         "provider_id must be flatpak");
+  expect(user_stable.provenance.native_id == "org.example.Editor",
+         "native_id must match Flatpak app ID");
+  expect(user_stable.provenance.installation_source ==
+             InstallationSource::kFlatpak,
+         "installation_source must be kFlatpak");
+  expect(user_stable.provenance.installation_scope == InstallationScope::kUser,
+         "user installation must have kUser scope");
+  expect(user_stable.package_id.has_value() &&
+             user_stable.package_id.value() == "org.example.Editor",
+         "package_id must equal Flatpak app ID");
+  expect(!user_stable.desktop_file_id.has_value(),
+         "Flatpak provider must NOT fabricate desktop_file_id");
+  expect(user_stable.classification == ApplicationClassification::kUnknown,
+         "Flatpak provider must NOT assume GUI classification");
+  expect(user_stable.desktop_menu_visibility == DesktopMenuVisibility::kUnknown,
+         "Flatpak provider must leave desktop_menu_visibility unknown");
+  expect(user_stable.capabilities.supports_files == CapabilityState::kUnknown &&
+             user_stable.capabilities.supports_uris ==
+                 CapabilityState::kUnknown &&
+             user_stable.capabilities.requires_terminal ==
+                 CapabilityState::kUnknown &&
+             user_stable.capabilities.launchable == CapabilityState::kUnknown,
+         "Flatpak provider must leave unsupported capabilities unknown");
+  expect(user_stable.metadata.name.has_value() &&
+             user_stable.metadata.name.value() == "Example Editor",
+         "appdata name must be preserved");
+  expect(user_stable.metadata.version.has_value() &&
+             user_stable.metadata.version.value() == "2.4.0",
+         "appdata version must be preserved");
+  expect(user_stable.metadata.description.has_value() &&
+             user_stable.metadata.description.value() == "Fast text editor",
+         "appdata summary must map to metadata.description");
+  expect(user_stable.metadata.architecture.has_value() &&
+             user_stable.metadata.architecture.value() == "x86_64",
+         "architecture must be preserved");
+  expect(user_stable.metadata.branch.has_value() &&
+             user_stable.metadata.branch.value() == "stable",
+         "branch must be preserved");
+
+  // Missing optional metadata remains unset on sys_x86.
+  expect(sys_x86.provenance.installation_scope == InstallationScope::kSystem,
+         "system installation must have kSystem scope");
+  expect(!sys_x86.metadata.name.has_value() &&
+             !sys_x86.metadata.version.has_value() &&
+             !sys_x86.metadata.description.has_value(),
+         "missing optional appdata fields must remain unset");
+
+  // Escaping of '/' in branch and distinctness of all 5 identities.
+  expect(user_beta.installation_id.has_value() &&
+             user_beta.installation_id.value() == "user/beta%2Fnightly/x86_64",
+         "branch containing '/' must percent-escape '/' in installation_id");
+
+  const std::vector<std::string> ids = {
+      user_stable.application_id, user_beta.application_id,
+      sys_x86.application_id, sys_arm.application_id, extra_x86.application_id};
+  for (size_t i = 0; i < ids.size(); ++i) {
+    for (size_t j = i + 1; j < ids.size(); ++j) {
+      expect(ids[i] != ids[j],
+             "distinct Flatpak installations must produce unique application_ids");
+    }
+  }
+}
+
+void test_flatpak_partial_and_total_installation_failures() {
+  // Partial failure: user installation fails, system installation succeeds.
+  {
+    FlatpakBackendQueryResult query;
+    FlatpakInstallationQueryResult user_failed;
+    user_failed.installation_id = "user";
+    user_failed.is_user = true;
+    user_failed.ok = false;
+    user_failed.error_message = "permission denied";
+    query.installations.push_back(std::move(user_failed));
+
+    FlatpakInstallationQueryResult sys_ok;
+    sys_ok.installation_id = "default";
+    sys_ok.is_user = false;
+    sys_ok.apps.push_back(
+        make_flatpak_ref("org.example.SystemApp", "stable", "x86_64"));
+    query.installations.push_back(std::move(sys_ok));
+
+    ApplicationDiscoveryService service;
+    service.register_provider(std::make_unique<FlatpakDiscoveryProvider>(
+        std::make_unique<FakeFlatpakBackend>(true, std::move(query))));
+
+    const DiscoveryPassResult pass = service.discover_with_report();
+    expect(pass.applications.size() == 1 &&
+               pass.applications[0].provenance.native_id ==
+                   "org.example.SystemApp",
+           "accessible system installation must still contribute apps when "
+           "another installation fails");
+    expect(pass.provider_summaries.size() == 1 &&
+               pass.provider_summaries[0].status ==
+                   ProviderExecutionStatus::kPartiallyFailed &&
+               pass.provider_summaries[0].error_message.find("permission denied") !=
+                   std::string::npos,
+           "partial failure must preserve accurate provider diagnostics");
+  }
+
+  // Total failure: all installations fail -> must NOT report empty success!
+  {
+    FlatpakBackendQueryResult query;
+    FlatpakInstallationQueryResult sys_failed;
+    sys_failed.installation_id = "default";
+    sys_failed.is_user = false;
+    sys_failed.ok = false;
+    sys_failed.error_message = "corrupt ostree repo";
+    query.installations.push_back(std::move(sys_failed));
+
+    ApplicationDiscoveryService service;
+    service.register_provider(std::make_unique<FlatpakDiscoveryProvider>(
+        std::make_unique<FakeFlatpakBackend>(true, std::move(query))));
+
+    const DiscoveryPassResult pass = service.discover_with_report();
+    expect(pass.applications.empty(), "total failure should return no apps");
+    expect(pass.provider_summaries.size() == 1 &&
+               pass.provider_summaries[0].status ==
+                   ProviderExecutionStatus::kFailed &&
+               pass.provider_summaries[0].error_message.find(
+                   "corrupt ostree repo") != std::string::npos,
+           "total installation failure must report kFailed, not empty success");
+  }
+}
+
+void test_flatpak_ownership_and_legacy_list_apps_compatibility() {
+  int backend_destroyed = 0;
+  {
+    DiscoveryResult gio_result;
+    gio_result.applications.push_back(make_gio_app(
+        "org.example.Visible.desktop", "Visible", true, false, false,
+        DesktopMenuVisibility::kVisible));
+    gio_result.applications.push_back(make_gio_app(
+        "org.example.NoDisplay.desktop", "NoDisplay", false, false, false,
+        DesktopMenuVisibility::kNotVisible));
+
+    FlatpakBackendQueryResult flatpak_query;
+    FlatpakInstallationQueryResult user;
+    user.installation_id = "user";
+    user.is_user = true;
+    user.apps.push_back(
+        make_flatpak_ref("org.example.NoDesktopTool", "stable", "x86_64"));
+    flatpak_query.installations.push_back(std::move(user));
+
+    ApplicationDiscoveryService service;
+    service.register_provider(std::make_unique<FakeDiscoveryProvider>(
+        "gio", true, std::move(gio_result)));
+    service.register_provider(std::make_unique<FlatpakDiscoveryProvider>(
+        std::make_unique<FakeFlatpakBackend>(true, std::move(flatpak_query),
+                                             nullptr, &backend_destroyed)));
+
+    const auto unified = service.discover_applications();
+    expect(unified.size() == 3,
+           "internal discovery should include both GIO and Flatpak records");
+
+    const auto legacy =
+        flutter_device_apps_linux::adapt_for_legacy_list_apps(unified);
+    expect(legacy.size() == 1 &&
+               legacy[0].desktop_file_id == "org.example.Visible.desktop",
+           "legacy listApps() must remain strictly visible GIO apps only");
+    expect(backend_destroyed == 0,
+           "FlatpakBackend must remain alive while service is alive");
+  }
+  expect(backend_destroyed == 1,
+         "FlatpakBackend must be deterministically destroyed with service");
+}
+
 }  // namespace
 
 int main() {
@@ -1006,6 +1339,11 @@ int main() {
   test_teardown_while_discovery_pending_is_non_blocking_and_safe();
   test_teardown_with_stopped_platform_loop_releases_pending_calls();
   test_concurrent_registration_and_discovery_on_service();
+  test_flatpak_missing_backend_or_library_is_unavailable();
+  test_flatpak_empty_installations();
+  test_flatpak_scopes_named_installs_branches_arches_metadata_and_runtimes();
+  test_flatpak_partial_and_total_installation_failures();
+  test_flatpak_ownership_and_legacy_list_apps_compatibility();
 
   if (g_failures > 0) {
     std::cerr << g_failures << " test assertion(s) failed.\n";

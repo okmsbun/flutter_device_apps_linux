@@ -14,6 +14,7 @@ namespace flutter_device_apps_linux {
 // Per-provider outcome recorded during a discovery pass.
 enum class ProviderExecutionStatus {
   kSucceeded,
+  kPartiallyFailed,
   kUnavailable,
   kFailed,
 };

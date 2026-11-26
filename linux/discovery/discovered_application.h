@@ -127,6 +127,7 @@ struct ApplicationMetadata {
   OptionalString license;
   OptionalString icon_reference;
   OptionalString architecture;
+  OptionalString branch;
 };
 
 // Tri-state capability flags owned by the internal discovery record.

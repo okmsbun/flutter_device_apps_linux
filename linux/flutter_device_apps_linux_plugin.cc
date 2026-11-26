@@ -2,8 +2,10 @@
 
 #include "discovery/application_discovery_service.h"
 #include "discovery/async_discovery_runner.h"
+#include "discovery/flatpak_discovery_provider.h"
 #include "discovery/gio_discovery_provider.h"
 #include "discovery/legacy_list_apps_adapter.h"
+#include "discovery/libflatpak_backend.h"
 #include "elf_dependencies.h"
 
 #include <gio/gdesktopappinfo.h>
@@ -533,6 +535,9 @@ static std::unique_ptr<DiscoveryPluginContext> create_discovery_context() {
       flutter_device_apps_linux::ApplicationDiscoveryService>();
   context->service->register_provider(
       std::make_unique<flutter_device_apps_linux::GioDiscoveryProvider>());
+  context->service->register_provider(
+      std::make_unique<flutter_device_apps_linux::FlatpakDiscoveryProvider>(
+          flutter_device_apps_linux::create_libflatpak_backend()));
 
   std::shared_ptr<GMainContext> platform_context(
       g_main_context_ref_thread_default(), g_main_context_unref);

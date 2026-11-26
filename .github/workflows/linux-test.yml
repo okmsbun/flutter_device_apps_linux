@@ -25,7 +25,10 @@ jobs:
       - name: Install Linux build and test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev libstdc++-12-dev libgl1-mesa-dri shared-mime-info xvfb xauth
+          # Note: intentionally install flatpak runtime (for libflatpak.so.0 and
+          # local offline fixture creation) without libflatpak-dev, proving the
+          # plugin builds without compile-time or link-time libflatpak headers.
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev libstdc++-12-dev libgl1-mesa-dri shared-mime-info xvfb xauth flatpak
 
       - name: Install dependencies
         run: flutter pub get
@@ -38,6 +41,7 @@ jobs:
             linux/discovery/application_identity.cc \
             linux/discovery/application_discovery_service.cc \
             linux/discovery/async_discovery_runner.cc \
+            linux/discovery/flatpak_discovery_provider.cc \
             linux/discovery/legacy_list_apps_adapter.cc \
             linux/test/application_discovery_test.cc \
             -o /tmp/application_discovery_test_asan
@@ -49,6 +53,7 @@ jobs:
             linux/discovery/application_identity.cc \
             linux/discovery/application_discovery_service.cc \
             linux/discovery/async_discovery_runner.cc \
+            linux/discovery/flatpak_discovery_provider.cc \
             linux/discovery/legacy_list_apps_adapter.cc \
             linux/test/application_discovery_test.cc \
             -o /tmp/application_discovery_test_tsan
@@ -111,6 +116,93 @@ jobs:
             /tmp/gio_discovery_provider_test --empty
           env XDG_DATA_HOME="$fixture_dir" XDG_DATA_DIRS="$fixture_dir" XDG_CURRENT_DESKTOP=GNOME LANGUAGE=C LC_ALL=C.UTF-8 \
             /tmp/gio_discovery_provider_test
+
+      - name: Run native Flatpak discovery integration tests
+        run: |
+          clang++ -std=c++14 -Wall -Wextra -Wpedantic -Werror \
+            -Ilinux \
+            $(pkg-config --cflags gio-unix-2.0 gmodule-2.0) \
+            linux/discovery/application_identity.cc \
+            linux/discovery/flatpak_discovery_provider.cc \
+            linux/discovery/legacy_list_apps_adapter.cc \
+            linux/discovery/libflatpak_backend.cc \
+            linux/test/flatpak_discovery_provider_test.cc \
+            $(pkg-config --libs gio-unix-2.0 gmodule-2.0) \
+            -o /tmp/flatpak_discovery_provider_test
+
+          # Verify no mandatory DT_NEEDED ELF dependency on libflatpak.
+          if readelf -d /tmp/flatpak_discovery_provider_test | grep -q 'libflatpak'; then
+            echo "Unexpected mandatory DT_NEEDED dependency on libflatpak"
+            exit 1
+          fi
+
+          work_dir="$(mktemp -d)"
+          trap 'rm -rf -- "$work_dir"' EXIT
+
+          # Test missing library and missing symbols with tiny stub shared libraries.
+          printf '%s\n' 'void unrelated_symbol(void) {}' | \
+            clang -x c - -fPIC -shared -o "$work_dir/libincomplete.so"
+          cat > "$work_dir/core_only.c" <<'EOF'
+          void* flatpak_get_system_installations(void* c, void** e) { (void)c; (void)e; return 0; }
+          void* flatpak_installation_new_user(void* c, void** e) { (void)c; (void)e; return 0; }
+          void* flatpak_installation_list_installed_refs_by_kind(void* s, int k, void* c, void** e) { (void)s; (void)k; (void)c; (void)e; return 0; }
+          const char* flatpak_installation_get_id(void* s) { (void)s; return "default"; }
+          int flatpak_installation_get_is_user(void* s) { (void)s; return 0; }
+          const char* flatpak_ref_get_name(void* r) { (void)r; return 0; }
+          const char* flatpak_ref_get_arch(void* r) { (void)r; return 0; }
+          const char* flatpak_ref_get_branch(void* r) { (void)r; return 0; }
+          int flatpak_ref_get_kind(void* r) { (void)r; return 0; }
+          EOF
+          clang "$work_dir/core_only.c" -fPIC -shared -o "$work_dir/libcoreonly.so"
+
+          /tmp/flatpak_discovery_provider_test --missing-lib
+          /tmp/flatpak_discovery_provider_test --missing-symbols \
+            "$work_dir/libincomplete.so" "$work_dir/libcoreonly.so"
+
+          # Build an offline local Flatpak repo with one runtime and one app
+          # (intentionally without any .desktop file).
+          arch="$(flatpak --default-arch)"
+          mkdir -p "$work_dir/rt/files/bin" "$work_dir/app/files/bin" "$work_dir/repo" \
+            "$work_dir/user" "$work_dir/system" "$work_dir/extra" "$work_dir/etc/installations.d"
+
+          cat > "$work_dir/rt/metadata" <<EOF
+          [Runtime]
+          name=org.example.Runtime
+          runtime=org.example.Runtime/$arch/1.0
+          sdk=org.example.Runtime/$arch/1.0
+          EOF
+          flatpak build-export --runtime "$work_dir/repo" "$work_dir/rt" 1.0
+
+          cat > "$work_dir/app/metadata" <<EOF
+          [Application]
+          name=org.example.NoDesktopApp
+          runtime=org.example.Runtime/$arch/1.0
+          command=true
+          EOF
+          flatpak build-export "$work_dir/repo" "$work_dir/app" stable
+
+          cat > "$work_dir/etc/installations.d/extra.conf" <<EOF
+          [Installation "extra"]
+          Path=$work_dir/extra
+          DisplayName=Extra System Installation
+          StorageType=harddisk
+          EOF
+
+          export FLATPAK_USER_DIR="$work_dir/user"
+          export FLATPAK_SYSTEM_DIR="$work_dir/system"
+          export FLATPAK_CONFIG_DIR="$work_dir/etc"
+
+          flatpak remote-add --user --no-gpg-verify local "file://$work_dir/repo"
+          flatpak install --user -y --no-deps --no-related local org.example.Runtime//1.0
+          flatpak install --user -y --no-deps --no-related local org.example.NoDesktopApp//stable
+
+          flatpak remote-add --system --no-gpg-verify local "file://$work_dir/repo"
+          flatpak install --system -y --no-deps --no-related local org.example.NoDesktopApp//stable
+
+          flatpak remote-add --installation=extra --no-gpg-verify local "file://$work_dir/repo"
+          flatpak install --installation=extra -y --no-deps --no-related local org.example.NoDesktopApp//stable
+
+          /tmp/flatpak_discovery_provider_test --fixture
 
       - name: Run Linux integration tests
         run: bash example/tool/test_linux.sh
