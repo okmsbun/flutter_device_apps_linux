@@ -4670,6 +4670,309 @@ void test_ownership_service_single_pass_failure_isolation_and_legacy() {
          "ownership index failure must be isolated and leave records unlinked");
 }
 
+void test_resolution_step92_integrity_cross_provider_parallel_rpm_and_scoped_dedup() {
+  // 1. Cross-provider false-correlation prevention via bare AppStream pkgnames:
+  // (a) An unowned desktop entry must NOT be linked to an installed package
+  //     solely because AppStream mentions both desktop-id and pkgname.
+  // (b) When two distinct package providers (dpkg + rpm) both have a package
+  //     with the same name, bare AppStream pkgname must report ambiguity rather
+  //     than falsely correlating either/both across providers.
+  // (c) Distro kCatalog AppStream records must NOT match Nix profile packages,
+  //     and Flatpak/Snap bundle records must NOT match DPKG packages.
+  {
+    DiscoveryPassResult pass;
+    DiscoveredApplication foreign_desktop = make_gio_app(
+        "org.example.Manual.desktop", "Manual App", false, false, false);
+    foreign_desktop.desktop_file_path =
+        OptionalString::of("/usr/local/share/applications/org.example.Manual.desktop");
+    pass.applications.push_back(foreign_desktop);
+
+    InstalledPackageRecord dpkg_manual = make_owned_pkg(
+        "dpkg", InstallationSource::kDpkg, "manual-app", "amd64", "1.0-1");
+    InstalledPackageRecord dpkg_shared = make_owned_pkg(
+        "dpkg", InstallationSource::kDpkg, "shared-cli", "amd64", "2.0-1");
+    InstalledPackageRecord rpm_shared = make_owned_pkg(
+        "rpm", InstallationSource::kRpm, "shared-cli", "x86_64", "2.0");
+    rpm_shared.release = OptionalString::of("1");
+    rpm_shared.installation_identity_id = OptionalString::of(
+        fdal::build_rpm_installation_identity_id(
+            "shared-cli", rpm_shared.architecture, rpm_shared.epoch,
+            rpm_shared.version, rpm_shared.release));
+    InstalledPackageRecord nix_only = make_owned_pkg(
+        "nix", InstallationSource::kNix, "nix-tool", "x86_64-linux", "1.0");
+    nix_only.provenance.installation_scope = InstallationScope::kUser;
+    nix_only.package_identity_id =
+        build_application_id("nix", "nix-tool", InstallationScope::kUser,
+                             OptionalString::of("user"));
+    InstalledPackageRecord dpkg_bundle_collision = make_owned_pkg(
+        "dpkg", InstallationSource::kDpkg, "bundle-tool", "amd64", "1.0-1");
+    pass.packages = {dpkg_manual, dpkg_shared, rpm_shared, nix_only,
+                     dpkg_bundle_collision};
+
+    AppStreamMetadataRecord as_manual;
+    as_manual.component_id = "org.example.Manual";
+    as_manual.component_kind = "desktop-application";
+    as_manual.desktop_launchable_ids = {"org.example.Manual.desktop"};
+    as_manual.package_names = {"manual-app"};
+    as_manual.provenance.origin_kind = AppStreamMetadataOriginKind::kCatalog;
+
+    AppStreamMetadataRecord as_shared;
+    as_shared.component_id = "org.example.SharedCli";
+    as_shared.component_kind = "console-application";
+    as_shared.package_names = {"shared-cli"};
+    as_shared.provenance.origin_kind = AppStreamMetadataOriginKind::kCatalog;
+
+    AppStreamMetadataRecord as_nix_catalog;
+    as_nix_catalog.component_id = "org.example.NixTool";
+    as_nix_catalog.component_kind = "console-application";
+    as_nix_catalog.package_names = {"nix-tool"};
+    as_nix_catalog.provenance.origin_kind =
+        AppStreamMetadataOriginKind::kCatalog;
+
+    AppStreamMetadataRecord as_bundle;
+    as_bundle.component_id = "org.example.BundleTool";
+    as_bundle.component_kind = "console-application";
+    as_bundle.package_names = {"bundle-tool"};
+    as_bundle.bundles.push_back({"flatpak", "app/org.example.BundleTool/x86_64/stable"});
+
+    const ResolvedDiscoveryInventory inv = resolve_discovery_inventory(
+        pass, {as_manual, as_shared, as_nix_catalog, as_bundle});
+
+    const auto* res_manual =
+        find_resolved_by_id(inv, foreign_desktop.application_id);
+    expect(res_manual != nullptr &&
+               res_manual->linked_package_identity_ids.empty() &&
+               res_manual->primary_provenance.installation_source ==
+                   InstallationSource::kUnknown,
+           "unowned GIO desktop entry must NOT link to dpkg package solely via "
+           "AppStream package_names");
+
+    bool promoted_shared = false;
+    bool promoted_nix_from_catalog = false;
+    bool promoted_bundle_dpkg = false;
+    for (const auto& app : inv.applications) {
+      if (app.primary_provenance.native_id == "shared-cli") {
+        promoted_shared = true;
+      }
+      if (app.primary_provenance.native_id == "nix-tool") {
+        promoted_nix_from_catalog = true;
+      }
+      if (app.primary_provenance.native_id == "bundle-tool") {
+        promoted_bundle_dpkg = true;
+      }
+    }
+    expect(!promoted_shared,
+           "ambiguous cross-provider pkgname (dpkg + rpm) must NOT promote "
+           "either package");
+    expect(!promoted_nix_from_catalog,
+           "distro kCatalog AppStream pkgname must NOT falsely correlate to "
+           "Nix package");
+    expect(!promoted_bundle_dpkg,
+           "AppStream record with Flatpak bundle must NOT match DPKG package");
+
+    bool saw_cross_provider_amb = false;
+    for (const auto& amb : inv.ambiguities) {
+      if (amb.reason.find("cross-provider") != std::string::npos &&
+          amb.candidate_ids.size() == 2) {
+        saw_cross_provider_amb = true;
+      }
+    }
+    expect(saw_cross_provider_amb,
+           "cross-provider AppStream pkgname collision must record ambiguity");
+
+    for (const auto& pkg : inv.packages) {
+      if (pkg.package_name == "shared-cli" || pkg.package_name == "nix-tool" ||
+          pkg.package_name == "bundle-tool") {
+        expect(pkg.classification == ApplicationClassification::kUnknown,
+               "rejected/ambiguous cross-provider pkgname matches must leave "
+               "package classification kUnknown");
+      }
+    }
+  }
+
+  // 2. Parallel RPM installations preserved with distinct deterministic IDs,
+  //    AND installation-scoped component deduplication (not global by CID).
+  {
+    DiscoveryPassResult pass;
+
+    InstalledPackageRecord rpm_v1 = make_owned_pkg(
+        "rpm", InstallationSource::kRpm, "example-multi", "noarch", "1.0.0");
+    rpm_v1.epoch = OptionalString::of("1");
+    rpm_v1.release = OptionalString::of("1");
+    rpm_v1.installation_identity_id = OptionalString::of(
+        fdal::build_rpm_installation_identity_id(
+            "example-multi", rpm_v1.architecture, rpm_v1.epoch, rpm_v1.version,
+            rpm_v1.release));
+
+    InstalledPackageRecord rpm_v2 = make_owned_pkg(
+        "rpm", InstallationSource::kRpm, "example-multi", "noarch", "2.0.0");
+    rpm_v2.epoch = OptionalString::of("1");
+    rpm_v2.release = OptionalString::of("2");
+    rpm_v2.installation_identity_id = OptionalString::of(
+        fdal::build_rpm_installation_identity_id(
+            "example-multi", rpm_v2.architecture, rpm_v2.epoch, rpm_v2.version,
+            rpm_v2.release));
+
+    pass.packages = {rpm_v1, rpm_v2};
+
+    AppStreamMetadataRecord as_multi;
+    as_multi.component_id = "org.example.MultiCli";
+    as_multi.component_kind = "console-application";
+    as_multi.package_names = {"example-multi"};
+    as_multi.provenance.origin_kind = AppStreamMetadataOriginKind::kCatalog;
+
+    const ResolvedDiscoveryInventory fwd =
+        resolve_discovery_inventory(pass, {as_multi});
+    DiscoveryPassResult rev_pass = pass;
+    std::reverse(rev_pass.packages.begin(), rev_pass.packages.end());
+    const ResolvedDiscoveryInventory rev =
+        resolve_discovery_inventory(rev_pass, {as_multi});
+
+    expect(fwd.applications.size() == 2 && rev.applications.size() == 2,
+           "both parallel RPM installations must be preserved as distinct "
+           "applications");
+    if (fwd.applications.size() == 2 && rev.applications.size() == 2) {
+      expect(fwd.applications[0].resolved_id !=
+                 fwd.applications[1].resolved_id,
+             "parallel RPM installations must have distinct resolved_ids");
+      expect(fwd.applications[0].resolved_id ==
+                     rev.applications[0].resolved_id &&
+                 fwd.applications[1].resolved_id ==
+                     rev.applications[1].resolved_id,
+             "parallel RPM resolved_ids must be deterministic across order");
+      expect(fwd.applications[0].metadata.version.has_value() &&
+                 fwd.applications[1].metadata.version.has_value() &&
+                 fwd.applications[0].metadata.version.value() !=
+                     fwd.applications[1].metadata.version.value(),
+             "each parallel RPM record must retain its own installed version");
+    }
+
+    // If rpm_v1 owns a desktop entry matching org.example.MultiCli, only
+    // rpm_v1 is deduplicated while rpm_v2 stays preserved!
+    DiscoveredApplication v1_desktop = make_gio_app(
+        "org.example.MultiCli.desktop", "Multi v1", false, false, false);
+    v1_desktop.desktop_file_path =
+        OptionalString::of("/usr/share/applications/org.example.MultiCli.desktop");
+    pass.applications.push_back(v1_desktop);
+    as_multi.desktop_launchable_ids = {"org.example.MultiCli.desktop"};
+
+    FakeOwnershipLookup v1_owner;
+    PackageOwnershipEvidence ev;
+    ev.package_provider_id = "rpm";
+    ev.package_identity_id = OptionalString::of(rpm_v1.package_identity_id);
+    ev.installation_identity_id = rpm_v1.installation_identity_id;
+    ev.package_name = "example-multi";
+    v1_owner.add("/usr/share/applications/org.example.MultiCli.desktop", ev);
+
+    const ResolvedDiscoveryInventory with_v1_desktop =
+        resolve_discovery_inventory(pass, {as_multi}, &v1_owner);
+    expect(with_v1_desktop.applications.size() == 2,
+           "desktop entry owned by rpm_v1 must deduplicate ONLY rpm_v1 while "
+           "preserving parallel rpm_v2");
+
+    // Single RPM upgrade keeps resolved_id stable.
+    DiscoveryPassResult single_v1;
+    single_v1.packages = {rpm_v1};
+    DiscoveryPassResult single_v2;
+    single_v2.packages = {rpm_v2};
+    AppStreamMetadataRecord as_cli_only = as_multi;
+    as_cli_only.desktop_launchable_ids.clear();
+    const ResolvedDiscoveryInventory up1 =
+        resolve_discovery_inventory(single_v1, {as_cli_only});
+    const ResolvedDiscoveryInventory up2 =
+        resolve_discovery_inventory(single_v2, {as_cli_only});
+    expect(up1.applications.size() == 1 && up2.applications.size() == 1 &&
+               up1.applications[0].resolved_id ==
+                   up2.applications[0].resolved_id,
+           "single RPM installation must keep stable resolved_id across "
+           "version upgrades");
+  }
+
+  // 3. Installation-scoped component deduplication across Flatpak + DPKG:
+  //    Flatpak matching org.example.DualTool must NOT suppress a separate
+  //    verified DPKG installation sharing the same AppStream component ID!
+  {
+    DiscoveryPassResult pass;
+
+    DiscoveredApplication fp;
+    fp.provenance.provider_id = "flatpak";
+    fp.provenance.native_id = "org.example.DualTool";
+    fp.provenance.installation_source = InstallationSource::kFlatpak;
+    fp.provenance.installation_scope = InstallationScope::kUser;
+    fp.package_id = OptionalString::of("org.example.DualTool");
+    fp.installation_id = OptionalString::of("user/stable/x86_64");
+    fp.application_id = build_application_id(
+        "flatpak", "org.example.DualTool", InstallationScope::kUser,
+        fp.installation_id);
+    fp.metadata.version = OptionalString::of("3.0.0");
+    pass.applications.push_back(fp);
+
+    InstalledPackageRecord dpkg_dual = make_owned_pkg(
+        "dpkg", InstallationSource::kDpkg, "dual-tool", "amd64", "2.5.0-1");
+    InstalledPackageRecord dpkg_owned = make_owned_pkg(
+        "dpkg", InstallationSource::kDpkg, "owned-tool", "amd64", "1.1.0-1");
+    pass.packages = {dpkg_dual, dpkg_owned};
+
+    DiscoveredApplication owned_desktop = make_gio_app(
+        "org.example.OwnedTool.desktop", "Owned Tool", false, false, false);
+    owned_desktop.desktop_file_path =
+        OptionalString::of("/usr/share/applications/org.example.OwnedTool.desktop");
+    pass.applications.push_back(owned_desktop);
+
+    FakeOwnershipLookup owned_lookup;
+    PackageOwnershipEvidence own_ev;
+    own_ev.package_provider_id = "dpkg";
+    own_ev.package_identity_id =
+        OptionalString::of(dpkg_owned.package_identity_id);
+    own_ev.package_name = "owned-tool";
+    owned_lookup.add("/usr/share/applications/org.example.OwnedTool.desktop",
+                     own_ev);
+
+    AppStreamMetadataRecord as_fp_dual;
+    as_fp_dual.component_id = "org.example.DualTool";
+    as_fp_dual.component_kind = "desktop-application";
+    as_fp_dual.bundles.push_back(
+        {"flatpak", "app/org.example.DualTool/x86_64/stable"});
+
+    AppStreamMetadataRecord as_dpkg_dual;
+    as_dpkg_dual.component_id = "org.example.DualTool";
+    as_dpkg_dual.component_kind = "console-application";
+    as_dpkg_dual.package_names = {"dual-tool"};
+    as_dpkg_dual.provenance.origin_kind = AppStreamMetadataOriginKind::kCatalog;
+
+    AppStreamMetadataRecord as_owned;
+    as_owned.component_id = "org.example.OwnedTool";
+    as_owned.component_kind = "desktop-application";
+    as_owned.desktop_launchable_ids = {"org.example.OwnedTool.desktop"};
+    as_owned.package_names = {"owned-tool"};
+    as_owned.provenance.origin_kind = AppStreamMetadataOriginKind::kCatalog;
+
+    const ResolvedDiscoveryInventory inv = resolve_discovery_inventory(
+        pass, {as_fp_dual, as_dpkg_dual, as_owned}, &owned_lookup);
+
+    bool saw_fp_dual = false;
+    bool saw_dpkg_dual = false;
+    int owned_count = 0;
+    for (const auto& app : inv.applications) {
+      if (app.resolved_id == fp.application_id) saw_fp_dual = true;
+      if (app.primary_provenance.provider_id == "dpkg" &&
+          app.primary_provenance.native_id == "dual-tool") {
+        saw_dpkg_dual = true;
+      }
+      if (!app.linked_appstream_component_ids.empty() &&
+          app.linked_appstream_component_ids[0] == "org.example.OwnedTool") {
+        ++owned_count;
+      }
+    }
+    expect(saw_fp_dual && saw_dpkg_dual,
+           "Flatpak matching org.example.DualTool must NOT suppress separate "
+           "DPKG installation sharing the same component ID");
+    expect(owned_count == 1,
+           "verified DPKG installation owning its desktop entry must "
+           "deduplicate to a single ResolvedApplication");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -4717,6 +5020,7 @@ int main() {
   test_ownership_nix_rpm_pacman_indexers();
   test_ownership_resolution_parallel_versions_diversions_and_hints();
   test_ownership_service_single_pass_failure_isolation_and_legacy();
+  test_resolution_step92_integrity_cross_provider_parallel_rpm_and_scoped_dedup();
 
   if (g_failures > 0) {
     std::cerr << g_failures << " test assertion(s) failed.\n";

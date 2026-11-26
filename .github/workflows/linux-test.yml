@@ -427,7 +427,7 @@ jobs:
           echo "Resolved runtime librpm: $librpm_path"
 
           rpm_work="$(mktemp -d)"
-          trap 'rm -rf -- "$rpm_work"' EXIT
+          trap 'sudo rm -rf -- "$rpm_work"' EXIT
 
           printf '%s\n' 'void unrelated_symbol(void) {}' | \
             clang -x c - -fPIC -shared -o "$rpm_work/libincomplete.so"
@@ -501,13 +501,17 @@ jobs:
           rpmbuild --define "_topdir $rpm_work/rpmbuild" -bb "$rpm_work/rpmbuild/SPECS/example-multi-2.spec"
           rpmbuild --define "_topdir $rpm_work/rpmbuild" -bb "$rpm_work/rpmbuild/SPECS/example-tool.spec"
 
-          rpm --root "$rpm_work/fixture_root" --initdb
-          rpm --root "$rpm_work/fixture_root" -ivh --justdb --nodeps --noscripts --notriggers --ignorearch \
+          # RPM --root installation of packages with %files requires chroot(),
+          # so use sudo strictly for isolated fixture DB population and make
+          # the fixture world-readable before running the unprivileged test.
+          sudo rpm --root "$rpm_work/fixture_root" --initdb
+          sudo rpm --root "$rpm_work/fixture_root" -ivh --justdb --nodeps --noscripts --notriggers --ignorearch \
             "$rpm_work/rpmbuild/RPMS/noarch/example-multi-1.0.0-1.noarch.rpm"
-          rpm --root "$rpm_work/fixture_root" -ivh --justdb --nodeps --noscripts --notriggers --ignorearch \
+          sudo rpm --root "$rpm_work/fixture_root" -ivh --justdb --nodeps --noscripts --notriggers --ignorearch \
             "$rpm_work/rpmbuild/RPMS/noarch/example-multi-2.0.0-2.noarch.rpm"
-          rpm --root "$rpm_work/fixture_root" -ivh --justdb --nodeps --noscripts --notriggers --ignorearch \
+          sudo rpm --root "$rpm_work/fixture_root" -ivh --justdb --nodeps --noscripts --notriggers --ignorearch \
             "$rpm_work/rpmbuild/RPMS/noarch/example-tool-3.1.4-1.noarch.rpm"
+          sudo chmod -R a+rX "$rpm_work/fixture_root"
 
           /tmp/rpm_discovery_provider_test --fixture "$rpm_work/fixture_root"
 

@@ -276,12 +276,24 @@ int installed_version_rank_for_provider(const std::string& provider_id) {
   return 10;
 }
 
+std::string package_installation_key(const InstalledPackageRecord& pkg) {
+  if (pkg.installation_identity_id.has_value() &&
+      !pkg.installation_identity_id.value().empty()) {
+    return pkg.installation_identity_id.value();
+  }
+  return pkg.package_identity_id;
+}
+
 struct MutableResolvedEntry {
   ResolvedApplication app;
   FieldSourceTracker tracker;
   OptionalString flatpak_app_id;
   OptionalString snap_instance_name;
   OptionalString snap_package_name;
+  // Exact verified package installation keys linked to this entry via
+  // authoritative ownership evidence (installation_identity_id when present,
+  // otherwise package_identity_id).
+  std::vector<std::string> linked_installation_keys;
 };
 
 void recompute_desktop_aggregates(ResolvedApplication* app) {
@@ -474,8 +486,15 @@ void enrich_from_package(MutableResolvedEntry* target,
                          const InstalledPackageRecord& pkg) {
   add_unique_string(&target->app.linked_package_identity_ids,
                     pkg.package_identity_id);
+  add_unique_string(&target->linked_installation_keys,
+                    package_installation_key(pkg));
   add_unique_provenance(&target->app.source_provenances, pkg.provenance);
   add_unique_string(&target->app.original_record_ids, pkg.package_identity_id);
+  if (pkg.installation_identity_id.has_value() &&
+      !pkg.installation_identity_id.value().empty()) {
+    add_unique_string(&target->app.original_record_ids,
+                      pkg.installation_identity_id.value());
+  }
 
   if (target->app.primary_provenance.installation_source ==
       InstallationSource::kUnknown) {
@@ -1139,7 +1158,10 @@ ResolvedDiscoveryInventory resolve_discovery_inventory(
   }
 
   std::vector<bool> appstream_matched(sorted_as.size(), false);
-  std::unordered_set<std::string> matched_component_ids_on_apps;
+  // Scoped strictly to (verified_installation_key + "\n" + component_id) so a
+  // Flatpak, Snap, or one parallel RPM installation matching a component ID
+  // never suppresses a separate verified installation sharing that component.
+  std::unordered_set<std::string> matched_installation_components;
 
   // 7. Enrich ResolvedApplications from strongly matched AppStream records.
   for (auto& entry : entries) {
@@ -1185,35 +1207,14 @@ ResolvedDiscoveryInventory resolve_discovery_inventory(
                                      &ambiguous_cids)) {
       for (size_t aidx : selected) {
         appstream_matched[aidx] = true;
-        matched_component_ids_on_apps.insert(sorted_as[aidx].component_id);
         enrich_from_appstream(&entry, sorted_as[aidx]);
-
-        // If this desktop entry has no package link yet and AppStream provides
-        // a single unambiguous native package name matching a unique installed
-        // distro package, link them without guessing across multi-package
-        // ambiguity!
-        if (entry.app.linked_package_identity_ids.empty() &&
-            entry.app.primary_provenance.installation_source ==
-                InstallationSource::kUnknown &&
-            sorted_as[aidx].package_names.size() == 1) {
-          const auto pit =
-              pkg_by_name.find(sorted_as[aidx].package_names.front());
-          if (pit != pkg_by_name.end()) {
-            if (pit->second.size() == 1) {
-              enrich_from_package(&entry, inventory.packages[pit->second[0]]);
-            } else if (pit->second.size() > 1) {
-              ResolutionAmbiguity amb;
-              amb.reason =
-                  "ambiguous installed packages for AppStream pkgname " +
-                  sorted_as[aidx].package_names.front();
-              for (size_t pidx : pit->second) {
-                amb.candidate_ids.push_back(
-                    inventory.packages[pidx].package_identity_id);
-              }
-              entry.app.ambiguities.push_back(amb);
-              inventory.ambiguities.push_back(std::move(amb));
-            }
-          }
+        // Record component deduplication strictly for verified package
+        // installations already linked to this entry via ownership evidence.
+        // Never correlate desktop entries to packages solely via AppStream
+        // package_names.
+        for (const auto& install_key : entry.linked_installation_keys) {
+          matched_installation_components.insert(install_key + "\n" +
+                                                 sorted_as[aidx].component_id);
         }
       }
     } else if (!ambiguous_cids.empty()) {
@@ -1230,14 +1231,18 @@ ResolvedDiscoveryInventory resolve_discovery_inventory(
   // 8. Correlate installed packages with AppStream metadata by authoritative
   // `package_names` index:
   // - Never classify packages from names or sections alone.
+  // - Never cross-correlate across multiple package managers solely via bare
+  //   AppStream package_names; record ambiguity instead.
   // - Never promote catalog-only AppStream records without an installed
   //   package.
-  // - Promote strongly matched CLI/GUI application components backed by a
-  //   verified installed package (supporting multiple components per package),
-  //   while keeping services, libraries, runtimes, and insufficiently
-  //   identified packages strictly in `inventory.packages`.
+  // - Deduplicate components strictly per verified installation, preserving
+  //   distinct parallel RPM installations and separate provider installations.
+  std::unordered_set<std::string> reported_cross_provider_ambiguities;
   for (size_t pidx = 0; pidx < inventory.packages.size(); ++pidx) {
     auto& pkg = inventory.packages[pidx];
+    if (pkg.installation_state == PackageInstallationState::kUnknown) {
+      continue;
+    }
     const auto it = as_by_pkgname.find(pkg.package_name);
     if (it == as_by_pkgname.end()) continue;
 
@@ -1249,7 +1254,61 @@ ResolvedDiscoveryInventory resolve_discovery_inventory(
                                pkg.provenance.installation_scope)) {
         continue;
       }
-      // Reject bundle-only records that don't actually name this package.
+      // Reject bundle records (Flatpak/Snap) from matching distro/profile
+      // packages via bare package_names.
+      if (!rec.bundles.empty()) {
+        continue;
+      }
+      // Distro AppStream catalogs (kCatalog) describe traditional distribution
+      // packages, never Nix profile flake packages.
+      if (pkg.provenance.installation_source == InstallationSource::kNix &&
+          rec.provenance.origin_kind == AppStreamMetadataOriginKind::kCatalog) {
+        continue;
+      }
+
+      // Guard against cross-provider false correlation when multiple distinct
+      // package providers (for example, dpkg + rpm or dpkg + pacman) contain a
+      // compatible package with the exact same name.
+      const auto pit = pkg_by_name.find(pkg.package_name);
+      if (pit != pkg_by_name.end()) {
+        std::set<std::string> compatible_providers;
+        std::vector<std::string> candidate_pkg_ids;
+        for (size_t other_idx : pit->second) {
+          const auto& other_pkg = inventory.packages[other_idx];
+          if (other_pkg.installation_state ==
+              PackageInstallationState::kUnknown) {
+            continue;
+          }
+          if (!is_scope_compatible(rec.provenance.scope,
+                                   other_pkg.provenance.installation_scope)) {
+            continue;
+          }
+          if (other_pkg.provenance.installation_source ==
+                  InstallationSource::kNix &&
+              rec.provenance.origin_kind ==
+                  AppStreamMetadataOriginKind::kCatalog) {
+            continue;
+          }
+          compatible_providers.insert(other_pkg.provenance.provider_id);
+          add_unique_string(&candidate_pkg_ids,
+                            package_installation_key(other_pkg));
+        }
+        if (compatible_providers.size() > 1) {
+          const std::string amb_key =
+              rec.component_id + "\n" + pkg.package_name;
+          if (reported_cross_provider_ambiguities.insert(amb_key).second) {
+            std::sort(candidate_pkg_ids.begin(), candidate_pkg_ids.end());
+            ResolutionAmbiguity amb;
+            amb.reason =
+                "ambiguous cross-provider AppStream pkgname match (" +
+                rec.component_id + " -> " + pkg.package_name + ")";
+            amb.candidate_ids = std::move(candidate_pkg_ids);
+            inventory.ambiguities.push_back(std::move(amb));
+          }
+          continue;
+        }
+      }
+
       by_component[rec.component_id].push_back(aidx);
     }
     if (by_component.empty()) continue;
@@ -1276,11 +1335,26 @@ ResolvedDiscoveryInventory resolve_discovery_inventory(
       pkg.classification = agreed_class;
     }
 
+    const std::string pkg_install_key = package_installation_key(pkg);
+    const auto id_bucket_it = pkg_by_identity.find(pkg.package_identity_id);
+    const bool has_parallel_installations =
+        id_bucket_it != pkg_by_identity.end() &&
+        id_bucket_it->second.size() > 1 &&
+        pkg.installation_identity_id.has_value() &&
+        !pkg.installation_identity_id.value().empty();
+    // Preserve stable identity across normal upgrades while keeping distinct
+    // deterministic identities when parallel installations (such as multi-
+    // version RPMs) coexist simultaneously.
+    const std::string install_anchor =
+        has_parallel_installations ? pkg.installation_identity_id.value()
+                                   : pkg.package_identity_id;
+
     // Promote strongly matched verified installed CLI/GUI application
-    // components that are not already represented by a desktop-backed entry.
+    // components not already represented for THIS verified installation.
     for (const auto& kv : by_component) {
       const std::string& cid = kv.first;
-      if (matched_component_ids_on_apps.count(cid) > 0) {
+      if (matched_installation_components.count(pkg_install_key + "\n" + cid) >
+          0) {
         continue;
       }
 
@@ -1300,24 +1374,32 @@ ResolvedDiscoveryInventory resolve_discovery_inventory(
         return ra != rb ? ra < rb : a < b;
       });
 
-      const ApplicationClassification comp_class =
-          classify_appstream_component_kind(
-              sorted_as[ordered.front()].component_kind);
-      if (comp_class != ApplicationClassification::kCliApplication &&
-          comp_class != ApplicationClassification::kGuiApplication) {
-        // Services, libraries, runtimes, and generic/unknown components stay
-        // strictly in `inventory.packages`.
+      // Refuse to promote if records for the same component disagree on kind.
+      ApplicationClassification comp_class =
+          ApplicationClassification::kUnknown;
+      bool comp_kind_conflict = false;
+      for (size_t aidx : ordered) {
+        const ApplicationClassification c =
+            classify_appstream_component_kind(sorted_as[aidx].component_kind);
+        if (c == ApplicationClassification::kUnknown) continue;
+        if (comp_class == ApplicationClassification::kUnknown) {
+          comp_class = c;
+        } else if (comp_class != c) {
+          comp_kind_conflict = true;
+        }
+      }
+      if (comp_kind_conflict ||
+          (comp_class != ApplicationClassification::kCliApplication &&
+           comp_class != ApplicationClassification::kGuiApplication)) {
+        // Services, libraries, runtimes, conflicting kinds, and generic/unknown
+        // components stay strictly in `inventory.packages`.
         continue;
       }
 
-      // Build a deterministic component-qualified resolved_id anchored to the
-      // package's stable identity so multiple components belonging to one
-      // package (or across separate profiles/arches) stay distinct and stable
-      // across upgrades.
       const std::string comp_resolved_id = build_application_id(
           pkg.provenance.provider_id, pkg.package_name,
           pkg.provenance.installation_scope,
-          OptionalString::of(pkg.package_identity_id + "#" + cid));
+          OptionalString::of(install_anchor + "#" + cid));
       if (entry_by_resolved_id.count(comp_resolved_id) > 0) continue;
 
       MutableResolvedEntry promoted;
@@ -1327,6 +1409,7 @@ ResolvedDiscoveryInventory resolve_discovery_inventory(
       for (size_t aidx : ordered) {
         enrich_from_appstream(&promoted, sorted_as[aidx]);
       }
+      matched_installation_components.insert(pkg_install_key + "\n" + cid);
       entry_by_resolved_id[comp_resolved_id] = entries.size();
       entries.push_back(std::move(promoted));
     }
