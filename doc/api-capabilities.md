@@ -42,20 +42,67 @@ Its package ID and version are optional.
 
 ## Unified multi-source discovery (`discoverApps`)
 
-`discoverApps()` discovers and correlates local installations across available
-read-only providers without invoking package manager CLIs or network APIs:
+`FlutterDeviceAppsLinux.discoverApps()` discovers, correlates, and deduplicates
+local installations across available read-only providers without invoking
+package manager CLIs or network APIs:
 
-- **Application & desktop providers:** GIO desktop entries, Flatpak (`libflatpak`
-  loaded optionally at runtime), and Snap (local `snapd` UNIX socket).
-- **Package inventory & file ownership:** DPKG (`/var/lib/dpkg`), RPM (`librpm`
-  loaded optionally at runtime), Pacman (`libalpm` loaded optionally at runtime),
-  and active local Nix profiles.
-- **Metadata enrichment:** Local AppStream metadata (`libappstream` loaded
-  optionally at runtime, disabled with `includeAppStreamMetadata: false`).
+```dart
+final result = await FlutterDeviceAppsLinux.discoverApps(
+  includePackages: false,
+  includeAppStreamMetadata: true,
+  providers: null, // or a non-empty list such as ['gio', 'flatpak', 'dpkg']
+);
+```
 
-Missing optional libraries, databases, or daemons are reported as
-`LinuxDiscoveryProviderStatus.unavailable` in `providerDiagnostics` without
-failing the overall pass.
+### Options
+
+- `includePackages` (default `false`): when `true`, populates
+  `LinuxDiscoveryResult.packages` with raw installed system/profile packages
+  kept strictly separate from confirmed `applications`.
+- `includeAppStreamMetadata` (default `true`): controls local AppStream
+  enrichment (`libappstream`).
+- `providers` (default `null`): when `null`, queries all registered local
+  providers; when provided, must be a non-empty list of non-empty provider IDs
+  without NUL characters (otherwise throws `ArgumentError`).
+
+### Local providers and optional dependencies
+
+- **Application & desktop providers:**
+  - `gio`: XDG `.desktop` entries via GIO (always available).
+  - `flatpak`: user and system Flatpak installations via optional `libflatpak`
+    loaded dynamically with `GModule`.
+  - `snap`: enabled Snap applications via the local `snapd` UNIX socket.
+- **Package inventory & file ownership:**
+  - `dpkg`: local `/var/lib/dpkg` status and file-ownership inventories.
+  - `rpm`: local RPM database and `rpmfi` full-path file ownership via optional
+    `librpm` loaded dynamically with `GModule`.
+  - `pacman`: local Pacman database and file lists via optional `libalpm`
+    loaded dynamically with `GModule`.
+  - `nix`: active local Nix profile manifests and verified store paths.
+- **Metadata enrichment:**
+  - `appstream`: local AppStream MetaInfo and catalog metadata via optional
+    `libappstream` loaded dynamically with `GModule`.
+
+### Typed models and provider diagnostics
+
+All returned models and collections are immutable:
+
+- `LinuxDiscoveryResult`: `applications` (`List<LinuxDiscoveredApp>`),
+  `packages` (`List<LinuxInstalledPackage>`), `providerDiagnostics`
+  (`List<LinuxDiscoveryProviderDiagnostic>`), and top-level `ambiguities`
+  (`List<LinuxResolutionAmbiguity>`).
+- `LinuxDiscoveredApp`: `resolvedId`, `primaryProvenance`, `sourceProvenances`,
+  `originalRecordIds`, `desktopEntries` (`List<LinuxResolvedDesktopEntry>`),
+  `linkedPackageIdentityIds`, `linkedAppStreamComponentIds`, `metadata`
+  (`LinuxDiscoveredAppMetadata`), `catalogReleases` (`LinuxCatalogReleaseInfo`
+  with `List<LinuxCatalogRelease>`), `capabilities` (`LinuxAppCapabilities`),
+  `desktopMenuVisibility`, `classification`, `metadataConflicts`
+  (`List<LinuxMetadataConflict>`), and `ambiguities`.
+- `LinuxDiscoveryProviderDiagnostic`: reports `providerId`, `discoveredCount`,
+  optional `errorMessage`, and `status` (`succeeded`, `partiallyFailed`,
+  `unavailable`, or `failed`). Missing optional libraries, databases, or
+  daemons report `unavailable` without failing the overall pass; isolated
+  provider failures do not discard healthy results from other providers.
 
 ### Semantics and guarantees
 
@@ -82,20 +129,26 @@ failing the overall pass.
   instances, Nix profiles, or parallel RPM versions remain distinct
   `LinuxDiscoveredApp` records.
 
-### Identity stability limitations
+### Known limitations and identity stability
 
-- `LinuxDiscoveredApp.resolvedId` is deterministic and independent of provider
-  execution order.
-- For a normal single installation (GIO, Flatpak, Snap, DPKG, Pacman, Nix, or
-  single-version RPM), `resolvedId` remains stable across in-place upgrades.
+- **Deterministic identity:** `LinuxDiscoveredApp.resolvedId` is deterministic
+  and independent of provider execution order. For a normal single installation
+  (GIO, Flatpak, Snap, DPKG, Pacman, Nix, or single-version RPM), `resolvedId`
+  remains stable across in-place upgrades.
 - **Parallel RPM transition:** When an RPM package transitions between a single
   installed version and simultaneous multi-version (parallel) installations,
   parallel records must use version-specific installation identities so each
   installed version remains distinct; consequently, `resolvedId` changes across
   that single-to-parallel transition.
-- **Cross-provider / cross-scope moves:** Replacing a package with another
+- **Cross-provider / cross-scope moves:** Replacing an application with another
   packaging format (for example, DPKG to Flatpak) or moving between scopes or
   Nix profiles produces a distinct `resolvedId` by design.
+- **Sandboxed or restricted environments:** Inside strict sandboxes (such as
+  Flatpak or confined Snaps) or when host databases/sockets are unreadable,
+  affected providers report `unavailable` or `failed` in `providerDiagnostics`.
+- **No new launch mechanisms:** Launching remains handled by `openApp()` using
+  a valid GIO `desktopFileId`; applications discovered without a desktop entry
+  cannot be launched through `openApp()`.
 
 ## Technology detection
 
