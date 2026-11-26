@@ -93,6 +93,15 @@ enum class ApplicationClassification {
   kRuntime,
 };
 
+// Desktop menu visibility state (for example, as reported by GIO's
+// g_app_info_should_show()). Kept distinct from installation status,
+// launchability, and application classification.
+enum class DesktopMenuVisibility {
+  kUnknown,
+  kVisible,
+  kNotVisible,
+};
+
 // Provenance describing where a discovery record originated.
 struct SourceProvenance {
   // Required identifier of the provider that discovered this record.
@@ -159,6 +168,11 @@ struct DiscoveredApplication {
   // Application classification; defaults to kUnknown.
   ApplicationClassification classification =
       ApplicationClassification::kUnknown;
+
+  // Desktop menu visibility state; defaults to kUnknown for providers without
+  // desktop menu visibility semantics.
+  DesktopMenuVisibility desktop_menu_visibility =
+      DesktopMenuVisibility::kUnknown;
 };
 
 }  // namespace flutter_device_apps_linux

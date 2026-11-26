@@ -23,8 +23,11 @@ struct LegacyDesktopAppRecord {
 bool is_valid_legacy_desktop_file_id(const OptionalString& desktop_file_id);
 
 // Maps unified discovery records into the legacy listApps() representation.
-// Preserves input order, drops records that cannot satisfy the legacy desktop
-// file ID contract, and exposes only legacy fields.
+// Preserves the original GIO visible-application domain:
+// - Includes only records discovered by the "gio" provider.
+// - Includes only records with DesktopMenuVisibility::kVisible.
+// - Includes only records satisfying is_valid_legacy_desktop_file_id().
+// - Preserves relative ordering and exposes only legacy fields.
 std::vector<LegacyDesktopAppRecord> adapt_for_legacy_list_apps(
     const std::vector<DiscoveredApplication>& applications);
 

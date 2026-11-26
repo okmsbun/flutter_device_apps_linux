@@ -1,14 +1,18 @@
 #include "include/flutter_device_apps_linux/flutter_device_apps_linux_plugin.h"
 
 #include "discovery/application_discovery_service.h"
+#include "discovery/async_discovery_runner.h"
 #include "discovery/gio_discovery_provider.h"
 #include "discovery/legacy_list_apps_adapter.h"
 #include "elf_dependencies.h"
 
 #include <gio/gdesktopappinfo.h>
 
+#include <atomic>
+#include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 static void set_string(FlValue* map, const char* key, const char* value) {
@@ -335,22 +339,62 @@ static void schedule_query(FlMethodCall* call, QueryKind kind, const char* targe
   g_task_run_in_thread(task, run_query);
 }
 
+struct DiscoveryPluginContext {
+  std::shared_ptr<flutter_device_apps_linux::ApplicationDiscoveryService>
+      service;
+  std::unique_ptr<flutter_device_apps_linux::AsyncDiscoveryRunner> runner;
+  std::shared_ptr<std::atomic<bool>> torn_down =
+      std::make_shared<std::atomic<bool>>(false);
+
+  ~DiscoveryPluginContext() {
+    torn_down->store(true);
+    if (runner != nullptr) {
+      runner->shutdown();
+    }
+  }
+};
+
 static void handle_method_call(FlMethodChannel*, FlMethodCall* call,
                                gpointer user_data) {
   const char* method = fl_method_call_get_name(call);
   if (g_str_equal(method, "listApps")) {
-    // Synchronous execution is preserved while GIO is the only registered
-    // provider. Introduce an async worker boundary (such as GTask) before
-    // registering blocking disk, IPC, or network-backed providers.
-    auto* discovery_service =
-        static_cast<flutter_device_apps_linux::ApplicationDiscoveryService*>(
-            user_data);
-    const auto discovered =
-        discovery_service == nullptr
-            ? std::vector<flutter_device_apps_linux::DiscoveredApplication>{}
-            : discovery_service->discover_applications();
-    g_autoptr(FlValue) apps = legacy_list_apps_value(discovered);
-    fl_method_call_respond_success(call, apps, nullptr);
+    auto* context = static_cast<DiscoveryPluginContext*>(user_data);
+    if (context == nullptr || context->runner == nullptr) {
+      g_autoptr(FlValue) empty = fl_value_new_list();
+      fl_method_call_respond_success(call, empty, nullptr);
+      return;
+    }
+
+    std::shared_ptr<FlMethodCall> retained_call(
+        static_cast<FlMethodCall*>(g_object_ref(call)), g_object_unref);
+    std::shared_ptr<std::atomic<bool>> torn_down = context->torn_down;
+    auto responded = std::make_shared<std::atomic<bool>>(false);
+
+    context->runner->discover_async(
+        [retained_call, torn_down, responded](
+            flutter_device_apps_linux::DiscoveryExecutionOutcome outcome) mutable {
+          std::shared_ptr<FlMethodCall> method_call = std::move(retained_call);
+          if (method_call == nullptr) return;
+          if (torn_down->load() ||
+              outcome.status ==
+                  flutter_device_apps_linux::DiscoveryExecutionStatus::
+                      kCancelled) {
+            return;
+          }
+          if (responded->exchange(true)) {
+            return;
+          }
+          if (outcome.status ==
+              flutter_device_apps_linux::DiscoveryExecutionStatus::
+                  kExecutionError) {
+            fl_method_call_respond_error(method_call.get(), "ERR_DISCOVERY",
+                                         "Application discovery failed",
+                                         nullptr, nullptr);
+            return;
+          }
+          g_autoptr(FlValue) apps = legacy_list_apps_value(outcome.applications);
+          fl_method_call_respond_success(method_call.get(), apps, nullptr);
+        });
     return;
   }
 
@@ -432,13 +476,62 @@ static void handle_method_call(FlMethodChannel*, FlMethodCall* call,
   fl_method_call_respond_success(call, response, nullptr);
 }
 
-static std::unique_ptr<flutter_device_apps_linux::ApplicationDiscoveryService>
-create_discovery_service() {
-  auto service = std::make_unique<
+static std::unique_ptr<DiscoveryPluginContext> create_discovery_context() {
+  auto context = std::make_unique<DiscoveryPluginContext>();
+  context->service = std::make_shared<
       flutter_device_apps_linux::ApplicationDiscoveryService>();
-  service->register_provider(
+  context->service->register_provider(
       std::make_unique<flutter_device_apps_linux::GioDiscoveryProvider>());
-  return service;
+
+  std::shared_ptr<GMainContext> platform_context(
+      g_main_context_ref_thread_default(), g_main_context_unref);
+
+  auto schedule_worker = [](std::function<void()> work) {
+    auto* task_work = new std::function<void()>(std::move(work));
+    g_autoptr(GTask) task = g_task_new(nullptr, nullptr, nullptr, nullptr);
+    g_task_set_task_data(task, task_work, [](gpointer data) {
+      delete static_cast<std::function<void()>*>(data);
+    });
+    g_task_run_in_thread(
+        task, [](GTask*, gpointer, gpointer data, GCancellable*) {
+          auto* fn = static_cast<std::function<void()>*>(data);
+          try {
+            if (fn != nullptr && *fn) {
+              (*fn)();
+            }
+          } catch (...) {
+            // Never allow C++ exceptions to cross GLib C callback boundaries.
+          }
+        });
+  };
+
+  auto dispatch_completion = [platform_context](
+                                 std::function<void()> completion) {
+    auto* fn = new std::function<void()>(std::move(completion));
+    g_main_context_invoke_full(
+        platform_context.get(), G_PRIORITY_DEFAULT,
+        [](gpointer data) -> gboolean {
+          auto* callback = static_cast<std::function<void()>*>(data);
+          try {
+            if (callback != nullptr && *callback) {
+              (*callback)();
+            }
+          } catch (...) {
+            // Never allow C++ exceptions to cross GLib C callback boundaries.
+          }
+          return G_SOURCE_REMOVE;
+        },
+        fn,
+        [](gpointer data) {
+          delete static_cast<std::function<void()>*>(data);
+        });
+  };
+
+  context->runner =
+      std::make_unique<flutter_device_apps_linux::AsyncDiscoveryRunner>(
+          context->service, std::move(schedule_worker),
+          std::move(dispatch_completion));
+  return context;
 }
 
 void flutter_device_apps_linux_plugin_register_with_registrar(
@@ -447,11 +540,10 @@ void flutter_device_apps_linux_plugin_register_with_registrar(
   g_autoptr(FlMethodChannel) channel = fl_method_channel_new(
       fl_plugin_registrar_get_messenger(registrar),
       "flutter_device_apps_linux/methods", FL_METHOD_CODEC(codec));
-  auto discovery_service = create_discovery_service();
+  auto discovery_context = create_discovery_context();
   fl_method_channel_set_method_call_handler(
-      channel, handle_method_call, discovery_service.release(),
+      channel, handle_method_call, discovery_context.release(),
       [](gpointer data) {
-        delete static_cast<
-            flutter_device_apps_linux::ApplicationDiscoveryService*>(data);
+        delete static_cast<DiscoveryPluginContext*>(data);
       });
 }

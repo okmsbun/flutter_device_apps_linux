@@ -9,6 +9,7 @@ export XDG_DATA_HOME="$fixture/data"
 export XDG_CONFIG_HOME="$fixture/config"
 export XDG_CACHE_HOME="$fixture/cache"
 export XDG_DATA_DIRS=/usr/local/share:/usr/share
+export XDG_CURRENT_DESKTOP=GNOME
 export LANGUAGE=C
 export LC_ALL=C.UTF-8
 export DEVICE_APPS_TEST_FILE="$fixture/report.txt"
@@ -35,6 +36,30 @@ Exec=/usr/bin/true %U
 Keywords=deviceappsfixture;
 NoDisplay=true
 Terminal=true
+EOF
+
+cat > "$XDG_DATA_HOME/applications/org.example.OnlyShowInKdeFixture.desktop" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=KDE Only Fixture
+Exec=/usr/bin/true
+OnlyShowIn=KDE;
+EOF
+
+cat > "$XDG_DATA_HOME/applications/org.example.NotShowInGnomeFixture.desktop" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Not In GNOME Fixture
+Exec=/usr/bin/true
+NotShowIn=GNOME;
+EOF
+
+cat > "$XDG_DATA_HOME/applications/org.example.TrulyHiddenFixture.desktop" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Truly Hidden Fixture
+Exec=/usr/bin/true
+Hidden=true
 EOF
 
 cat > "$XDG_DATA_HOME/metainfo/org.example.DeviceAppsFixture.metainfo.xml" <<'EOF'

@@ -10,6 +10,7 @@ add_library(${PLUGIN_NAME} SHARED
   elf_dependencies.cc
   discovery/application_discovery_service.cc
   discovery/application_identity.cc
+  discovery/async_discovery_runner.cc
   discovery/gio_discovery_provider.cc
   discovery/legacy_list_apps_adapter.cc
 )

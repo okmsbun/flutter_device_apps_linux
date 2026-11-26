@@ -3,6 +3,7 @@ name: Linux Tests
 on:
   pull_request:
     branches: ["develop"]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -29,17 +30,87 @@ jobs:
       - name: Install dependencies
         run: flutter pub get
 
-      - name: Run native discovery unit tests
+      - name: Run native discovery unit tests (ASan/UBSan and TSan)
         run: |
-          clang++ -std=c++14 -Wall -Wextra -Werror \
-            -fsanitize=address,undefined \
+          clang++ -std=c++14 -Wall -Wextra -Wpedantic -Werror \
+            -pthread -fsanitize=address,undefined \
             -Ilinux \
             linux/discovery/application_identity.cc \
             linux/discovery/application_discovery_service.cc \
+            linux/discovery/async_discovery_runner.cc \
             linux/discovery/legacy_list_apps_adapter.cc \
             linux/test/application_discovery_test.cc \
-            -o /tmp/application_discovery_test
-          /tmp/application_discovery_test
+            -o /tmp/application_discovery_test_asan
+          /tmp/application_discovery_test_asan
+
+          clang++ -std=c++14 -Wall -Wextra -Wpedantic -Werror \
+            -pthread -fsanitize=thread \
+            -Ilinux \
+            linux/discovery/application_identity.cc \
+            linux/discovery/application_discovery_service.cc \
+            linux/discovery/async_discovery_runner.cc \
+            linux/discovery/legacy_list_apps_adapter.cc \
+            linux/test/application_discovery_test.cc \
+            -o /tmp/application_discovery_test_tsan
+          /tmp/application_discovery_test_tsan
+
+      - name: Run native GIO discovery integration tests
+        run: |
+          clang++ -std=c++14 -Wall -Wextra -Werror \
+            -Ilinux \
+            $(pkg-config --cflags gio-unix-2.0) \
+            linux/discovery/application_identity.cc \
+            linux/discovery/gio_discovery_provider.cc \
+            linux/discovery/legacy_list_apps_adapter.cc \
+            linux/test/gio_discovery_provider_test.cc \
+            $(pkg-config --libs gio-unix-2.0) \
+            -o /tmp/gio_discovery_provider_test
+
+          empty_dir="$(mktemp -d)"
+          fixture_dir="$(mktemp -d)"
+          trap 'rm -rf -- "$empty_dir" "$fixture_dir"' EXIT
+
+          mkdir -p "$empty_dir/applications" "$fixture_dir/applications"
+          cat > "$fixture_dir/applications/org.example.VisibleFixture.desktop" <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Visible Fixture
+          Exec=/usr/bin/true %f
+          EOF
+          cat > "$fixture_dir/applications/org.example.NoDisplayFixture.desktop" <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=NoDisplay Fixture
+          Exec=/usr/bin/true %U
+          NoDisplay=true
+          Terminal=true
+          EOF
+          cat > "$fixture_dir/applications/org.example.OnlyShowInKdeFixture.desktop" <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Only KDE Fixture
+          Exec=/usr/bin/true
+          OnlyShowIn=KDE;
+          EOF
+          cat > "$fixture_dir/applications/org.example.NotShowInGnomeFixture.desktop" <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Not GNOME Fixture
+          Exec=/usr/bin/true
+          NotShowIn=GNOME;
+          EOF
+          cat > "$fixture_dir/applications/org.example.HiddenFixture.desktop" <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Hidden Fixture
+          Exec=/usr/bin/true
+          Hidden=true
+          EOF
+
+          env XDG_DATA_HOME="$empty_dir" XDG_DATA_DIRS="$empty_dir" XDG_CURRENT_DESKTOP=GNOME LANGUAGE=C LC_ALL=C.UTF-8 \
+            /tmp/gio_discovery_provider_test --empty
+          env XDG_DATA_HOME="$fixture_dir" XDG_DATA_DIRS="$fixture_dir" XDG_CURRENT_DESKTOP=GNOME LANGUAGE=C LC_ALL=C.UTF-8 \
+            /tmp/gio_discovery_provider_test
 
       - name: Run Linux integration tests
         run: bash example/tool/test_linux.sh

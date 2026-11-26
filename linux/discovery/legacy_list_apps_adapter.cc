@@ -7,6 +7,7 @@ namespace flutter_device_apps_linux {
 namespace {
 
 const char kDesktopSuffix[] = ".desktop";
+const char kGioProviderId[] = "gio";
 
 }  // namespace
 
@@ -31,6 +32,10 @@ std::vector<LegacyDesktopAppRecord> adapt_for_legacy_list_apps(
   records.reserve(applications.size());
 
   for (const auto& app : applications) {
+    if (app.provenance.provider_id != kGioProviderId) continue;
+    if (app.desktop_menu_visibility != DesktopMenuVisibility::kVisible) {
+      continue;
+    }
     if (!is_valid_legacy_desktop_file_id(app.desktop_file_id)) continue;
 
     LegacyDesktopAppRecord record;

@@ -6,6 +6,9 @@ import 'package:integration_test/integration_test.dart';
 
 const _id = 'org.example.DeviceAppsFixture.desktop';
 const _hiddenId = 'org.example.HiddenFixture.desktop';
+const _onlyShowInKdeId = 'org.example.OnlyShowInKdeFixture.desktop';
+const _notShowInGnomeId = 'org.example.NotShowInGnomeFixture.desktop';
+const _trulyHiddenId = 'org.example.TrulyHiddenFixture.desktop';
 
 void main() {
   IntegrationTestWidgetsFlutterBinding.ensureInitialized();
@@ -24,6 +27,19 @@ void main() {
     expect(fixture.single.categories, isEmpty);
     expect(fixture.single.mimeTypes, isEmpty);
     expect(apps.any((app) => app.desktopFileId == _hiddenId), isFalse);
+    expect(apps.any((app) => app.desktopFileId == _onlyShowInKdeId), isFalse);
+    expect(apps.any((app) => app.desktopFileId == _notShowInGnomeId), isFalse);
+    expect(apps.any((app) => app.desktopFileId == _trulyHiddenId), isFalse);
+
+    final concurrent = await Future.wait([
+      FlutterDeviceAppsLinux.listApps(),
+      FlutterDeviceAppsLinux.listApps(),
+      FlutterDeviceAppsLinux.listApps(),
+    ]);
+    for (final batch in concurrent) {
+      expect(batch.any((app) => app.desktopFileId == _id), isTrue);
+      expect(batch.any((app) => app.desktopFileId == _hiddenId), isFalse);
+    }
 
     final search = await FlutterDeviceAppsLinux.searchApps('deviceappsfixture');
     expect(search.map((app) => app.desktopFileId), [_id]);

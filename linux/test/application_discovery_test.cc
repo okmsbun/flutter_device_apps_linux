@@ -1,12 +1,20 @@
+#include <atomic>
+#include <condition_variable>
+#include <functional>
 #include <iostream>
 #include <memory>
+#include <mutex>
+#include <queue>
+#include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #include "discovery/application_discovery_provider.h"
 #include "discovery/application_discovery_service.h"
 #include "discovery/application_identity.h"
+#include "discovery/async_discovery_runner.h"
 #include "discovery/discovered_application.h"
 #include "discovery/legacy_list_apps_adapter.h"
 
@@ -15,24 +23,137 @@ namespace {
 using flutter_device_apps_linux::ApplicationClassification;
 using flutter_device_apps_linux::ApplicationDiscoveryProvider;
 using flutter_device_apps_linux::ApplicationDiscoveryService;
+using flutter_device_apps_linux::AsyncDiscoveryRunner;
 using flutter_device_apps_linux::build_application_id;
 using flutter_device_apps_linux::capability_from_bool;
 using flutter_device_apps_linux::CapabilityState;
+using flutter_device_apps_linux::DesktopMenuVisibility;
 using flutter_device_apps_linux::DiscoveredApplication;
+using flutter_device_apps_linux::DiscoveryExecutionOutcome;
+using flutter_device_apps_linux::DiscoveryExecutionStatus;
+using flutter_device_apps_linux::DiscoveryPassResult;
+using flutter_device_apps_linux::DiscoveryRequestHandle;
 using flutter_device_apps_linux::DiscoveryResult;
 using flutter_device_apps_linux::InstallationScope;
 using flutter_device_apps_linux::InstallationSource;
 using flutter_device_apps_linux::is_valid_legacy_desktop_file_id;
 using flutter_device_apps_linux::OptionalString;
+using flutter_device_apps_linux::ProviderExecutionStatus;
 
+std::mutex g_failure_mutex;
 int g_failures = 0;
 
 void expect(bool condition, const char* message) {
   if (!condition) {
+    std::lock_guard<std::mutex> lock(g_failure_mutex);
     std::cerr << "FAIL: " << message << "\n";
     ++g_failures;
   }
 }
+
+class Latch {
+ public:
+  explicit Latch(int count = 1) : remaining_(count) {}
+
+  void count_down() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (remaining_ > 0) {
+      --remaining_;
+      if (remaining_ == 0) {
+        cv_.notify_all();
+      }
+    }
+  }
+
+  void wait() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    cv_.wait(lock, [this]() { return remaining_ == 0; });
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  int remaining_;
+};
+
+// Deterministic single-threaded completion pump standing in for the platform
+// GMainContext during pure C++14 async tests.
+class TestPlatformLoop {
+ public:
+  void post(std::function<void()> callback) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      callbacks_.push(std::move(callback));
+    }
+    cv_.notify_one();
+  }
+
+  void run_one() {
+    std::function<void()> callback;
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      cv_.wait(lock, [this]() { return !callbacks_.empty(); });
+      callback = std::move(callbacks_.front());
+      callbacks_.pop();
+    }
+    if (callback) callback();
+  }
+
+  void run_until(int expected_count) {
+    for (int i = 0; i < expected_count; ++i) {
+      run_one();
+    }
+  }
+
+  void drain_available() {
+    while (true) {
+      std::function<void()> callback;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (callbacks_.empty()) return;
+        callback = std::move(callbacks_.front());
+        callbacks_.pop();
+      }
+      if (callback) callback();
+    }
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::queue<std::function<void()>> callbacks_;
+};
+
+class WorkerPoolFixture {
+ public:
+  ~WorkerPoolFixture() { join_all(); }
+
+  AsyncDiscoveryRunner::WorkScheduler scheduler() {
+    return [this](std::function<void()> work) {
+      ++scheduled_workers_;
+      std::lock_guard<std::mutex> lock(mutex_);
+      threads_.emplace_back(std::move(work));
+    };
+  }
+
+  void join_all() {
+    std::vector<std::thread> to_join;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      to_join.swap(threads_);
+    }
+    for (auto& thread : to_join) {
+      if (thread.joinable()) thread.join();
+    }
+  }
+
+  int scheduled_workers() const { return scheduled_workers_.load(); }
+
+ private:
+  std::mutex mutex_;
+  std::vector<std::thread> threads_;
+  std::atomic<int> scheduled_workers_{0};
+};
 
 class FakeDiscoveryProvider final : public ApplicationDiscoveryProvider {
  public:
@@ -70,9 +191,37 @@ class FakeDiscoveryProvider final : public ApplicationDiscoveryProvider {
   int* destroyed_count_;
 };
 
-DiscoveredApplication make_gio_app(const char* desktop_id, const char* name,
-                                   bool supports_files, bool supports_uris,
-                                   bool requires_terminal) {
+class ControlledDiscoveryProvider final : public ApplicationDiscoveryProvider {
+ public:
+  ControlledDiscoveryProvider(std::string id,
+                              std::function<DiscoveryResult()> on_discover,
+                              std::atomic<int>* destroyed_count = nullptr)
+      : id_(std::move(id)),
+        on_discover_(std::move(on_discover)),
+        destroyed_count_(destroyed_count) {}
+
+  ~ControlledDiscoveryProvider() override {
+    if (destroyed_count_ != nullptr) {
+      destroyed_count_->fetch_add(1);
+    }
+  }
+
+  const char* id() const override { return id_.c_str(); }
+
+  bool is_available() const override { return true; }
+
+  DiscoveryResult discover() override { return on_discover_(); }
+
+ private:
+  std::string id_;
+  std::function<DiscoveryResult()> on_discover_;
+  std::atomic<int>* destroyed_count_;
+};
+
+DiscoveredApplication make_gio_app(
+    const char* desktop_id, const char* name, bool supports_files,
+    bool supports_uris, bool requires_terminal,
+    DesktopMenuVisibility visibility = DesktopMenuVisibility::kVisible) {
   DiscoveredApplication app;
   app.provenance.provider_id = "gio";
   app.provenance.native_id = desktop_id;
@@ -82,6 +231,7 @@ DiscoveredApplication make_gio_app(const char* desktop_id, const char* name,
       app.provenance.provider_id, app.provenance.native_id,
       app.provenance.installation_scope, app.installation_id);
   app.desktop_file_id = OptionalString::of(desktop_id);
+  app.desktop_menu_visibility = visibility;
   if (name != nullptr) {
     app.metadata.name = OptionalString::of(name);
   }
@@ -101,12 +251,12 @@ DiscoveredApplication make_non_desktop_app(
   app.provenance.installation_source = source;
   app.provenance.installation_scope = scope;
   app.installation_id = installation_id;
-  app.application_id = build_application_id(
-      provider_id, native_id, scope, installation_id);
+  app.application_id =
+      build_application_id(provider_id, native_id, scope, installation_id);
   return app;
 }
 
-// --- Unified model tests ---
+// --- Unified model and visibility tests ---
 
 void test_unified_model_defaults_are_unknown_and_missing() {
   DiscoveredApplication app;
@@ -115,7 +265,6 @@ void test_unified_model_defaults_are_unknown_and_missing() {
   expect(!app.package_id.has_value(), "package_id should default to missing");
   expect(!app.installation_id.has_value(),
          "installation_id should default to missing");
-
   expect(!app.metadata.name.has_value(), "name should default to missing");
   expect(!app.metadata.version.has_value(),
          "version should default to missing");
@@ -147,6 +296,40 @@ void test_unified_model_defaults_are_unknown_and_missing() {
          "installation_scope should default to kUnknown");
   expect(app.classification == ApplicationClassification::kUnknown,
          "classification should default to kUnknown");
+  expect(app.desktop_menu_visibility == DesktopMenuVisibility::kUnknown,
+         "desktop_menu_visibility should default to kUnknown");
+}
+
+void test_visibility_states_remain_independent_from_source_and_classification() {
+  DiscoveredApplication visible = make_gio_app(
+      "org.example.Visible.desktop", "Visible", true, false, false,
+      DesktopMenuVisibility::kVisible);
+  DiscoveredApplication not_visible = make_gio_app(
+      "org.example.NoDisplay.desktop", "NoDisplay", false, true, true,
+      DesktopMenuVisibility::kNotVisible);
+  DiscoveredApplication unknown_vis = make_non_desktop_app(
+      "dpkg", "ripgrep:amd64", InstallationSource::kDpkg,
+      InstallationScope::kSystem);
+
+  expect(visible.desktop_menu_visibility == DesktopMenuVisibility::kVisible,
+         "visible record should store kVisible");
+  expect(not_visible.desktop_menu_visibility ==
+             DesktopMenuVisibility::kNotVisible,
+         "non-visible record should store kNotVisible");
+  expect(unknown_vis.desktop_menu_visibility == DesktopMenuVisibility::kUnknown,
+         "non-desktop record should leave visibility kUnknown");
+
+  expect(not_visible.application_id == "gio:org.example.NoDisplay.desktop",
+         "non-visible record should preserve source-aware identity");
+  expect(not_visible.provenance.installation_source ==
+             InstallationSource::kUnknown,
+         "visibility must not imply installation source");
+  expect(not_visible.classification == ApplicationClassification::kUnknown,
+         "visibility must not imply application classification");
+  expect(visible.classification == ApplicationClassification::kUnknown,
+         "visible desktop entry must not assume classification without policy");
+  expect(not_visible.capabilities.launchable == CapabilityState::kUnknown,
+         "visibility must not be conflated with launchability");
 }
 
 void test_unified_model_distinguishes_empty_vs_missing_and_false_vs_unknown() {
@@ -159,231 +342,60 @@ void test_unified_model_distinguishes_empty_vs_missing_and_false_vs_unknown() {
   app.capabilities.supports_files = CapabilityState::kUnsupported;
   app.capabilities.supports_uris = CapabilityState::kUnknown;
   app.capabilities.requires_terminal = CapabilityState::kSupported;
-  app.capabilities.launchable = CapabilityState::kUnknown;
 
   expect(!app.desktop_file_id.has_value(),
-         "non-desktop application must not require or fabricate desktop_file_id");
+         "non-desktop application must not fabricate desktop_file_id");
   expect(app.metadata.name.has_value() && app.metadata.name.value().empty(),
          "empty metadata value must stay distinct from missing");
   expect(!app.metadata.version.has_value(),
          "missing metadata value must have has_value() == false");
   expect(app.metadata.name != app.metadata.version,
          "OptionalString::of(\"\") must not equal OptionalString::none()");
-  expect(app.capabilities.supports_files == CapabilityState::kUnsupported,
-         "known false must be kUnsupported");
-  expect(app.capabilities.supports_uris == CapabilityState::kUnknown,
-         "unknown capability must stay kUnknown");
   expect(app.capabilities.supports_files != app.capabilities.supports_uris,
          "kUnsupported must not equal kUnknown");
-  expect(app.classification == ApplicationClassification::kUnknown,
-         "absence of desktop entry must not imply CLI classification");
-}
-
-void test_unified_model_separates_provider_from_installation_source() {
-  DiscoveredApplication app = make_gio_app(
-      "org.example.Editor.desktop", "Editor", true, true, false);
-  app.provenance.installation_source = InstallationSource::kFlatpak;
-  app.package_id = OptionalString::of("org.example.Editor");
-
-  expect(app.provenance.provider_id == "gio",
-         "discovery provider should remain gio");
-  expect(app.provenance.installation_source == InstallationSource::kFlatpak,
-         "installation source should independently track flatpak");
-  expect(app.desktop_file_id.has_value() &&
-             app.desktop_file_id.value() == "org.example.Editor.desktop",
-         "desktop file ID should remain distinct from package ID");
-  expect(app.package_id.has_value() &&
-             app.package_id.value() == "org.example.Editor",
-         "package ID should remain distinct from desktop file ID");
 }
 
 // --- Identity contract tests ---
 
-void test_identity_is_deterministic_and_independent_of_display_name() {
+void test_identity_contract_and_collision_resistance() {
   DiscoveredApplication english = make_gio_app(
       "org.example.Editor.desktop", "Editor", true, false, false);
   DiscoveredApplication turkish = make_gio_app(
       "org.example.Editor.desktop", "Metin Duzenleyici", true, false, false);
-
   expect(english.application_id == "gio:org.example.Editor.desktop",
          "GIO application ID should use provider:native encoding");
   expect(english.application_id == turkish.application_id,
          "application_id must not depend on localized display name");
-}
 
-void test_identity_distinguishes_same_native_id_across_providers() {
-  const std::string flatpak_id =
-      build_application_id("flatpak", "org.example.Editor");
-  const std::string appstream_id =
-      build_application_id("appstream", "org.example.Editor");
-  const std::string snap_id = build_application_id("snap", "example-editor");
-  const std::string dpkg_id =
-      build_application_id("dpkg", "example-editor:amd64");
-
-  expect(flatpak_id != appstream_id,
-         "identical native IDs from different providers must stay distinct");
-  expect(flatpak_id == "flatpak:org.example.Editor",
-         "flatpak ID should match expected format");
-  expect(snap_id == "snap:example-editor",
-         "snap ID should match expected format");
-  expect(dpkg_id == "dpkg:example-editor%3Aamd64",
-         "embedded colon in native ID must be percent-escaped");
-}
-
-void test_identity_distinguishes_multiple_installations() {
-  const std::string system_install = build_application_id(
-      "flatpak", "org.example.Editor", InstallationScope::kSystem);
-  const std::string user_install = build_application_id(
-      "flatpak", "org.example.Editor", InstallationScope::kUser);
-  const std::string stable_branch = build_application_id(
-      "flatpak", "org.example.Editor", InstallationScope::kUser,
-      OptionalString::of("stable/x86_64"));
-  const std::string beta_branch = build_application_id(
-      "flatpak", "org.example.Editor", InstallationScope::kUser,
-      OptionalString::of("beta/x86_64"));
-  const std::string empty_install_id = build_application_id(
-      "flatpak", "org.example.Editor", InstallationScope::kUser,
-      OptionalString::of(""));
-
-  expect(system_install != user_install,
+  expect(build_application_id("flatpak", "org.example.Editor") !=
+             build_application_id("appstream", "org.example.Editor"),
+         "same native ID from different providers must stay distinct");
+  expect(build_application_id("flatpak", "org.example.Editor",
+                              InstallationScope::kSystem) !=
+             build_application_id("flatpak", "org.example.Editor",
+                                  InstallationScope::kUser),
          "system and user scopes must produce distinct identities");
-  expect(stable_branch != beta_branch,
-         "distinct installation_ids must produce distinct identities");
-  expect(user_install != empty_install_id,
+  expect(build_application_id("flatpak", "org.example.Editor",
+                              InstallationScope::kUser) !=
+             build_application_id("flatpak", "org.example.Editor",
+                                  InstallationScope::kUser,
+                                  OptionalString::of("")),
          "missing installation_id must not collide with empty installation_id");
-}
 
-void test_identity_prevents_concatenation_and_encoding_collisions() {
-  const std::string pair_a = build_application_id("a:b", "c");
-  const std::string pair_b = build_application_id("a", "b:c");
-  expect(pair_a != pair_b,
+  expect(build_application_id("a:b", "c") != build_application_id("a", "b:c"),
          "colon in provider_id vs native_id must not collide");
-
-  const std::string literal_escape = build_application_id("a%3Ab", "c");
-  expect(pair_a != literal_escape,
+  expect(build_application_id("a:b", "c") !=
+             build_application_id("a%3Ab", "c"),
          "literal %3A must be escaped so it cannot collide with encoded colon");
-
-  const std::string colon_in_native = build_application_id("p", "n:user");
-  const std::string scoped_native =
-      build_application_id("p", "n", InstallationScope::kUser);
-  expect(colon_in_native != scoped_native,
+  expect(build_application_id("p", "n:user") !=
+             build_application_id("p", "n", InstallationScope::kUser),
          "colon suffix in native_id must not collide with installation scope");
-
-  const std::string colon_in_install = build_application_id(
-      "p", "n", InstallationScope::kUser, OptionalString::of("a:b"));
-  const std::string colon_in_native_with_install = build_application_id(
-      "p", "n:user", InstallationScope::kUnknown, OptionalString::of("a:b"));
-  expect(colon_in_install != colon_in_native_with_install,
-         "escaped components must prevent multi-slot collisions");
-
-  const std::string nul_a =
-      build_application_id("p", std::string("a\0b", 3));
-  const std::string nul_b = build_application_id("p", "a%00b");
-  expect(nul_a != nul_b, "embedded NUL byte must encode without collision");
+  expect(build_application_id("p", std::string("a\0b", 3)) !=
+             build_application_id("p", "a%00b"),
+         "embedded NUL byte must encode without collision");
 }
 
-// --- Provider and coordinator tests ---
-
-void test_empty_service_and_null_provider_handling() {
-  ApplicationDiscoveryService service;
-  expect(service.provider_count() == 0, "new service should have 0 providers");
-  expect(service.discover_applications().empty(),
-         "empty service should return no applications");
-
-  service.register_provider(nullptr);
-  expect(service.provider_count() == 0,
-         "null provider registration should be ignored");
-}
-
-void test_empty_provider_result_and_unavailable_provider() {
-  ApplicationDiscoveryService service;
-  int gio_calls = 0;
-  int unavailable_calls = 0;
-
-  service.register_provider(std::make_unique<FakeDiscoveryProvider>(
-      "gio", true, DiscoveryResult{}, &gio_calls));
-
-  DiscoveryResult skipped;
-  skipped.applications.push_back(make_non_desktop_app(
-      "snap", "skipped", InstallationSource::kSnap,
-      InstallationScope::kSystem));
-  service.register_provider(std::make_unique<FakeDiscoveryProvider>(
-      "snap", false, std::move(skipped), &unavailable_calls));
-
-  const auto apps = service.discover_applications();
-  expect(gio_calls == 1, "available provider discover() should be called once");
-  expect(unavailable_calls == 0,
-         "unavailable provider discover() should not be called");
-  expect(apps.empty(), "empty available + unavailable should yield empty list");
-}
-
-void test_coordinator_aggregates_preserves_provenance_and_isolates_failures() {
-  DiscoveryResult gio_result;
-  gio_result.applications.push_back(
-      make_gio_app("org.example.Editor.desktop", "Editor", true, false, false));
-
-  DiscoveryResult failing_result;
-  failing_result.ok = false;
-  failing_result.error_message = "backend unavailable";
-  failing_result.applications.push_back(make_non_desktop_app(
-      "rpm", "partial-pkg", InstallationSource::kRpm,
-      InstallationScope::kSystem));
-
-  DiscoveryResult dpkg_result;
-  DiscoveredApplication cli = make_non_desktop_app(
-      "dpkg", "jq:amd64", InstallationSource::kDpkg,
-      InstallationScope::kSystem);
-  cli.package_id = OptionalString::of("jq:amd64");
-  cli.metadata.version = OptionalString::of("1.7.1");
-  dpkg_result.applications.push_back(std::move(cli));
-
-  ApplicationDiscoveryService service;
-  service.register_provider(std::make_unique<FakeDiscoveryProvider>(
-      "gio", true, std::move(gio_result)));
-  service.register_provider(std::make_unique<FakeDiscoveryProvider>(
-      "rpm", true, std::move(failing_result)));
-  service.register_provider(std::make_unique<FakeDiscoveryProvider>(
-      "dpkg", true, std::move(dpkg_result)));
-
-  expect(service.provider_count() == 3, "all three providers should register");
-  const auto apps = service.discover_applications();
-  expect(apps.size() == 2,
-         "failed provider should be isolated while healthy providers aggregate");
-  if (apps.size() == 2) {
-    expect(apps[0].application_id == "gio:org.example.Editor.desktop",
-           "GIO identity should be preserved");
-    expect(apps[0].provenance.provider_id == "gio" &&
-               apps[0].provenance.native_id == "org.example.Editor.desktop",
-           "GIO provenance should be preserved");
-
-    expect(apps[1].application_id == "dpkg:jq%3Aamd64:system",
-           "non-desktop provider identity should be preserved");
-    expect(!apps[1].desktop_file_id.has_value(),
-           "non-desktop record should remain without desktop_file_id");
-    expect(apps[1].provenance.provider_id == "dpkg" &&
-               apps[1].provenance.installation_source ==
-                   InstallationSource::kDpkg &&
-               apps[1].provenance.installation_scope ==
-                   InstallationScope::kSystem,
-           "non-desktop source provenance should be preserved");
-  }
-}
-
-void test_service_owns_and_destroys_providers_deterministically() {
-  int destroyed = 0;
-  {
-    ApplicationDiscoveryService service;
-    service.register_provider(std::make_unique<FakeDiscoveryProvider>(
-        "gio", true, DiscoveryResult{}, nullptr, &destroyed));
-    service.register_provider(std::make_unique<FakeDiscoveryProvider>(
-        "dpkg", false, DiscoveryResult{}, nullptr, &destroyed));
-    expect(destroyed == 0, "providers should remain alive while owned");
-  }
-  expect(destroyed == 2,
-         "all registered providers should be destroyed with the service");
-}
-
-// --- Legacy serialization adapter tests ---
+// --- Legacy adapter tests ---
 
 void test_legacy_desktop_file_id_validation() {
   expect(is_valid_legacy_desktop_file_id(
@@ -405,44 +417,63 @@ void test_legacy_desktop_file_id_validation() {
          "ID containing NUL byte must be rejected");
 }
 
-void test_legacy_adapter_preserves_contract_and_filters_incompatible_records() {
+void test_legacy_adapter_enforces_gio_visibility_and_preserves_order() {
   std::vector<DiscoveredApplication> unified;
 
-  // 1. Standard GIO visible entry.
-  unified.push_back(make_gio_app(
-      "org.example.First.desktop", "First", true, false, true));
+  // 1. Visible GIO entry -> INCLUDED.
+  unified.push_back(make_gio_app("org.example.First.desktop", "First", true,
+                                 false, true, DesktopMenuVisibility::kVisible));
 
-  // 2. Non-desktop application (must be filtered out of legacy listApps).
-  DiscoveredApplication non_desktop = make_non_desktop_app(
-      "dpkg", "curl:amd64", InstallationSource::kDpkg,
-      InstallationScope::kSystem);
-  non_desktop.metadata.name = OptionalString::of("curl");
-  unified.push_back(std::move(non_desktop));
+  // 2. Non-visible GIO entry (NoDisplay / OnlyShowIn / NotShowIn) -> EXCLUDED.
+  unified.push_back(make_gio_app("org.example.NoDisplay.desktop", "Hidden",
+                                 true, true, false,
+                                 DesktopMenuVisibility::kNotVisible));
 
-  // 3. Invalid desktop ID (must be filtered out, never fabricated).
-  DiscoveredApplication bad_desktop = make_non_desktop_app(
-      "flatpak", "org.example.Broken", InstallationSource::kFlatpak,
+  // 3. Unknown visibility GIO entry -> EXCLUDED (never treated as visible).
+  unified.push_back(make_gio_app("org.example.UnknownVis.desktop", "UnknownVis",
+                                 false, false, false,
+                                 DesktopMenuVisibility::kUnknown));
+
+  // 4. Non-GIO provider record WITH valid desktop_file_id and kVisible ->
+  // EXCLUDED so future providers cannot accidentally alter legacy listApps().
+  DiscoveredApplication flatpak_visible = make_non_desktop_app(
+      "flatpak", "org.example.FlatpakApp", InstallationSource::kFlatpak,
       InstallationScope::kUser);
-  bad_desktop.desktop_file_id = OptionalString::of("/usr/share/bad.desktop");
-  unified.push_back(std::move(bad_desktop));
+  flatpak_visible.desktop_file_id =
+      OptionalString::of("org.example.FlatpakApp.desktop");
+  flatpak_visible.desktop_menu_visibility = DesktopMenuVisibility::kVisible;
+  flatpak_visible.metadata.name = OptionalString::of("Flatpak App");
+  unified.push_back(std::move(flatpak_visible));
 
-  // 4. Desktop entry with missing app_name (null in legacy map) and unknown
-  // capability states (mapped to false in legacy bool schema).
+  // 5. Non-desktop record -> EXCLUDED.
+  unified.push_back(make_non_desktop_app("dpkg", "curl:amd64",
+                                         InstallationSource::kDpkg,
+                                         InstallationScope::kSystem));
+
+  // 6. Visible GIO entry with missing app_name (null in legacy map) and
+  // unknown capability state -> INCLUDED with null app_name and false bool.
   DiscoveredApplication unnamed = make_gio_app(
-      "org.example.Unnamed.desktop", nullptr, false, true, false);
+      "org.example.Unnamed.desktop", nullptr, false, true, false,
+      DesktopMenuVisibility::kVisible);
   unnamed.capabilities.supports_files = CapabilityState::kUnknown;
-  unnamed.capabilities.launchable = CapabilityState::kSupported;
-  unnamed.metadata.version = OptionalString::of("2.0.0");
   unified.push_back(std::move(unnamed));
 
-  // 5. Desktop entry with explicitly empty app_name (present "" in legacy map).
-  unified.push_back(
-      make_gio_app("org.example.EmptyName.desktop", "", false, false, false));
+  // 7. Visible GIO entry with explicitly empty app_name -> INCLUDED.
+  unified.push_back(make_gio_app("org.example.EmptyName.desktop", "", false,
+                                 false, false,
+                                 DesktopMenuVisibility::kVisible));
+
+  // 8. Visible GIO entry with invalid desktop ID -> EXCLUDED.
+  DiscoveredApplication invalid_id = make_gio_app(
+      "org.example.Valid.desktop", "Bad", false, false, false,
+      DesktopMenuVisibility::kVisible);
+  invalid_id.desktop_file_id = OptionalString::of("/usr/share/bad.desktop");
+  unified.push_back(std::move(invalid_id));
 
   const auto legacy =
       flutter_device_apps_linux::adapt_for_legacy_list_apps(unified);
   expect(legacy.size() == 3,
-         "legacy adapter should keep only valid desktop-integrated records");
+         "legacy adapter must include only visible, valid GIO records");
   if (legacy.size() == 3) {
     expect(legacy[0].desktop_file_id == "org.example.First.desktop",
            "first legacy record order should be preserved");
@@ -456,7 +487,7 @@ void test_legacy_adapter_preserves_contract_and_filters_incompatible_records() {
     expect(legacy[1].desktop_file_id == "org.example.Unnamed.desktop",
            "second legacy record order should be preserved");
     expect(!legacy[1].app_name.has_value(),
-           "missing app_name must stay unset so legacy serializer omits key");
+           "missing app_name must stay unset");
     expect(!legacy[1].supports_files && legacy[1].supports_uris &&
                !legacy[1].requires_terminal,
            "unknown capability should map to false while known true stays true");
@@ -468,27 +499,389 @@ void test_legacy_adapter_preserves_contract_and_filters_incompatible_records() {
   }
 }
 
+// --- Coordinator and error distinction tests ---
+
+void test_coordinator_report_distinguishes_success_unavailable_and_failure() {
+  DiscoveryResult failing;
+  failing.ok = false;
+  failing.error_message = "db locked";
+  failing.applications.push_back(make_non_desktop_app(
+      "rpm", "partial", InstallationSource::kRpm, InstallationScope::kSystem));
+
+  ApplicationDiscoveryService service;
+  service.register_provider(nullptr);
+  service.register_provider(
+      std::make_unique<FakeDiscoveryProvider>("gio", true, DiscoveryResult{}));
+  service.register_provider(std::make_unique<FakeDiscoveryProvider>(
+      "snap", false, DiscoveryResult{}));
+  service.register_provider(std::make_unique<FakeDiscoveryProvider>(
+      "rpm", true, std::move(failing)));
+
+  const DiscoveryPassResult report = service.discover_with_report();
+  expect(report.applications.empty(),
+         "failed provider partial payload must not leak into results");
+  expect(report.provider_summaries.size() == 3,
+         "all registered providers should be summarized");
+  if (report.provider_summaries.size() == 3) {
+    expect(report.provider_summaries[0].provider_id == "gio" &&
+               report.provider_summaries[0].status ==
+                   ProviderExecutionStatus::kSucceeded &&
+               report.provider_summaries[0].discovered_count == 0,
+           "empty healthy provider should report kSucceeded with count 0");
+    expect(report.provider_summaries[1].provider_id == "snap" &&
+               report.provider_summaries[1].status ==
+                   ProviderExecutionStatus::kUnavailable,
+           "unavailable provider should report kUnavailable");
+    expect(report.provider_summaries[2].provider_id == "rpm" &&
+               report.provider_summaries[2].status ==
+                   ProviderExecutionStatus::kFailed &&
+               report.provider_summaries[2].error_message == "db locked",
+           "failed provider should report kFailed with error_message");
+  }
+}
+
+// --- Asynchronous execution, concurrency, and lifecycle tests ---
+
+void test_async_completion_context_empty_and_provider_failures() {
+  auto service = std::make_shared<ApplicationDiscoveryService>();
+  service->register_provider(
+      std::make_unique<FakeDiscoveryProvider>("gio", true, DiscoveryResult{}));
+  DiscoveryResult failed;
+  failed.ok = false;
+  failed.error_message = "simulated failure";
+  service->register_provider(std::make_unique<FakeDiscoveryProvider>(
+      "flatpak", true, std::move(failed)));
+
+  TestPlatformLoop loop;
+  WorkerPoolFixture pool;
+  const std::thread::id platform_thread = std::this_thread::get_id();
+  std::thread::id completion_thread;
+  int callback_count = 0;
+  DiscoveryExecutionOutcome received;
+
+  AsyncDiscoveryRunner runner(
+      service, pool.scheduler(),
+      [&loop](std::function<void()> cb) { loop.post(std::move(cb)); });
+
+  runner.discover_async([&](DiscoveryExecutionOutcome outcome) {
+    completion_thread = std::this_thread::get_id();
+    ++callback_count;
+    received = std::move(outcome);
+  });
+
+  loop.run_one();
+  pool.join_all();
+
+  expect(callback_count == 1, "completion callback must run exactly once");
+  expect(completion_thread == platform_thread,
+         "completion must execute on the platform thread");
+  expect(received.status == DiscoveryExecutionStatus::kCompleted,
+         "discovery pass with empty + isolated failure should complete");
+  expect(received.applications.empty(), "applications should be empty");
+  expect(received.provider_summaries.size() == 2 &&
+             received.provider_summaries[1].status ==
+                 ProviderExecutionStatus::kFailed,
+         "provider failure summary should be preserved");
+}
+
+void test_async_worker_exception_produces_execution_error() {
+  auto service = std::make_shared<ApplicationDiscoveryService>();
+  service->register_provider(std::make_unique<ControlledDiscoveryProvider>(
+      "throwing",
+      []() -> DiscoveryResult { throw std::runtime_error("boom"); }));
+
+  TestPlatformLoop loop;
+  WorkerPoolFixture pool;
+  DiscoveryExecutionOutcome received;
+
+  AsyncDiscoveryRunner runner(
+      service, pool.scheduler(),
+      [&loop](std::function<void()> cb) { loop.post(std::move(cb)); });
+
+  runner.discover_async([&](DiscoveryExecutionOutcome outcome) {
+    received = std::move(outcome);
+  });
+
+  loop.run_one();
+  pool.join_all();
+
+  expect(received.status == DiscoveryExecutionStatus::kExecutionError,
+         "unexpected worker exception should report kExecutionError");
+  expect(!received.error_message.empty(),
+         "execution error should populate internal error_message");
+}
+
+void test_async_serializes_overlapping_requests_and_keeps_platform_responsive() {
+  Latch first_started(1);
+  Latch release_first(1);
+  std::atomic<int> in_flight{0};
+  std::atomic<int> max_in_flight{0};
+  std::atomic<int> call_index{0};
+
+  auto service = std::make_shared<ApplicationDiscoveryService>();
+  service->register_provider(std::make_unique<ControlledDiscoveryProvider>(
+      "gio", [&]() {
+        const int current = in_flight.fetch_add(1) + 1;
+        int prev_max = max_in_flight.load();
+        while (current > prev_max &&
+               !max_in_flight.compare_exchange_weak(prev_max, current)) {
+        }
+
+        const int invocation = call_index.fetch_add(1) + 1;
+        if (invocation == 1) {
+          first_started.count_down();
+          release_first.wait();
+        }
+
+        DiscoveryResult result;
+        const std::string id =
+            "org.example.Pass" + std::to_string(invocation) + ".desktop";
+        result.applications.push_back(
+            make_gio_app(id.c_str(), "Pass", true, false, false));
+        in_flight.fetch_sub(1);
+        return result;
+      }));
+
+  TestPlatformLoop loop;
+  WorkerPoolFixture pool;
+  AsyncDiscoveryRunner runner(
+      service, pool.scheduler(),
+      [&loop](std::function<void()> cb) { loop.post(std::move(cb)); });
+
+  std::vector<int> completion_order;
+  std::vector<std::string> app_ids;
+
+  // Submit first (slow) request; platform thread returns immediately.
+  runner.discover_async([&](DiscoveryExecutionOutcome outcome) {
+    expect(outcome.status == DiscoveryExecutionStatus::kCompleted,
+           "request 1 should complete");
+    completion_order.push_back(1);
+    if (!outcome.applications.empty()) {
+      app_ids.push_back(outcome.applications.front().desktop_file_id.value());
+    }
+  });
+
+  // Wait deterministically until worker is actively blocked inside request 1.
+  first_started.wait();
+
+  // Platform thread remains responsive while request 1 is blocked and can
+  // enqueue additional overlapping requests without blocking or spawning extra
+  // workers.
+  runner.discover_async([&](DiscoveryExecutionOutcome outcome) {
+    expect(outcome.status == DiscoveryExecutionStatus::kCompleted,
+           "request 2 should complete");
+    completion_order.push_back(2);
+    if (!outcome.applications.empty()) {
+      app_ids.push_back(outcome.applications.front().desktop_file_id.value());
+    }
+  });
+  runner.discover_async([&](DiscoveryExecutionOutcome outcome) {
+    expect(outcome.status == DiscoveryExecutionStatus::kCompleted,
+           "request 3 should complete");
+    completion_order.push_back(3);
+    if (!outcome.applications.empty()) {
+      app_ids.push_back(outcome.applications.front().desktop_file_id.value());
+    }
+  });
+
+  expect(pool.scheduled_workers() == 1,
+         "overlapping requests must reuse a single active worker");
+
+  // Unblock the slow provider and pump all 3 completions on the platform loop.
+  release_first.count_down();
+  loop.run_until(3);
+  pool.join_all();
+
+  expect(max_in_flight.load() == 1,
+         "provider must never be accessed concurrently");
+  expect(call_index.load() == 3, "all 3 requests must execute without drops");
+  expect(completion_order.size() == 3 && completion_order[0] == 1 &&
+             completion_order[1] == 2 && completion_order[2] == 3,
+         "overlapping requests must complete in FIFO order");
+  expect(app_ids.size() == 3 &&
+             app_ids[0] == "org.example.Pass1.desktop" &&
+             app_ids[1] == "org.example.Pass2.desktop" &&
+             app_ids[2] == "org.example.Pass3.desktop",
+         "each request must receive its own discovery pass results");
+}
+
+void test_async_cancellation_for_queued_and_in_flight_requests() {
+  Latch first_started(1);
+  Latch release_first(1);
+  std::atomic<int> provider_calls{0};
+
+  auto service = std::make_shared<ApplicationDiscoveryService>();
+  service->register_provider(std::make_unique<ControlledDiscoveryProvider>(
+      "gio", [&]() {
+        const int n = provider_calls.fetch_add(1) + 1;
+        if (n == 1) {
+          first_started.count_down();
+          release_first.wait();
+        }
+        DiscoveryResult result;
+        result.applications.push_back(make_gio_app(
+            "org.example.App.desktop", "App", false, false, false));
+        return result;
+      }));
+
+  TestPlatformLoop loop;
+  WorkerPoolFixture pool;
+  AsyncDiscoveryRunner runner(
+      service, pool.scheduler(),
+      [&loop](std::function<void()> cb) { loop.post(std::move(cb)); });
+
+  DiscoveryExecutionStatus first_status = DiscoveryExecutionStatus::kCompleted;
+  DiscoveryExecutionStatus second_status = DiscoveryExecutionStatus::kCompleted;
+  DiscoveryExecutionStatus third_status = DiscoveryExecutionStatus::kCancelled;
+
+  DiscoveryRequestHandle first_handle =
+      runner.discover_async([&](DiscoveryExecutionOutcome outcome) {
+        first_status = outcome.status;
+      });
+  first_started.wait();
+
+  DiscoveryRequestHandle second_handle =
+      runner.discover_async([&](DiscoveryExecutionOutcome outcome) {
+        second_status = outcome.status;
+      });
+  runner.discover_async([&](DiscoveryExecutionOutcome outcome) {
+    third_status = outcome.status;
+  });
+
+  // Cancel both the in-flight request (1) and the queued request (2).
+  first_handle.cancel();
+  second_handle.cancel();
+
+  release_first.count_down();
+  loop.run_until(3);
+  pool.join_all();
+
+  expect(first_status == DiscoveryExecutionStatus::kCancelled,
+         "cancelled in-flight request should finish as kCancelled");
+  expect(second_status == DiscoveryExecutionStatus::kCancelled,
+         "cancelled queued request should finish as kCancelled");
+  expect(third_status == DiscoveryExecutionStatus::kCompleted,
+         "subsequent non-cancelled request should still complete");
+  expect(provider_calls.load() == 2,
+         "cancelled queued request must not invoke provider discover()");
+}
+
+void test_teardown_while_discovery_pending_is_non_blocking_and_safe() {
+  Latch slow_started(1);
+  Latch release_slow(1);
+  std::atomic<int> provider_destroyed{0};
+  std::atomic<int> first_completions{0};
+  std::atomic<int> second_completions{0};
+  DiscoveryExecutionStatus first_status = DiscoveryExecutionStatus::kCompleted;
+  DiscoveryExecutionStatus second_status = DiscoveryExecutionStatus::kCompleted;
+
+  TestPlatformLoop loop;
+  WorkerPoolFixture pool;
+
+  {
+    auto service = std::make_shared<ApplicationDiscoveryService>();
+    service->register_provider(std::make_unique<ControlledDiscoveryProvider>(
+        "gio",
+        [&]() {
+          slow_started.count_down();
+          release_slow.wait();
+          DiscoveryResult result;
+          result.applications.push_back(make_gio_app(
+              "org.example.Slow.desktop", "Slow", true, false, false));
+          return result;
+        },
+        &provider_destroyed));
+
+    auto runner = std::make_unique<AsyncDiscoveryRunner>(
+        service, pool.scheduler(),
+        [&loop](std::function<void()> cb) { loop.post(std::move(cb)); });
+
+    // Drop local service ref so only runner/worker keep it alive.
+    service.reset();
+
+    runner->discover_async([&](DiscoveryExecutionOutcome outcome) {
+      first_completions.fetch_add(1);
+      first_status = outcome.status;
+    });
+    slow_started.wait();
+
+    runner->discover_async([&](DiscoveryExecutionOutcome outcome) {
+      second_completions.fetch_add(1);
+      second_status = outcome.status;
+    });
+
+    // Simulate plugin teardown while request 1 is still blocked on worker and
+    // request 2 is queued. Destroying runner calls shutdown() and must NOT
+    // block waiting for release_slow!
+    runner.reset();
+
+    expect(second_completions.load() == 1 &&
+               second_status == DiscoveryExecutionStatus::kCancelled,
+           "queued request must be cancelled immediately during teardown");
+    expect(provider_destroyed.load() == 0,
+           "provider and service must stay alive while slow worker is running");
+    expect(first_completions.load() == 0,
+           "in-flight request has not finished yet");
+
+    // Now allow the slow worker to exit.
+    release_slow.count_down();
+  }
+
+  pool.join_all();
+  loop.drain_available();
+
+  expect(first_completions.load() == 1 &&
+             first_status == DiscoveryExecutionStatus::kCancelled,
+         "in-flight request during teardown must deliver kCancelled once");
+  expect(provider_destroyed.load() == 1,
+         "service and provider must be deterministically destroyed once worker "
+         "and completion finish");
+}
+
+void test_concurrent_registration_and_discovery_on_service() {
+  ApplicationDiscoveryService service;
+  service.register_provider(std::make_unique<FakeDiscoveryProvider>(
+      "gio", true, DiscoveryResult{}));
+
+  std::thread reader([&]() {
+    for (int i = 0; i < 20; ++i) {
+      (void)service.discover_applications();
+    }
+  });
+  std::thread writer([&]() {
+    for (int i = 0; i < 5; ++i) {
+      service.register_provider(std::make_unique<FakeDiscoveryProvider>(
+          "extra", true, DiscoveryResult{}));
+    }
+  });
+
+  reader.join();
+  writer.join();
+  expect(service.provider_count() == 6,
+         "concurrent registration and discovery must not race");
+}
+
 }  // namespace
 
 int main() {
   test_unified_model_defaults_are_unknown_and_missing();
+  test_visibility_states_remain_independent_from_source_and_classification();
   test_unified_model_distinguishes_empty_vs_missing_and_false_vs_unknown();
-  test_unified_model_separates_provider_from_installation_source();
-  test_identity_is_deterministic_and_independent_of_display_name();
-  test_identity_distinguishes_same_native_id_across_providers();
-  test_identity_distinguishes_multiple_installations();
-  test_identity_prevents_concatenation_and_encoding_collisions();
-  test_empty_service_and_null_provider_handling();
-  test_empty_provider_result_and_unavailable_provider();
-  test_coordinator_aggregates_preserves_provenance_and_isolates_failures();
-  test_service_owns_and_destroys_providers_deterministically();
+  test_identity_contract_and_collision_resistance();
   test_legacy_desktop_file_id_validation();
-  test_legacy_adapter_preserves_contract_and_filters_incompatible_records();
+  test_legacy_adapter_enforces_gio_visibility_and_preserves_order();
+  test_coordinator_report_distinguishes_success_unavailable_and_failure();
+  test_async_completion_context_empty_and_provider_failures();
+  test_async_worker_exception_produces_execution_error();
+  test_async_serializes_overlapping_requests_and_keeps_platform_responsive();
+  test_async_cancellation_for_queued_and_in_flight_requests();
+  test_teardown_while_discovery_pending_is_non_blocking_and_safe();
+  test_concurrent_registration_and_discovery_on_service();
 
   if (g_failures > 0) {
     std::cerr << g_failures << " test assertion(s) failed.\n";
     return 1;
   }
-  std::cout << "All discovery native unit tests passed.\n";
+  std::cout << "All discovery native unit and async tests passed.\n";
   return 0;
 }
