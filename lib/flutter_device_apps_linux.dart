@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 import 'src/appstream_stub.dart' if (dart.library.io) 'src/appstream.dart';
 
 part 'linux_app_technologies.dart';
+part 'linux_discovery_models.dart';
 
 /// An application registered with the Linux desktop.
 class LinuxAppInfo {
@@ -108,6 +109,63 @@ abstract final class FlutterDeviceAppsLinux {
 
   /// Lists registered applications that GIO considers visible in desktop menus.
   static Future<List<LinuxAppInfo>> listApps() => _listApps('listApps');
+
+  /// Discovers installed Linux applications across available local providers
+  /// (GIO, Flatpak, Snap, DPKG, RPM, Pacman, Nix, and AppStream metadata).
+  ///
+  /// Returns normalized, deduplicated, and enriched applications in
+  /// [LinuxDiscoveryResult.applications] along with per-provider diagnostics
+  /// and preserved correlation ambiguities.
+  ///
+  /// Raw installed system and profile packages stay strictly separate in
+  /// [LinuxDiscoveryResult.packages] and are included only when
+  /// [includePackages] is `true`. Set [includeAppStreamMetadata] to `false` to
+  /// skip local AppStream enrichment, or pass [providers] to restrict which
+  /// local providers execute (for example, `['gio', 'flatpak']`).
+  ///
+  /// Identity stability note: [LinuxDiscoveredApp.resolvedId] is deterministic
+  /// and stable across normal upgrades for a single installation, except when
+  /// an RPM package transitions between single-version and simultaneous
+  /// multi-version (parallel) installations where version-specific identities
+  /// are required to keep parallel installations distinct.
+  static Future<LinuxDiscoveryResult> discoverApps({
+    bool includePackages = false,
+    bool includeAppStreamMetadata = true,
+    List<String>? providers,
+  }) async {
+    _checkPlatform();
+    List<String>? validatedProviders;
+    if (providers != null) {
+      if (providers.isEmpty) {
+        throw ArgumentError.value(
+          providers,
+          'providers',
+          'Pass null to query all providers, or a non-empty list of provider IDs',
+        );
+      }
+      validatedProviders = <String>[];
+      for (final provider in providers) {
+        if (provider.isEmpty || provider.contains('\u0000')) {
+          throw ArgumentError.value(
+            providers,
+            'providers',
+            'Provider IDs must be non-empty strings without NUL characters',
+          );
+        }
+        validatedProviders.add(provider);
+      }
+    }
+    final args = <String, Object?>{
+      'includePackages': includePackages,
+      'includeAppStreamMetadata': includeAppStreamMetadata,
+      'providers': ?validatedProviders,
+    };
+    final result = await _channel.invokeMapMethod<Object?, Object?>(
+      'discoverApps',
+      args,
+    );
+    return LinuxDiscoveryResult._fromMap(result);
+  }
 
   /// Searches visible desktop applications in GIO's relevance order.
   ///

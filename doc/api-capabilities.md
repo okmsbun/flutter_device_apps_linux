@@ -40,6 +40,63 @@ localized text where available and returns `null` if no readable record matches.
 AppImage. The source is `unknown` when an entry has no supported marker.
 Its package ID and version are optional.
 
+## Unified multi-source discovery (`discoverApps`)
+
+`discoverApps()` discovers and correlates local installations across available
+read-only providers without invoking package manager CLIs or network APIs:
+
+- **Application & desktop providers:** GIO desktop entries, Flatpak (`libflatpak`
+  loaded optionally at runtime), and Snap (local `snapd` UNIX socket).
+- **Package inventory & file ownership:** DPKG (`/var/lib/dpkg`), RPM (`librpm`
+  loaded optionally at runtime), Pacman (`libalpm` loaded optionally at runtime),
+  and active local Nix profiles.
+- **Metadata enrichment:** Local AppStream metadata (`libappstream` loaded
+  optionally at runtime, disabled with `includeAppStreamMetadata: false`).
+
+Missing optional libraries, databases, or daemons are reported as
+`LinuxDiscoveryProviderStatus.unavailable` in `providerDiagnostics` without
+failing the overall pass.
+
+### Semantics and guarantees
+
+- **Applications vs. packages:** Confirmed applications are returned in
+  `LinuxDiscoveryResult.applications`. Raw system and profile packages remain
+  strictly separate in `LinuxDiscoveryResult.packages` (empty unless
+  `includePackages: true`). Catalog-only AppStream components and arbitrary
+  installed packages are never promoted into applications.
+- **Installed vs. catalog versions:** `LinuxDiscoveredAppMetadata.version` only
+  contains a verified installed version reported by an installation provider.
+  Upstream AppStream release history is kept separate in
+  `LinuxDiscoveredApp.catalogReleases`.
+- **Desktop entries:** Desktop entries are never fabricated. An application
+  without a `.desktop` file has an empty `desktopEntries` list; an application
+  that owns multiple `.desktop` files exposes all of them.
+- **Honest unknowns & provenance:** Capabilities use tri-state
+  `LinuxCapabilityState` (`supported`, `unsupported`, `unknown`). Classification
+  remains `LinuxAppClassification.unknown` unless authoritative metadata (such
+  as strongly matched AppStream component kinds) establishes it. Unresolved
+  matches and field disagreements are preserved in `ambiguities` and
+  `metadataConflicts` instead of guessing.
+- **Separate installations:** Installations across different package managers,
+  scopes (user/system), Flatpak branches, architectures, Snap parallel
+  instances, Nix profiles, or parallel RPM versions remain distinct
+  `LinuxDiscoveredApp` records.
+
+### Identity stability limitations
+
+- `LinuxDiscoveredApp.resolvedId` is deterministic and independent of provider
+  execution order.
+- For a normal single installation (GIO, Flatpak, Snap, DPKG, Pacman, Nix, or
+  single-version RPM), `resolvedId` remains stable across in-place upgrades.
+- **Parallel RPM transition:** When an RPM package transitions between a single
+  installed version and simultaneous multi-version (parallel) installations,
+  parallel records must use version-specific installation identities so each
+  installed version remains distinct; consequently, `resolvedId` changes across
+  that single-to-parallel transition.
+- **Cross-provider / cross-scope moves:** Replacing a package with another
+  packaging format (for example, DPKG to Flatpak) or moving between scopes or
+  Nix profiles produces a distinct `resolvedId` by design.
+
 ## Technology detection
 
 `detectAppTechnologies()` reads direct ELF dependency metadata from an

@@ -3,6 +3,7 @@ name: Linux Tests
 on:
   pull_request:
     branches: ["develop"]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -15,6 +16,50 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Free disk space
+        if: runner.environment == 'github-hosted'
+        run: |
+          echo "=== Disk usage before cleanup ==="
+          df -h /
+
+          avail_kib="$(df -Pk / | awk 'NR==2 {print $4}')"
+          min_free_kib=$((25 * 1024 * 1024))
+          if [ -n "$avail_kib" ] && [ "$avail_kib" -ge "$min_free_kib" ]; then
+            echo "Skipping disk cleanup: available space (${avail_kib} KiB) is already >= 25 GiB."
+            exit 0
+          fi
+
+          # Explicit allowlist of large standalone (non-dpkg-managed) SDKs and
+          # toolcaches preinstalled on GitHub-hosted Ubuntu runners.
+          # Excludes dpkg-managed runtimes (.NET, PowerShell, Google Cloud CLI)
+          # to preserve /var/lib/dpkg/status inventory consistency.
+          cleanup_dirs=(
+            "/usr/local/lib/android"
+            "/opt/hostedtoolcache/CodeQL"
+            "/usr/local/.ghcup"
+            "/usr/share/swift"
+            "/usr/share/miniconda"
+            "/usr/local/julia"
+            "/usr/local/aws-cli"
+          )
+
+          for dir in "${cleanup_dirs[@]}"; do
+            if [ -L "$dir" ] || [ ! -d "$dir" ]; then
+              continue
+            fi
+            if dpkg -S "$dir" >/dev/null 2>&1; then
+              echo "Skipping dpkg-managed path: $dir"
+              continue
+            fi
+            du -sh "$dir" || true
+            sudo rm -rf -- "$dir"
+          done
+
+          sudo apt-get clean
+
+          echo "=== Disk usage after cleanup ==="
+          df -h /
+
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
@@ -24,10 +69,625 @@ jobs:
       - name: Install Linux build and test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev libstdc++-12-dev libgl1-mesa-dri shared-mime-info xvfb xauth
+          # Note: intentionally install flatpak, libflatpak0, rpm,
+          # pacman-package-manager, and libappstream runtime shared libraries
+          # without -dev packages, proving the plugin builds without
+          # compile-time or link-time headers.
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev libstdc++-12-dev libgl1-mesa-dri shared-mime-info xvfb xauth flatpak libflatpak0 rpm pacman-package-manager
+          sudo apt-get install -y libappstream5 || sudo apt-get install -y libappstream4
 
       - name: Install dependencies
         run: flutter pub get
+
+      - name: Run native discovery unit tests (ASan/UBSan and TSan)
+        run: |
+          clang++ -std=c++14 -Wall -Wextra -Wpedantic -Werror \
+            -pthread -fsanitize=address,undefined \
+            -Ilinux \
+            linux/discovery/application_identity.cc \
+            linux/discovery/application_discovery_service.cc \
+            linux/discovery/appstream_metadata_provider.cc \
+            linux/discovery/async_discovery_runner.cc \
+            linux/discovery/discovery_resolution.cc \
+            linux/discovery/dpkg_discovery_provider.cc \
+            linux/discovery/flatpak_discovery_provider.cc \
+            linux/discovery/json_parser.cc \
+            linux/discovery/legacy_list_apps_adapter.cc \
+            linux/discovery/nix_discovery_provider.cc \
+            linux/discovery/package_ownership.cc \
+            linux/discovery/package_ownership_indexers.cc \
+            linux/discovery/pacman_discovery_provider.cc \
+            linux/discovery/rpm_discovery_provider.cc \
+            linux/discovery/snap_discovery_provider.cc \
+            linux/discovery/snapd_socket_backend.cc \
+            linux/test/application_discovery_test.cc \
+            -o /tmp/application_discovery_test_asan
+          /tmp/application_discovery_test_asan
+
+          clang++ -std=c++14 -Wall -Wextra -Wpedantic -Werror \
+            -pthread -fsanitize=thread \
+            -Ilinux \
+            linux/discovery/application_identity.cc \
+            linux/discovery/application_discovery_service.cc \
+            linux/discovery/appstream_metadata_provider.cc \
+            linux/discovery/async_discovery_runner.cc \
+            linux/discovery/discovery_resolution.cc \
+            linux/discovery/dpkg_discovery_provider.cc \
+            linux/discovery/flatpak_discovery_provider.cc \
+            linux/discovery/json_parser.cc \
+            linux/discovery/legacy_list_apps_adapter.cc \
+            linux/discovery/nix_discovery_provider.cc \
+            linux/discovery/package_ownership.cc \
+            linux/discovery/package_ownership_indexers.cc \
+            linux/discovery/pacman_discovery_provider.cc \
+            linux/discovery/rpm_discovery_provider.cc \
+            linux/discovery/snap_discovery_provider.cc \
+            linux/discovery/snapd_socket_backend.cc \
+            linux/test/application_discovery_test.cc \
+            -o /tmp/application_discovery_test_tsan
+          /tmp/application_discovery_test_tsan
+
+      - name: Run native GIO discovery integration tests
+        run: |
+          clang++ -std=c++14 -Wall -Wextra -Werror \
+            -Ilinux \
+            $(pkg-config --cflags gio-unix-2.0) \
+            linux/discovery/application_identity.cc \
+            linux/discovery/gio_discovery_provider.cc \
+            linux/discovery/legacy_list_apps_adapter.cc \
+            linux/test/gio_discovery_provider_test.cc \
+            $(pkg-config --libs gio-unix-2.0) \
+            -o /tmp/gio_discovery_provider_test
+
+          empty_dir="$(mktemp -d)"
+          fixture_dir="$(mktemp -d)"
+          trap 'rm -rf -- "$empty_dir" "$fixture_dir"' EXIT
+
+          mkdir -p "$empty_dir/applications" "$fixture_dir/applications"
+          cat > "$fixture_dir/applications/org.example.VisibleFixture.desktop" <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Visible Fixture
+          Exec=/usr/bin/true %f
+          EOF
+          cat > "$fixture_dir/applications/org.example.NoDisplayFixture.desktop" <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=NoDisplay Fixture
+          Exec=/usr/bin/true %U
+          NoDisplay=true
+          Terminal=true
+          EOF
+          cat > "$fixture_dir/applications/org.example.OnlyShowInKdeFixture.desktop" <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Only KDE Fixture
+          Exec=/usr/bin/true
+          OnlyShowIn=KDE;
+          EOF
+          cat > "$fixture_dir/applications/org.example.NotShowInGnomeFixture.desktop" <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Not GNOME Fixture
+          Exec=/usr/bin/true
+          NotShowIn=GNOME;
+          EOF
+          cat > "$fixture_dir/applications/org.example.HiddenFixture.desktop" <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Hidden Fixture
+          Exec=/usr/bin/true
+          Hidden=true
+          EOF
+
+          env XDG_DATA_HOME="$empty_dir" XDG_DATA_DIRS="$empty_dir" XDG_CURRENT_DESKTOP=GNOME LANGUAGE=C LC_ALL=C.UTF-8 \
+            /tmp/gio_discovery_provider_test --empty
+          env XDG_DATA_HOME="$fixture_dir" XDG_DATA_DIRS="$fixture_dir" XDG_CURRENT_DESKTOP=GNOME LANGUAGE=C LC_ALL=C.UTF-8 \
+            /tmp/gio_discovery_provider_test
+
+      - name: Run native Flatpak discovery integration tests
+        run: |
+          clang++ -std=c++14 -Wall -Wextra -Wpedantic -Werror \
+            -Ilinux \
+            $(pkg-config --cflags gio-unix-2.0 gmodule-2.0) \
+            linux/discovery/application_identity.cc \
+            linux/discovery/flatpak_discovery_provider.cc \
+            linux/discovery/legacy_list_apps_adapter.cc \
+            linux/discovery/libflatpak_backend.cc \
+            linux/test/flatpak_discovery_provider_test.cc \
+            $(pkg-config --libs gio-unix-2.0 gmodule-2.0) \
+            -o /tmp/flatpak_discovery_provider_test
+
+          # Verify no mandatory DT_NEEDED ELF dependency on libflatpak.
+          if readelf -d /tmp/flatpak_discovery_provider_test | grep -q 'libflatpak'; then
+            echo "Unexpected mandatory DT_NEEDED dependency on libflatpak"
+            exit 1
+          fi
+
+          # Verify runtime libflatpak.so.0 availability and required exported
+          # symbols via ldconfig and nm.
+          libflatpak_path="$(ldconfig -p | awk '/libflatpak\.so\.0 / { print $NF; exit }')"
+          if [ -z "$libflatpak_path" ] || [ ! -r "$libflatpak_path" ]; then
+            echo "libflatpak.so.0 was not found in ldconfig cache"
+            exit 1
+          fi
+          echo "Resolved runtime libflatpak: $libflatpak_path"
+          for sym in \
+            flatpak_get_system_installations \
+            flatpak_installation_new_user \
+            flatpak_installation_list_installed_refs_by_kind \
+            flatpak_installation_get_id \
+            flatpak_installation_get_is_user \
+            flatpak_ref_get_name \
+            flatpak_ref_get_arch \
+            flatpak_ref_get_branch \
+            flatpak_ref_get_kind; do
+            if ! nm -D --defined-only "$libflatpak_path" | grep -q " ${sym}$"; then
+              echo "Required libflatpak symbol not exported: $sym"
+              exit 1
+            fi
+          done
+
+          work_dir="$(mktemp -d)"
+          trap 'sudo rm -rf -- "$work_dir"' EXIT
+
+          # Test missing library and missing symbols with tiny stub shared libraries.
+          printf '%s\n' 'void unrelated_symbol(void) {}' | \
+            clang -x c - -fPIC -shared -o "$work_dir/libincomplete.so"
+          cat > "$work_dir/core_only.c" <<'EOF'
+          void* flatpak_get_system_installations(void* c, void** e) { (void)c; (void)e; return 0; }
+          void* flatpak_installation_new_user(void* c, void** e) { (void)c; (void)e; return 0; }
+          void* flatpak_installation_list_installed_refs_by_kind(void* s, int k, void* c, void** e) { (void)s; (void)k; (void)c; (void)e; return 0; }
+          const char* flatpak_installation_get_id(void* s) { (void)s; return "default"; }
+          int flatpak_installation_get_is_user(void* s) { (void)s; return 0; }
+          const char* flatpak_ref_get_name(void* r) { (void)r; return 0; }
+          const char* flatpak_ref_get_arch(void* r) { (void)r; return 0; }
+          const char* flatpak_ref_get_branch(void* r) { (void)r; return 0; }
+          int flatpak_ref_get_kind(void* r) { (void)r; return 0; }
+          EOF
+          clang "$work_dir/core_only.c" -fPIC -shared -o "$work_dir/libcoreonly.so"
+
+          /tmp/flatpak_discovery_provider_test --missing-lib
+          /tmp/flatpak_discovery_provider_test --missing-symbols \
+            "$work_dir/libincomplete.so" "$work_dir/libcoreonly.so"
+
+          # Build an offline local Flatpak repo with one runtime and one app
+          # (intentionally without any .desktop file), matching upstream
+          # flatpak build-export / make-test-runtime.sh directory expectations.
+          arch="$(flatpak --default-arch)"
+          mkdir -p "$work_dir/rt/usr/bin" "$work_dir/rt/files" \
+            "$work_dir/app/files/bin" "$work_dir/app/var" \
+            "$work_dir/user" "$work_dir/system" "$work_dir/extra" "$work_dir/etc/installations.d"
+
+          cat > "$work_dir/rt/metadata" <<EOF
+          [Runtime]
+          name=org.example.Runtime
+          runtime=org.example.Runtime/$arch/1.0
+          sdk=org.example.Runtime/$arch/1.0
+          EOF
+          flatpak build-export --runtime "$work_dir/repo" "$work_dir/rt" 1.0
+
+          printf '#!/bin/sh\nexit 0\n' > "$work_dir/app/files/bin/true"
+          chmod +x "$work_dir/app/files/bin/true"
+          cat > "$work_dir/app/metadata" <<EOF
+          [Application]
+          name=org.example.NoDesktopApp
+          runtime=org.example.Runtime/$arch/1.0
+          sdk=org.example.Runtime/$arch/1.0
+          EOF
+          flatpak build-finish --command=true "$work_dir/app"
+          flatpak build-export "$work_dir/repo" "$work_dir/app" stable
+
+          cat > "$work_dir/etc/installations.d/extra.conf" <<EOF
+          [Installation "extra"]
+          Path=$work_dir/extra
+          DisplayName=Extra System Installation
+          StorageType=harddisk
+          EOF
+
+          export FLATPAK_USER_DIR="$work_dir/user"
+          export FLATPAK_SYSTEM_DIR="$work_dir/system"
+          export FLATPAK_CONFIG_DIR="$work_dir/etc"
+
+          flatpak remote-add --user --no-gpg-verify local "file://$work_dir/repo"
+          flatpak install --user -y --noninteractive --no-deps --no-related \
+            local "runtime/org.example.Runtime/$arch/1.0"
+          flatpak install --user -y --noninteractive --no-deps --no-related \
+            local "app/org.example.NoDesktopApp/$arch/stable"
+
+          sudo FLATPAK_SYSTEM_DIR="$work_dir/system" FLATPAK_CONFIG_DIR="$work_dir/etc" \
+            flatpak remote-add --system --no-gpg-verify local "file://$work_dir/repo"
+          sudo FLATPAK_SYSTEM_DIR="$work_dir/system" FLATPAK_CONFIG_DIR="$work_dir/etc" \
+            flatpak install --system -y --noninteractive --no-deps --no-related \
+            local "app/org.example.NoDesktopApp/$arch/stable"
+
+          sudo FLATPAK_SYSTEM_DIR="$work_dir/system" FLATPAK_CONFIG_DIR="$work_dir/etc" \
+            flatpak remote-add --installation=extra --no-gpg-verify local "file://$work_dir/repo"
+          sudo FLATPAK_SYSTEM_DIR="$work_dir/system" FLATPAK_CONFIG_DIR="$work_dir/etc" \
+            flatpak install --installation=extra -y --noninteractive --no-deps --no-related \
+            local "app/org.example.NoDesktopApp/$arch/stable"
+
+          sudo chmod -R a+rX "$work_dir/system" "$work_dir/extra"
+          /tmp/flatpak_discovery_provider_test --fixture
+
+      - name: Run native AppStream metadata integration tests
+        run: |
+          clang++ -std=c++14 -Wall -Wextra -Wpedantic -Werror \
+            -Ilinux \
+            $(pkg-config --cflags gio-unix-2.0 gmodule-2.0) \
+            linux/discovery/application_identity.cc \
+            linux/discovery/application_discovery_service.cc \
+            linux/discovery/appstream_metadata_provider.cc \
+            linux/discovery/discovery_resolution.cc \
+            linux/discovery/libappstream_backend.cc \
+            linux/discovery/package_ownership.cc \
+            linux/test/appstream_metadata_provider_test.cc \
+            $(pkg-config --libs gio-unix-2.0 gmodule-2.0) \
+            -o /tmp/appstream_metadata_provider_test
+
+          # Verify no mandatory DT_NEEDED ELF dependency on libappstream.
+          if readelf -d /tmp/appstream_metadata_provider_test | grep -q 'libappstream'; then
+            echo "Unexpected mandatory DT_NEEDED dependency on libappstream"
+            exit 1
+          fi
+
+          as_dir="$(mktemp -d)"
+          trap 'rm -rf -- "$as_dir"' EXIT
+
+          printf '%s\n' 'void unrelated_symbol(void) {}' | \
+            clang -x c - -fPIC -shared -o "$as_dir/libincomplete.so"
+          cat > "$as_dir/mismatched_v5.c" <<'EOF'
+          void* as_pool_new(void) { return 0; }
+          int as_pool_load(void* p, void* c, void** e) { (void)p; (void)c; (void)e; return 0; }
+          void* as_pool_get_components(void* p) { (void)p; return 0; }
+          const char* as_component_get_id(void* c) { (void)c; return 0; }
+          EOF
+          clang "$as_dir/mismatched_v5.c" -fPIC -shared -o "$as_dir/libappstream.so.5"
+
+          /tmp/appstream_metadata_provider_test --missing-lib
+          /tmp/appstream_metadata_provider_test --unsupported-abi \
+            "$as_dir/libincomplete.so" "$as_dir/libappstream.so.5"
+
+          mkdir -p "$as_dir/metainfo" "$as_dir/catalog"
+          cat > "$as_dir/metainfo/org.example.Editor.metainfo.xml" <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <component type="desktop-application">
+            <id>org.example.Editor</id>
+            <name>Example Editor</name>
+            <name xml:lang="tr">Örnek Editör</name>
+            <summary>Text editor</summary>
+            <summary xml:lang="tr">Metin düzenleyici</summary>
+            <description><p>Simple editor.</p></description>
+            <project_license>MIT</project_license>
+            <url type="homepage">https://example.org/editor</url>
+            <launchable type="desktop-id">org.example.Editor.desktop</launchable>
+            <categories><category>Utility</category></categories>
+            <releases>
+              <release version="3.1.0" date="2026-10-01"/>
+            </releases>
+          </component>
+          EOF
+          cat > "$as_dir/metainfo/malformed.metainfo.xml" <<'EOF'
+          <component ! broken xml
+          EOF
+          cat > "$as_dir/catalog/example-catalog.xml" <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <components version="0.16" origin="example-distro">
+            <component type="console-application">
+              <id>org.example.CliTool</id>
+              <pkgname>example-cli</pkgname>
+              <name>CLI Tool</name>
+              <summary>Command line utility</summary>
+              <bundle type="flatpak">app/org.example.CliTool/x86_64/stable</bundle>
+            </component>
+          </components>
+          EOF
+
+          /tmp/appstream_metadata_provider_test --fixture "$as_dir/metainfo" "$as_dir/catalog"
+
+      - name: Run native DPKG dpkg-query parity test
+        run: |
+          clang++ -std=c++14 -Wall -Wextra -Wpedantic -Werror \
+            -fsanitize=address,undefined \
+            -Ilinux \
+            linux/discovery/application_identity.cc \
+            linux/discovery/dpkg_discovery_provider.cc \
+            linux/discovery/package_ownership.cc \
+            linux/discovery/package_ownership_indexers.cc \
+            linux/discovery/pacman_discovery_provider.cc \
+            linux/discovery/rpm_discovery_provider.cc \
+            linux/test/dpkg_discovery_provider_test.cc \
+            -o /tmp/dpkg_discovery_provider_test
+          /tmp/dpkg_discovery_provider_test
+
+      - name: Run native RPM discovery integration tests
+        run: |
+          clang++ -std=c++14 -Wall -Wextra -Wpedantic -Werror \
+            -Ilinux \
+            $(pkg-config --cflags gmodule-2.0) \
+            linux/discovery/application_identity.cc \
+            linux/discovery/rpm_discovery_provider.cc \
+            linux/discovery/librpm_backend.cc \
+            linux/test/rpm_discovery_provider_test.cc \
+            $(pkg-config --libs gmodule-2.0) \
+            -o /tmp/rpm_discovery_provider_test
+
+          # Verify no mandatory DT_NEEDED ELF dependency on librpm.
+          if readelf -d /tmp/rpm_discovery_provider_test | grep -q 'librpm'; then
+            echo "Unexpected mandatory DT_NEEDED dependency on librpm"
+            exit 1
+          fi
+
+          # Verify runtime librpm shared library is registered in ldconfig.
+          librpm_path="$(ldconfig -p | awk '/librpm\.so\.(10|9|8) / { print $NF; exit }')"
+          if [ -z "$librpm_path" ] || [ ! -r "$librpm_path" ]; then
+            echo "No supported librpm.so.{10,9,8} found in ldconfig cache"
+            exit 1
+          fi
+          echo "Resolved runtime librpm: $librpm_path"
+
+          rpm_work="$(mktemp -d)"
+          trap 'sudo rm -rf -- "$rpm_work"' EXIT
+
+          printf '%s\n' 'void unrelated_symbol(void) {}' | \
+            clang -x c - -fPIC -shared -o "$rpm_work/libincomplete.so"
+
+          /tmp/rpm_discovery_provider_test --missing-lib
+          /tmp/rpm_discovery_provider_test --unsupported-abi "$rpm_work/libincomplete.so"
+
+          # Initialize an empty isolated RPM DB and verify empty discovery.
+          mkdir -p "$rpm_work/empty_root" "$rpm_work/fixture_root" "$rpm_work/rpmbuild"/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+          rpm --root "$rpm_work/empty_root" --initdb
+          /tmp/rpm_discovery_provider_test --empty "$rpm_work/empty_root"
+
+          # Build offline local RPM packages (two versions of example-multi plus
+          # a noarch package) and install into an isolated RPM DB root.
+          cat > "$rpm_work/rpmbuild/SPECS/example-multi-1.spec" <<'EOF'
+          Name:           example-multi
+          Epoch:          1
+          Version:        1.0.0
+          Release:        1
+          Summary:        Example multi-version RPM package
+          License:        MIT
+          URL:            https://example.org/multi
+          Vendor:         Example Vendor
+          Group:          Applications/System
+          BuildArch:      noarch
+
+          %description
+          Offline fixture package version 1.
+
+          %install
+          mkdir -p %{buildroot}/usr/share/example-multi
+          printf 'shared\n' > %{buildroot}/usr/share/example-multi/shared.txt
+
+          %files
+          /usr/share/example-multi/shared.txt
+          EOF
+
+          cat > "$rpm_work/rpmbuild/SPECS/example-multi-2.spec" <<'EOF'
+          Name:           example-multi
+          Epoch:          1
+          Version:        2.0.0
+          Release:        2
+          Summary:        Example multi-version RPM package
+          License:        MIT
+          URL:            https://example.org/multi
+          Vendor:         Example Vendor
+          Group:          Applications/System
+          BuildArch:      noarch
+
+          %description
+          Offline fixture package version 2.
+
+          %install
+          mkdir -p %{buildroot}/usr/share/example-multi
+          printf 'shared\n' > %{buildroot}/usr/share/example-multi/shared.txt
+
+          %files
+          /usr/share/example-multi/shared.txt
+          EOF
+
+          cat > "$rpm_work/rpmbuild/SPECS/example-tool.spec" <<'EOF'
+          Name:           example-tool
+          Version:        3.1.4
+          Release:        1
+          Summary:        Example noarch tool
+          License:        Apache-2.0
+          BuildArch:      noarch
+
+          %description
+          Minimal fixture package without epoch or vendor.
+
+          %install
+          mkdir -p %{buildroot}/usr/share/applications
+          printf '[Desktop Entry]\nName=Tool\n' > %{buildroot}/usr/share/applications/example-tool.desktop
+
+          %files
+          /usr/share/applications/example-tool.desktop
+          EOF
+
+          rpmbuild --define "_topdir $rpm_work/rpmbuild" -bb "$rpm_work/rpmbuild/SPECS/example-multi-1.spec"
+          rpmbuild --define "_topdir $rpm_work/rpmbuild" -bb "$rpm_work/rpmbuild/SPECS/example-multi-2.spec"
+          rpmbuild --define "_topdir $rpm_work/rpmbuild" -bb "$rpm_work/rpmbuild/SPECS/example-tool.spec"
+
+          # RPM --root installation of packages with %files requires chroot(),
+          # so use sudo strictly for isolated fixture DB population and make
+          # the fixture world-readable before running the unprivileged test.
+          sudo rpm --root "$rpm_work/fixture_root" --initdb
+          sudo rpm --root "$rpm_work/fixture_root" -ivh --justdb --replacefiles --nodeps --noscripts --notriggers --ignorearch \
+            "$rpm_work/rpmbuild/RPMS/noarch/example-multi-1.0.0-1.noarch.rpm"
+          sudo rpm --root "$rpm_work/fixture_root" -ivh --justdb --replacefiles --nodeps --noscripts --notriggers --ignorearch \
+            "$rpm_work/rpmbuild/RPMS/noarch/example-multi-2.0.0-2.noarch.rpm"
+          sudo rpm --root "$rpm_work/fixture_root" -ivh --justdb --replacefiles --nodeps --noscripts --notriggers --ignorearch \
+            "$rpm_work/rpmbuild/RPMS/noarch/example-tool-3.1.4-1.noarch.rpm"
+          sudo chmod -R a+rX "$rpm_work/fixture_root"
+
+          /tmp/rpm_discovery_provider_test --fixture "$rpm_work/fixture_root"
+
+      - name: Run native Pacman discovery integration tests
+        run: |
+          clang++ -std=c++14 -Wall -Wextra -Wpedantic -Werror \
+            -Ilinux \
+            $(pkg-config --cflags gmodule-2.0) \
+            linux/discovery/application_identity.cc \
+            linux/discovery/pacman_discovery_provider.cc \
+            linux/discovery/libalpm_backend.cc \
+            linux/test/pacman_discovery_provider_test.cc \
+            $(pkg-config --libs gmodule-2.0) \
+            -o /tmp/pacman_discovery_provider_test
+
+          # Verify no mandatory DT_NEEDED ELF dependency on libalpm.
+          if readelf -d /tmp/pacman_discovery_provider_test | grep -q 'libalpm'; then
+            echo "Unexpected mandatory DT_NEEDED dependency on libalpm"
+            exit 1
+          fi
+
+          # Verify runtime libalpm shared library and required exported symbols.
+          libalpm_path="$(ldconfig -p | awk '/libalpm\.so\.(16|15|14|13) / { print $NF; exit }')"
+          if [ -z "$libalpm_path" ] || [ ! -r "$libalpm_path" ]; then
+            echo "No supported libalpm.so.{16,15,14,13} found in ldconfig cache"
+            exit 1
+          fi
+          echo "Resolved runtime libalpm: $libalpm_path"
+          for sym in \
+            alpm_initialize \
+            alpm_release \
+            alpm_errno \
+            alpm_strerror \
+            alpm_get_localdb \
+            alpm_db_get_pkgcache \
+            alpm_list_next \
+            alpm_pkg_get_name \
+            alpm_pkg_get_version \
+            alpm_pkg_get_arch \
+            alpm_pkg_get_desc \
+            alpm_pkg_get_url \
+            alpm_pkg_get_packager \
+            alpm_pkg_get_licenses \
+            alpm_pkg_get_groups \
+            alpm_pkg_get_reason \
+            alpm_pkg_get_files; do
+            if ! nm -D --defined-only "$libalpm_path" | grep -q " ${sym}$"; then
+              echo "Required libalpm symbol not exported: $sym"
+              exit 1
+            fi
+          done
+
+          pacman_work="$(mktemp -d)"
+          trap 'rm -rf -- "$pacman_work"' EXIT
+
+          printf '%s\n' 'void unrelated_symbol(void) {}' | \
+            clang -x c - -fPIC -shared -o "$pacman_work/libincomplete.so"
+
+          /tmp/pacman_discovery_provider_test --missing-lib
+          /tmp/pacman_discovery_provider_test --unsupported-abi "$pacman_work/libincomplete.so"
+
+          # Verify empty isolated Pacman local database.
+          mkdir -p "$pacman_work/root" "$pacman_work/empty_db/local"
+          printf '9\n' > "$pacman_work/empty_db/local/ALPM_DB_VERSION"
+          /tmp/pacman_discovery_provider_test --empty "$pacman_work/root" "$pacman_work/empty_db"
+
+          # Create an offline local Pacman database fixture matching libalpm's
+          # documented ALPM_DB_VERSION 9 local desc layout plus a pacman.conf
+          # with custom DBPath.
+          mkdir -p \
+            "$pacman_work/fixture_db/local/example-app-1.2.3-1" \
+            "$pacman_work/fixture_db/local/example-lib-0.9.0-2"
+          printf '9\n' > "$pacman_work/fixture_db/local/ALPM_DB_VERSION"
+
+          cat > "$pacman_work/fixture_db/local/example-app-1.2.3-1/desc" <<'EOF'
+          %NAME%
+          example-app
+
+          %VERSION%
+          1.2.3-1
+
+          %BASE%
+          example-app
+
+          %DESC%
+          Example explicit Arch package
+
+          %URL%
+          https://example.org/app
+
+          %ARCH%
+          x86_64
+
+          %BUILDDATE%
+          1700000000
+
+          %INSTALLDATE%
+          1700000100
+
+          %PACKAGER%
+          Example Packager <packager@example.org>
+
+          %SIZE%
+          4096
+
+          %GROUPS%
+          base-devel
+          example-tools
+
+          %LICENSE%
+          MIT
+          Apache-2.0
+          EOF
+
+          cat > "$pacman_work/fixture_db/local/example-lib-0.9.0-2/desc" <<'EOF'
+          %NAME%
+          example-lib
+
+          %VERSION%
+          0.9.0-2
+
+          %BASE%
+          example-lib
+
+          %DESC%
+          Example dependency library
+
+          %ARCH%
+          any
+
+          %BUILDDATE%
+          1700000000
+
+          %INSTALLDATE%
+          1700000200
+
+          %PACKAGER%
+          Unknown Packager
+
+          %SIZE%
+          1024
+
+          %REASON%
+          1
+
+          %LICENSE%
+          GPL-3.0-or-later
+          EOF
+
+          # File list and on-disk file for exact ownership verification.
+          mkdir -p "$pacman_work/root/usr/share/applications"
+          printf '[Desktop Entry]\nName=Example\n' > "$pacman_work/root/usr/share/applications/example-app.desktop"
+          printf '%%FILES%%\nusr/\nusr/share/\nusr/share/applications/\nusr/share/applications/example-app.desktop\n' > "$pacman_work/fixture_db/local/example-app-1.2.3-1/files"
+
+          cat > "$pacman_work/pacman.conf" <<EOF
+          # Offline Pacman fixture config
+          [options]
+          RootDir = $pacman_work/root
+          DBPath = $pacman_work/fixture_db
+
+          [core]
+          Server = file:///nonexistent/should-never-be-read
+          EOF
+
+          /tmp/pacman_discovery_provider_test --fixture \
+            "$pacman_work/root" "$pacman_work/fixture_db" "$pacman_work/pacman.conf"
 
       - name: Run Linux integration tests
         run: bash example/tool/test_linux.sh

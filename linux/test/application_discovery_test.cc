@@ -1,0 +1,5329 @@
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <functional>
+#include <iostream>
+#include <memory>
+#include <mutex>
+#include <queue>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include "discovery/application_discovery_provider.h"
+#include "discovery/application_discovery_service.h"
+#include "discovery/application_identity.h"
+#include "discovery/appstream_metadata.h"
+#include "discovery/appstream_metadata_provider.h"
+#include "discovery/async_discovery_runner.h"
+#include "discovery/discovered_application.h"
+#include "discovery/discovery_resolution.h"
+#include "discovery/dpkg_discovery_provider.h"
+#include "discovery/flatpak_discovery_provider.h"
+#include "discovery/installed_package.h"
+#include "discovery/legacy_list_apps_adapter.h"
+#include "discovery/nix_discovery_provider.h"
+#include "discovery/package_discovery_provider.h"
+#include "discovery/package_ownership.h"
+#include "discovery/package_ownership_indexers.h"
+#include "discovery/pacman_discovery_provider.h"
+#include "discovery/rpm_discovery_provider.h"
+#include "discovery/snap_discovery_provider.h"
+#include "discovery/snapd_socket_backend.h"
+
+namespace {
+
+using flutter_device_apps_linux::ApplicationClassification;
+using flutter_device_apps_linux::ApplicationDiscoveryProvider;
+using flutter_device_apps_linux::ApplicationDiscoveryService;
+using flutter_device_apps_linux::AppStreamBackend;
+using flutter_device_apps_linux::AppStreamBackendResult;
+using flutter_device_apps_linux::AppStreamBundleReference;
+using flutter_device_apps_linux::AppStreamIconReference;
+using flutter_device_apps_linux::AppStreamMetadataOriginKind;
+using flutter_device_apps_linux::AppStreamMetadataProvider;
+using flutter_device_apps_linux::AppStreamMetadataRecord;
+using flutter_device_apps_linux::AppStreamMetadataResult;
+using flutter_device_apps_linux::AppStreamQueryErrorKind;
+using flutter_device_apps_linux::AppStreamReleaseMetadata;
+using flutter_device_apps_linux::AsyncDiscoveryRunner;
+using flutter_device_apps_linux::build_application_id;
+using flutter_device_apps_linux::capability_from_bool;
+using flutter_device_apps_linux::CapabilityState;
+using flutter_device_apps_linux::classify_appstream_component_kind;
+using flutter_device_apps_linux::create_snapd_socket_backend;
+using flutter_device_apps_linux::DesktopMenuVisibility;
+using flutter_device_apps_linux::DiscoveredApplication;
+using flutter_device_apps_linux::DiscoveryExecutionOutcome;
+using flutter_device_apps_linux::DiscoveryExecutionStatus;
+using flutter_device_apps_linux::DiscoveryPassResult;
+using flutter_device_apps_linux::DiscoveryRequestHandle;
+using flutter_device_apps_linux::DiscoveryRequestOptions;
+using flutter_device_apps_linux::DiscoveryResult;
+using flutter_device_apps_linux::DpkgDiscoveryConfig;
+using flutter_device_apps_linux::DpkgDiscoveryProvider;
+using flutter_device_apps_linux::FlatpakBackend;
+using flutter_device_apps_linux::FlatpakBackendQueryResult;
+using flutter_device_apps_linux::FlatpakDiscoveryProvider;
+using flutter_device_apps_linux::FlatpakInstallationQueryResult;
+using flutter_device_apps_linux::FlatpakInstalledAppRecord;
+using flutter_device_apps_linux::InstallationScope;
+using flutter_device_apps_linux::InstallationSource;
+using flutter_device_apps_linux::InstalledPackageRecord;
+using flutter_device_apps_linux::is_valid_legacy_desktop_file_id;
+using flutter_device_apps_linux::kFlatpakRefKindApp;
+using flutter_device_apps_linux::kFlatpakRefKindRuntime;
+using flutter_device_apps_linux::MetadataConflict;
+using flutter_device_apps_linux::NixDiscoveryConfig;
+using flutter_device_apps_linux::NixDiscoveryProvider;
+using flutter_device_apps_linux::NixProfileSpec;
+using flutter_device_apps_linux::OptionalString;
+using flutter_device_apps_linux::PackageDiscoveryProvider;
+using flutter_device_apps_linux::PackageDiscoveryResult;
+using flutter_device_apps_linux::PackageInstallationState;
+using flutter_device_apps_linux::PackageInstallReason;
+using flutter_device_apps_linux::PackageOwnershipEvidence;
+using flutter_device_apps_linux::PackageOwnershipLookup;
+using flutter_device_apps_linux::PackageSelectionState;
+using flutter_device_apps_linux::PacmanBackend;
+using flutter_device_apps_linux::PacmanBackendQueryResult;
+using flutter_device_apps_linux::PacmanDiscoveryProvider;
+using flutter_device_apps_linux::PacmanInstalledPackageRecord;
+using flutter_device_apps_linux::PacmanQueryErrorKind;
+using flutter_device_apps_linux::PacmanResolvedPaths;
+using flutter_device_apps_linux::ProviderExecutionStatus;
+using flutter_device_apps_linux::resolve_discovery_inventory;
+using flutter_device_apps_linux::resolve_pacman_db_paths;
+using flutter_device_apps_linux::ResolvedApplication;
+using flutter_device_apps_linux::ResolvedDiscoveryInventory;
+using flutter_device_apps_linux::RpmBackend;
+using flutter_device_apps_linux::RpmBackendQueryResult;
+using flutter_device_apps_linux::RpmDiscoveryProvider;
+using flutter_device_apps_linux::RpmInstalledPackageRecord;
+using flutter_device_apps_linux::RpmQueryErrorKind;
+using flutter_device_apps_linux::SnapBackend;
+using flutter_device_apps_linux::SnapBackendQueryResult;
+using flutter_device_apps_linux::SnapDiscoveryProvider;
+using flutter_device_apps_linux::SnapdSocketConfig;
+using flutter_device_apps_linux::SnapInstalledRecord;
+using flutter_device_apps_linux::SnapQueryErrorKind;
+
+std::mutex g_failure_mutex;
+int g_failures = 0;
+
+void expect(bool condition, const char* message) {
+  if (!condition) {
+    std::lock_guard<std::mutex> lock(g_failure_mutex);
+    std::cerr << "FAIL: " << message << "\n";
+    ++g_failures;
+  }
+}
+
+class Latch {
+ public:
+  explicit Latch(int count = 1) : remaining_(count) {}
+
+  void count_down() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (remaining_ > 0) {
+      --remaining_;
+      if (remaining_ == 0) {
+        cv_.notify_all();
+      }
+    }
+  }
+
+  void wait() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    cv_.wait(lock, [this]() { return remaining_ == 0; });
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  int remaining_;
+};
+
+// Deterministic single-threaded completion pump standing in for the platform
+// GMainContext during pure C++14 async tests.
+class TestPlatformLoop {
+ public:
+  void post(std::function<void()> callback) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      callbacks_.push(std::move(callback));
+    }
+    cv_.notify_one();
+  }
+
+  void run_one() {
+    std::function<void()> callback;
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      cv_.wait(lock, [this]() { return !callbacks_.empty(); });
+      callback = std::move(callbacks_.front());
+      callbacks_.pop();
+    }
+    if (callback) callback();
+  }
+
+  void run_until(int expected_count) {
+    for (int i = 0; i < expected_count; ++i) {
+      run_one();
+    }
+  }
+
+  void drain_available() {
+    while (true) {
+      std::function<void()> callback;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (callbacks_.empty()) return;
+        callback = std::move(callbacks_.front());
+        callbacks_.pop();
+      }
+      if (callback) callback();
+    }
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::queue<std::function<void()>> callbacks_;
+};
+
+class WorkerPoolFixture {
+ public:
+  ~WorkerPoolFixture() { join_all(); }
+
+  AsyncDiscoveryRunner::WorkScheduler scheduler() {
+    return [this](std::function<void()> work) {
+      ++scheduled_workers_;
+      std::lock_guard<std::mutex> lock(mutex_);
+      threads_.emplace_back(std::move(work));
+    };
+  }
+
+  void join_all() {
+    std::vector<std::thread> to_join;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      to_join.swap(threads_);
+    }
+    for (auto& thread : to_join) {
+      if (thread.joinable()) thread.join();
+    }
+  }
+
+  int scheduled_workers() const { return scheduled_workers_.load(); }
+
+ private:
+  std::mutex mutex_;
+  std::vector<std::thread> threads_;
+  std::atomic<int> scheduled_workers_{0};
+};
+
+class FakeDiscoveryProvider final : public ApplicationDiscoveryProvider {
+ public:
+  FakeDiscoveryProvider(std::string id, bool available, DiscoveryResult result,
+                        int* discover_calls = nullptr,
+                        int* destroyed_count = nullptr)
+      : id_(std::move(id)),
+        available_(available),
+        result_(std::move(result)),
+        discover_calls_(discover_calls),
+        destroyed_count_(destroyed_count) {}
+
+  ~FakeDiscoveryProvider() override {
+    if (destroyed_count_ != nullptr) {
+      ++(*destroyed_count_);
+    }
+  }
+
+  const char* id() const override { return id_.c_str(); }
+
+  bool is_available() const override { return available_; }
+
+  DiscoveryResult discover() override {
+    if (discover_calls_ != nullptr) {
+      ++(*discover_calls_);
+    }
+    return result_;
+  }
+
+ private:
+  std::string id_;
+  bool available_;
+  DiscoveryResult result_;
+  int* discover_calls_;
+  int* destroyed_count_;
+};
+
+class ControlledDiscoveryProvider final : public ApplicationDiscoveryProvider {
+ public:
+  ControlledDiscoveryProvider(std::string id,
+                              std::function<DiscoveryResult()> on_discover,
+                              std::atomic<int>* destroyed_count = nullptr)
+      : id_(std::move(id)),
+        on_discover_(std::move(on_discover)),
+        destroyed_count_(destroyed_count) {}
+
+  ~ControlledDiscoveryProvider() override {
+    if (destroyed_count_ != nullptr) {
+      destroyed_count_->fetch_add(1);
+    }
+  }
+
+  const char* id() const override { return id_.c_str(); }
+
+  bool is_available() const override { return true; }
+
+  DiscoveryResult discover() override { return on_discover_(); }
+
+ private:
+  std::string id_;
+  std::function<DiscoveryResult()> on_discover_;
+  std::atomic<int>* destroyed_count_;
+};
+
+DiscoveredApplication make_gio_app(
+    const char* desktop_id, const char* name, bool supports_files,
+    bool supports_uris, bool requires_terminal,
+    DesktopMenuVisibility visibility = DesktopMenuVisibility::kVisible) {
+  DiscoveredApplication app;
+  app.provenance.provider_id = "gio";
+  app.provenance.native_id = desktop_id;
+  app.provenance.installation_source = InstallationSource::kUnknown;
+  app.provenance.installation_scope = InstallationScope::kUnknown;
+  app.application_id = build_application_id(
+      app.provenance.provider_id, app.provenance.native_id,
+      app.provenance.installation_scope, app.installation_id);
+  app.desktop_file_id = OptionalString::of(desktop_id);
+  app.desktop_menu_visibility = visibility;
+  if (name != nullptr) {
+    app.metadata.name = OptionalString::of(name);
+  }
+  app.capabilities.supports_files = capability_from_bool(supports_files);
+  app.capabilities.supports_uris = capability_from_bool(supports_uris);
+  app.capabilities.requires_terminal = capability_from_bool(requires_terminal);
+  return app;
+}
+
+DiscoveredApplication make_non_desktop_app(
+    const std::string& provider_id, const std::string& native_id,
+    InstallationSource source, InstallationScope scope,
+    const OptionalString& installation_id = OptionalString::none()) {
+  DiscoveredApplication app;
+  app.provenance.provider_id = provider_id;
+  app.provenance.native_id = native_id;
+  app.provenance.installation_source = source;
+  app.provenance.installation_scope = scope;
+  app.installation_id = installation_id;
+  app.application_id =
+      build_application_id(provider_id, native_id, scope, installation_id);
+  return app;
+}
+
+// --- Unified model and visibility tests ---
+
+void test_unified_model_defaults_are_unknown_and_missing() {
+  DiscoveredApplication app;
+  expect(!app.desktop_file_id.has_value(),
+         "desktop_file_id should default to missing");
+  expect(!app.package_id.has_value(), "package_id should default to missing");
+  expect(!app.installation_id.has_value(),
+         "installation_id should default to missing");
+  expect(!app.metadata.name.has_value(), "name should default to missing");
+  expect(!app.metadata.version.has_value(),
+         "version should default to missing");
+  expect(!app.metadata.description.has_value(),
+         "description should default to missing");
+  expect(!app.metadata.executable.has_value(),
+         "executable should default to missing");
+  expect(!app.metadata.homepage.has_value(),
+         "homepage should default to missing");
+  expect(!app.metadata.license.has_value(),
+         "license should default to missing");
+  expect(!app.metadata.icon_reference.has_value(),
+         "icon_reference should default to missing");
+  expect(!app.metadata.architecture.has_value(),
+         "architecture should default to missing");
+
+  expect(app.capabilities.supports_files == CapabilityState::kUnknown,
+         "supports_files should default to kUnknown");
+  expect(app.capabilities.supports_uris == CapabilityState::kUnknown,
+         "supports_uris should default to kUnknown");
+  expect(app.capabilities.requires_terminal == CapabilityState::kUnknown,
+         "requires_terminal should default to kUnknown");
+  expect(app.capabilities.launchable == CapabilityState::kUnknown,
+         "launchable should default to kUnknown");
+
+  expect(app.provenance.installation_source == InstallationSource::kUnknown,
+         "installation_source should default to kUnknown");
+  expect(app.provenance.installation_scope == InstallationScope::kUnknown,
+         "installation_scope should default to kUnknown");
+  expect(app.classification == ApplicationClassification::kUnknown,
+         "classification should default to kUnknown");
+  expect(app.desktop_menu_visibility == DesktopMenuVisibility::kUnknown,
+         "desktop_menu_visibility should default to kUnknown");
+}
+
+void test_visibility_states_remain_independent_from_source_and_classification() {
+  DiscoveredApplication visible = make_gio_app(
+      "org.example.Visible.desktop", "Visible", true, false, false,
+      DesktopMenuVisibility::kVisible);
+  DiscoveredApplication not_visible = make_gio_app(
+      "org.example.NoDisplay.desktop", "NoDisplay", false, true, true,
+      DesktopMenuVisibility::kNotVisible);
+  DiscoveredApplication unknown_vis = make_non_desktop_app(
+      "dpkg", "ripgrep:amd64", InstallationSource::kDpkg,
+      InstallationScope::kSystem);
+
+  expect(visible.desktop_menu_visibility == DesktopMenuVisibility::kVisible,
+         "visible record should store kVisible");
+  expect(not_visible.desktop_menu_visibility ==
+             DesktopMenuVisibility::kNotVisible,
+         "non-visible record should store kNotVisible");
+  expect(unknown_vis.desktop_menu_visibility == DesktopMenuVisibility::kUnknown,
+         "non-desktop record should leave visibility kUnknown");
+
+  expect(not_visible.application_id == "gio:org.example.NoDisplay.desktop",
+         "non-visible record should preserve source-aware identity");
+  expect(not_visible.provenance.installation_source ==
+             InstallationSource::kUnknown,
+         "visibility must not imply installation source");
+  expect(not_visible.classification == ApplicationClassification::kUnknown,
+         "visibility must not imply application classification");
+  expect(visible.classification == ApplicationClassification::kUnknown,
+         "visible desktop entry must not assume classification without policy");
+  expect(not_visible.capabilities.launchable == CapabilityState::kUnknown,
+         "visibility must not be conflated with launchability");
+}
+
+void test_unified_model_distinguishes_empty_vs_missing_and_false_vs_unknown() {
+  DiscoveredApplication app = make_non_desktop_app(
+      "dpkg", "ripgrep:amd64", InstallationSource::kDpkg,
+      InstallationScope::kSystem);
+  app.package_id = OptionalString::of("ripgrep:amd64");
+  app.metadata.name = OptionalString::of("");
+  app.metadata.version = OptionalString::none();
+  app.capabilities.supports_files = CapabilityState::kUnsupported;
+  app.capabilities.supports_uris = CapabilityState::kUnknown;
+  app.capabilities.requires_terminal = CapabilityState::kSupported;
+
+  expect(!app.desktop_file_id.has_value(),
+         "non-desktop application must not fabricate desktop_file_id");
+  expect(app.metadata.name.has_value() && app.metadata.name.value().empty(),
+         "empty metadata value must stay distinct from missing");
+  expect(!app.metadata.version.has_value(),
+         "missing metadata value must have has_value() == false");
+  expect(app.metadata.name != app.metadata.version,
+         "OptionalString::of(\"\") must not equal OptionalString::none()");
+  expect(app.capabilities.supports_files != app.capabilities.supports_uris,
+         "kUnsupported must not equal kUnknown");
+}
+
+// --- Identity contract tests ---
+
+void test_identity_contract_and_collision_resistance() {
+  DiscoveredApplication english = make_gio_app(
+      "org.example.Editor.desktop", "Editor", true, false, false);
+  DiscoveredApplication turkish = make_gio_app(
+      "org.example.Editor.desktop", "Metin Duzenleyici", true, false, false);
+  expect(english.application_id == "gio:org.example.Editor.desktop",
+         "GIO application ID should use provider:native encoding");
+  expect(english.application_id == turkish.application_id,
+         "application_id must not depend on localized display name");
+
+  expect(build_application_id("flatpak", "org.example.Editor") !=
+             build_application_id("appstream", "org.example.Editor"),
+         "same native ID from different providers must stay distinct");
+  expect(build_application_id("flatpak", "org.example.Editor",
+                              InstallationScope::kSystem) !=
+             build_application_id("flatpak", "org.example.Editor",
+                                  InstallationScope::kUser),
+         "system and user scopes must produce distinct identities");
+  expect(build_application_id("flatpak", "org.example.Editor",
+                              InstallationScope::kUser) !=
+             build_application_id("flatpak", "org.example.Editor",
+                                  InstallationScope::kUser,
+                                  OptionalString::of("")),
+         "missing installation_id must not collide with empty installation_id");
+
+  expect(build_application_id("a:b", "c") != build_application_id("a", "b:c"),
+         "colon in provider_id vs native_id must not collide");
+  expect(build_application_id("a:b", "c") !=
+             build_application_id("a%3Ab", "c"),
+         "literal %3A must be escaped so it cannot collide with encoded colon");
+  expect(build_application_id("p", "n:user") !=
+             build_application_id("p", "n", InstallationScope::kUser),
+         "colon suffix in native_id must not collide with installation scope");
+  expect(build_application_id("p", std::string("a\0b", 3)) !=
+             build_application_id("p", "a%00b"),
+         "embedded NUL byte must encode without collision");
+}
+
+// --- Legacy adapter tests ---
+
+void test_legacy_desktop_file_id_validation() {
+  expect(is_valid_legacy_desktop_file_id(
+             OptionalString::of("org.example.Editor.desktop")),
+         "standard desktop file ID should be valid");
+  expect(!is_valid_legacy_desktop_file_id(OptionalString::none()),
+         "missing desktop file ID must be rejected");
+  expect(!is_valid_legacy_desktop_file_id(OptionalString::of("")),
+         "empty desktop file ID must be rejected");
+  expect(!is_valid_legacy_desktop_file_id(OptionalString::of(".desktop")),
+         "bare .desktop suffix must be rejected");
+  expect(!is_valid_legacy_desktop_file_id(OptionalString::of("org.example.App")),
+         "ID without .desktop suffix must be rejected");
+  expect(!is_valid_legacy_desktop_file_id(
+             OptionalString::of("sub/org.example.App.desktop")),
+         "ID containing slash must be rejected");
+  expect(!is_valid_legacy_desktop_file_id(
+             OptionalString::of(std::string("bad\0id.desktop", 14))),
+         "ID containing NUL byte must be rejected");
+}
+
+void test_legacy_adapter_enforces_gio_visibility_and_preserves_order() {
+  std::vector<DiscoveredApplication> unified;
+
+  // 1. Visible GIO entry -> INCLUDED.
+  unified.push_back(make_gio_app("org.example.First.desktop", "First", true,
+                                 false, true, DesktopMenuVisibility::kVisible));
+
+  // 2. Non-visible GIO entry (NoDisplay / OnlyShowIn / NotShowIn) -> EXCLUDED.
+  unified.push_back(make_gio_app("org.example.NoDisplay.desktop", "Hidden",
+                                 true, true, false,
+                                 DesktopMenuVisibility::kNotVisible));
+
+  // 3. Unknown visibility GIO entry -> EXCLUDED (never treated as visible).
+  unified.push_back(make_gio_app("org.example.UnknownVis.desktop", "UnknownVis",
+                                 false, false, false,
+                                 DesktopMenuVisibility::kUnknown));
+
+  // 4. Non-GIO provider record WITH valid desktop_file_id and kVisible ->
+  // EXCLUDED so future providers cannot accidentally alter legacy listApps().
+  DiscoveredApplication flatpak_visible = make_non_desktop_app(
+      "flatpak", "org.example.FlatpakApp", InstallationSource::kFlatpak,
+      InstallationScope::kUser);
+  flatpak_visible.desktop_file_id =
+      OptionalString::of("org.example.FlatpakApp.desktop");
+  flatpak_visible.desktop_menu_visibility = DesktopMenuVisibility::kVisible;
+  flatpak_visible.metadata.name = OptionalString::of("Flatpak App");
+  unified.push_back(std::move(flatpak_visible));
+
+  // 5. Non-desktop record -> EXCLUDED.
+  unified.push_back(make_non_desktop_app("dpkg", "curl:amd64",
+                                         InstallationSource::kDpkg,
+                                         InstallationScope::kSystem));
+
+  // 6. Visible GIO entry with missing app_name (null in legacy map) and
+  // unknown capability state -> INCLUDED with null app_name and false bool.
+  DiscoveredApplication unnamed = make_gio_app(
+      "org.example.Unnamed.desktop", nullptr, false, true, false,
+      DesktopMenuVisibility::kVisible);
+  unnamed.capabilities.supports_files = CapabilityState::kUnknown;
+  unified.push_back(std::move(unnamed));
+
+  // 7. Visible GIO entry with explicitly empty app_name -> INCLUDED.
+  unified.push_back(make_gio_app("org.example.EmptyName.desktop", "", false,
+                                 false, false,
+                                 DesktopMenuVisibility::kVisible));
+
+  // 8. Visible GIO entry with invalid desktop ID -> EXCLUDED.
+  DiscoveredApplication invalid_id = make_gio_app(
+      "org.example.Valid.desktop", "Bad", false, false, false,
+      DesktopMenuVisibility::kVisible);
+  invalid_id.desktop_file_id = OptionalString::of("/usr/share/bad.desktop");
+  unified.push_back(std::move(invalid_id));
+
+  const auto legacy =
+      flutter_device_apps_linux::adapt_for_legacy_list_apps(unified);
+  expect(legacy.size() == 3,
+         "legacy adapter must include only visible, valid GIO records");
+  if (legacy.size() == 3) {
+    expect(legacy[0].desktop_file_id == "org.example.First.desktop",
+           "first legacy record order should be preserved");
+    expect(legacy[0].app_name.has_value() &&
+               legacy[0].app_name.value() == "First",
+           "first app_name should be preserved");
+    expect(legacy[0].supports_files && !legacy[0].supports_uris &&
+               legacy[0].requires_terminal,
+           "first capability booleans should match");
+
+    expect(legacy[1].desktop_file_id == "org.example.Unnamed.desktop",
+           "second legacy record order should be preserved");
+    expect(!legacy[1].app_name.has_value(),
+           "missing app_name must stay unset");
+    expect(!legacy[1].supports_files && legacy[1].supports_uris &&
+               !legacy[1].requires_terminal,
+           "unknown capability should map to false while known true stays true");
+
+    expect(legacy[2].desktop_file_id == "org.example.EmptyName.desktop",
+           "third legacy record order should be preserved");
+    expect(legacy[2].app_name.has_value() && legacy[2].app_name.value().empty(),
+           "empty app_name must stay present as empty string");
+  }
+}
+
+// --- Coordinator and error distinction tests ---
+
+void test_coordinator_report_distinguishes_success_unavailable_and_failure() {
+  DiscoveryResult failing;
+  failing.ok = false;
+  failing.error_message = "db locked";
+  failing.applications.push_back(make_non_desktop_app(
+      "rpm", "partial", InstallationSource::kRpm, InstallationScope::kSystem));
+
+  ApplicationDiscoveryService service;
+  service.register_provider(nullptr);
+  service.register_provider(
+      std::make_unique<FakeDiscoveryProvider>("gio", true, DiscoveryResult{}));
+  service.register_provider(std::make_unique<FakeDiscoveryProvider>(
+      "snap", false, DiscoveryResult{}));
+  service.register_provider(std::make_unique<FakeDiscoveryProvider>(
+      "rpm", true, std::move(failing)));
+
+  const DiscoveryPassResult report = service.discover_with_report();
+  expect(report.applications.empty(),
+         "failed provider partial payload must not leak into results");
+  expect(report.provider_summaries.size() == 3,
+         "all registered providers should be summarized");
+  if (report.provider_summaries.size() == 3) {
+    expect(report.provider_summaries[0].provider_id == "gio" &&
+               report.provider_summaries[0].status ==
+                   ProviderExecutionStatus::kSucceeded &&
+               report.provider_summaries[0].discovered_count == 0,
+           "empty healthy provider should report kSucceeded with count 0");
+    expect(report.provider_summaries[1].provider_id == "snap" &&
+               report.provider_summaries[1].status ==
+                   ProviderExecutionStatus::kUnavailable,
+           "unavailable provider should report kUnavailable");
+    expect(report.provider_summaries[2].provider_id == "rpm" &&
+               report.provider_summaries[2].status ==
+                   ProviderExecutionStatus::kFailed &&
+               report.provider_summaries[2].error_message == "db locked",
+           "failed provider should report kFailed with error_message");
+  }
+}
+
+// --- Asynchronous execution, concurrency, and lifecycle tests ---
+
+void test_async_completion_context_empty_and_provider_failures() {
+  auto service = std::make_shared<ApplicationDiscoveryService>();
+  service->register_provider(
+      std::make_unique<FakeDiscoveryProvider>("gio", true, DiscoveryResult{}));
+  DiscoveryResult failed;
+  failed.ok = false;
+  failed.error_message = "simulated failure";
+  service->register_provider(std::make_unique<FakeDiscoveryProvider>(
+      "flatpak", true, std::move(failed)));
+
+  TestPlatformLoop loop;
+  WorkerPoolFixture pool;
+  const std::thread::id platform_thread = std::this_thread::get_id();
+  std::thread::id completion_thread;
+  int callback_count = 0;
+  DiscoveryExecutionOutcome received;
+
+  AsyncDiscoveryRunner runner(
+      service, pool.scheduler(),
+      [&loop](std::function<void()> cb) { loop.post(std::move(cb)); });
+
+  runner.discover_async([&](DiscoveryExecutionOutcome outcome) {
+    completion_thread = std::this_thread::get_id();
+    ++callback_count;
+    received = std::move(outcome);
+  });
+
+  loop.run_one();
+  pool.join_all();
+
+  expect(callback_count == 1, "completion callback must run exactly once");
+  expect(completion_thread == platform_thread,
+         "completion must execute on the platform thread");
+  expect(received.status == DiscoveryExecutionStatus::kCompleted,
+         "discovery pass with empty + isolated failure should complete");
+  expect(received.applications.empty(), "applications should be empty");
+  expect(received.provider_summaries.size() == 2 &&
+             received.provider_summaries[1].status ==
+                 ProviderExecutionStatus::kFailed,
+         "provider failure summary should be preserved");
+}
+
+void test_async_worker_exception_produces_execution_error() {
+  auto service = std::make_shared<ApplicationDiscoveryService>();
+  service->register_provider(std::make_unique<ControlledDiscoveryProvider>(
+      "throwing",
+      []() -> DiscoveryResult { throw std::runtime_error("boom"); }));
+
+  TestPlatformLoop loop;
+  WorkerPoolFixture pool;
+  DiscoveryExecutionOutcome received;
+
+  AsyncDiscoveryRunner runner(
+      service, pool.scheduler(),
+      [&loop](std::function<void()> cb) { loop.post(std::move(cb)); });
+
+  runner.discover_async([&](DiscoveryExecutionOutcome outcome) {
+    received = std::move(outcome);
+  });
+
+  loop.run_one();
+  pool.join_all();
+
+  expect(received.status == DiscoveryExecutionStatus::kExecutionError,
+         "unexpected worker exception should report kExecutionError");
+  expect(!received.error_message.empty(),
+         "execution error should populate internal error_message");
+}
+
+void test_async_serializes_overlapping_requests_and_keeps_platform_responsive() {
+  Latch first_started(1);
+  Latch release_first(1);
+  std::atomic<int> in_flight{0};
+  std::atomic<int> max_in_flight{0};
+  std::atomic<int> call_index{0};
+
+  auto service = std::make_shared<ApplicationDiscoveryService>();
+  service->register_provider(std::make_unique<ControlledDiscoveryProvider>(
+      "gio", [&]() {
+        const int current = in_flight.fetch_add(1) + 1;
+        int prev_max = max_in_flight.load();
+        while (current > prev_max &&
+               !max_in_flight.compare_exchange_weak(prev_max, current)) {
+        }
+
+        const int invocation = call_index.fetch_add(1) + 1;
+        if (invocation == 1) {
+          first_started.count_down();
+          release_first.wait();
+        }
+
+        DiscoveryResult result;
+        const std::string id =
+            "org.example.Pass" + std::to_string(invocation) + ".desktop";
+        result.applications.push_back(
+            make_gio_app(id.c_str(), "Pass", true, false, false));
+        in_flight.fetch_sub(1);
+        return result;
+      }));
+
+  TestPlatformLoop loop;
+  WorkerPoolFixture pool;
+  AsyncDiscoveryRunner runner(
+      service, pool.scheduler(),
+      [&loop](std::function<void()> cb) { loop.post(std::move(cb)); });
+
+  std::vector<int> completion_order;
+  std::vector<std::string> app_ids;
+
+  // Submit first (slow) request; platform thread returns immediately.
+  runner.discover_async([&](DiscoveryExecutionOutcome outcome) {
+    expect(outcome.status == DiscoveryExecutionStatus::kCompleted,
+           "request 1 should complete");
+    completion_order.push_back(1);
+    if (!outcome.applications.empty()) {
+      app_ids.push_back(outcome.applications.front().desktop_file_id.value());
+    }
+  });
+
+  // Wait deterministically until worker is actively blocked inside request 1.
+  first_started.wait();
+
+  // Platform thread remains responsive while request 1 is blocked and can
+  // enqueue additional overlapping requests without blocking or spawning extra
+  // workers.
+  runner.discover_async([&](DiscoveryExecutionOutcome outcome) {
+    expect(outcome.status == DiscoveryExecutionStatus::kCompleted,
+           "request 2 should complete");
+    completion_order.push_back(2);
+    if (!outcome.applications.empty()) {
+      app_ids.push_back(outcome.applications.front().desktop_file_id.value());
+    }
+  });
+  runner.discover_async([&](DiscoveryExecutionOutcome outcome) {
+    expect(outcome.status == DiscoveryExecutionStatus::kCompleted,
+           "request 3 should complete");
+    completion_order.push_back(3);
+    if (!outcome.applications.empty()) {
+      app_ids.push_back(outcome.applications.front().desktop_file_id.value());
+    }
+  });
+
+  expect(pool.scheduled_workers() == 1,
+         "overlapping requests must reuse a single active worker");
+
+  // Unblock the slow provider and pump all 3 completions on the platform loop.
+  release_first.count_down();
+  loop.run_until(3);
+  pool.join_all();
+
+  expect(max_in_flight.load() == 1,
+         "provider must never be accessed concurrently");
+  expect(call_index.load() == 3, "all 3 requests must execute without drops");
+  expect(completion_order.size() == 3 && completion_order[0] == 1 &&
+             completion_order[1] == 2 && completion_order[2] == 3,
+         "overlapping requests must complete in FIFO order");
+  expect(app_ids.size() == 3 &&
+             app_ids[0] == "org.example.Pass1.desktop" &&
+             app_ids[1] == "org.example.Pass2.desktop" &&
+             app_ids[2] == "org.example.Pass3.desktop",
+         "each request must receive its own discovery pass results");
+}
+
+void test_async_cancellation_for_queued_and_in_flight_requests() {
+  Latch first_started(1);
+  Latch release_first(1);
+  std::atomic<int> provider_calls{0};
+
+  auto service = std::make_shared<ApplicationDiscoveryService>();
+  service->register_provider(std::make_unique<ControlledDiscoveryProvider>(
+      "gio", [&]() {
+        const int n = provider_calls.fetch_add(1) + 1;
+        if (n == 1) {
+          first_started.count_down();
+          release_first.wait();
+        }
+        DiscoveryResult result;
+        result.applications.push_back(make_gio_app(
+            "org.example.App.desktop", "App", false, false, false));
+        return result;
+      }));
+
+  TestPlatformLoop loop;
+  WorkerPoolFixture pool;
+  AsyncDiscoveryRunner runner(
+      service, pool.scheduler(),
+      [&loop](std::function<void()> cb) { loop.post(std::move(cb)); });
+
+  DiscoveryExecutionStatus first_status = DiscoveryExecutionStatus::kCompleted;
+  DiscoveryExecutionStatus second_status = DiscoveryExecutionStatus::kCompleted;
+  DiscoveryExecutionStatus third_status = DiscoveryExecutionStatus::kCancelled;
+
+  DiscoveryRequestHandle first_handle =
+      runner.discover_async([&](DiscoveryExecutionOutcome outcome) {
+        first_status = outcome.status;
+      });
+  first_started.wait();
+
+  DiscoveryRequestHandle second_handle =
+      runner.discover_async([&](DiscoveryExecutionOutcome outcome) {
+        second_status = outcome.status;
+      });
+  runner.discover_async([&](DiscoveryExecutionOutcome outcome) {
+    third_status = outcome.status;
+  });
+
+  // Cancel both the in-flight request (1) and the queued request (2).
+  first_handle.cancel();
+  second_handle.cancel();
+
+  release_first.count_down();
+  loop.run_until(3);
+  pool.join_all();
+
+  expect(first_status == DiscoveryExecutionStatus::kCancelled,
+         "cancelled in-flight request should finish as kCancelled");
+  expect(second_status == DiscoveryExecutionStatus::kCancelled,
+         "cancelled queued request should finish as kCancelled");
+  expect(third_status == DiscoveryExecutionStatus::kCompleted,
+         "subsequent non-cancelled request should still complete");
+  expect(provider_calls.load() == 2,
+         "cancelled queued request must not invoke provider discover()");
+}
+
+void test_teardown_while_discovery_pending_is_non_blocking_and_safe() {
+  Latch slow_started(1);
+  Latch release_slow(1);
+  std::atomic<int> provider_destroyed{0};
+  std::atomic<int> first_completions{0};
+  std::atomic<int> second_completions{0};
+  DiscoveryExecutionStatus first_status = DiscoveryExecutionStatus::kCompleted;
+  DiscoveryExecutionStatus second_status = DiscoveryExecutionStatus::kCompleted;
+
+  TestPlatformLoop loop;
+  WorkerPoolFixture pool;
+
+  {
+    auto service = std::make_shared<ApplicationDiscoveryService>();
+    service->register_provider(std::make_unique<ControlledDiscoveryProvider>(
+        "gio",
+        [&]() {
+          slow_started.count_down();
+          release_slow.wait();
+          DiscoveryResult result;
+          result.applications.push_back(make_gio_app(
+              "org.example.Slow.desktop", "Slow", true, false, false));
+          return result;
+        },
+        &provider_destroyed));
+
+    auto runner = std::make_unique<AsyncDiscoveryRunner>(
+        service, pool.scheduler(),
+        [&loop](std::function<void()> cb) { loop.post(std::move(cb)); });
+
+    // Drop local service ref so only runner/worker keep it alive.
+    service.reset();
+
+    runner->discover_async([&](DiscoveryExecutionOutcome outcome) {
+      first_completions.fetch_add(1);
+      first_status = outcome.status;
+    });
+    slow_started.wait();
+
+    runner->discover_async([&](DiscoveryExecutionOutcome outcome) {
+      second_completions.fetch_add(1);
+      second_status = outcome.status;
+    });
+
+    // Simulate plugin teardown while request 1 is still blocked on worker and
+    // request 2 is queued. Destroying runner calls shutdown() and must NOT
+    // block waiting for release_slow!
+    runner.reset();
+
+    expect(second_completions.load() == 1 &&
+               second_status == DiscoveryExecutionStatus::kCancelled,
+           "queued request must be cancelled immediately during teardown");
+    expect(provider_destroyed.load() == 0,
+           "provider and service must stay alive while slow worker is running");
+    expect(first_completions.load() == 0,
+           "in-flight request has not finished yet");
+
+    // Now allow the slow worker to exit.
+    release_slow.count_down();
+  }
+
+  pool.join_all();
+  loop.drain_available();
+
+  expect(first_completions.load() == 1 &&
+             first_status == DiscoveryExecutionStatus::kCancelled,
+         "in-flight request during teardown must deliver kCancelled once");
+  expect(provider_destroyed.load() == 1,
+         "service and provider must be deterministically destroyed once worker "
+         "and completion finish");
+}
+
+void test_teardown_with_stopped_platform_loop_releases_pending_calls() {
+  struct PlatformOnlyCall {
+    std::thread::id owner_thread;
+    int* released_count;
+    bool* wrong_thread_release;
+
+    ~PlatformOnlyCall() {
+      if (std::this_thread::get_id() != owner_thread) {
+        *wrong_thread_release = true;
+      }
+      ++(*released_count);
+    }
+  };
+
+  struct PlatformCallTable {
+    bool torn_down = false;
+    uint64_t next_id = 0;
+    std::unordered_map<uint64_t, std::unique_ptr<PlatformOnlyCall>> calls;
+
+    uint64_t add(std::unique_ptr<PlatformOnlyCall> call) {
+      const uint64_t id = ++next_id;
+      calls.emplace(id, std::move(call));
+      return id;
+    }
+
+    std::unique_ptr<PlatformOnlyCall> take(uint64_t id) {
+      if (torn_down) return nullptr;
+      const auto it = calls.find(id);
+      if (it == calls.end()) return nullptr;
+      auto call = std::move(it->second);
+      calls.erase(it);
+      return call;
+    }
+
+    void teardown() {
+      torn_down = true;
+      calls.clear();
+    }
+  };
+
+  const std::thread::id platform_thread = std::this_thread::get_id();
+  int released_calls = 0;
+  bool wrong_thread_release = false;
+  std::atomic<int> responses{0};
+  Latch slow_started(1);
+  Latch release_slow(1);
+
+  std::mutex stopped_loop_mutex;
+  std::vector<std::function<void()>> undelivered_callbacks;
+  WorkerPoolFixture pool;
+
+  {
+    auto service = std::make_shared<ApplicationDiscoveryService>();
+    service->register_provider(std::make_unique<ControlledDiscoveryProvider>(
+        "gio", [&]() {
+          slow_started.count_down();
+          release_slow.wait();
+          DiscoveryResult result;
+          result.applications.push_back(make_gio_app(
+              "org.example.Slow.desktop", "Slow", true, false, false));
+          return result;
+        }));
+
+    auto table = std::make_shared<PlatformCallTable>();
+    AsyncDiscoveryRunner runner(
+        service, pool.scheduler(), [&](std::function<void()> cb) {
+          // Simulate a stopped main loop: callbacks are enqueued but never
+          // dispatched before teardown/destruction.
+          std::lock_guard<std::mutex> lock(stopped_loop_mutex);
+          undelivered_callbacks.push_back(std::move(cb));
+        });
+
+    const uint64_t first_id = table->add(std::unique_ptr<PlatformOnlyCall>(
+        new PlatformOnlyCall{platform_thread, &released_calls,
+                             &wrong_thread_release}));
+    std::weak_ptr<PlatformCallTable> weak_table(table);
+    runner.discover_async([first_id, weak_table, &responses](
+                              DiscoveryExecutionOutcome) {
+      auto locked = weak_table.lock();
+      if (locked == nullptr) return;
+      auto call = locked->take(first_id);
+      if (call != nullptr) responses.fetch_add(1);
+    });
+    slow_started.wait();
+
+    const uint64_t second_id = table->add(std::unique_ptr<PlatformOnlyCall>(
+        new PlatformOnlyCall{platform_thread, &released_calls,
+                             &wrong_thread_release}));
+    runner.discover_async([second_id, weak_table, &responses](
+                              DiscoveryExecutionOutcome) {
+      auto locked = weak_table.lock();
+      if (locked == nullptr) return;
+      auto call = locked->take(second_id);
+      if (call != nullptr) responses.fetch_add(1);
+    });
+
+    // Teardown on platform thread while slow worker is still running and main
+    // loop will never pump again.
+    table->teardown();
+    runner.shutdown();
+    table.reset();
+
+    expect(released_calls == 2,
+           "all pending calls (in-flight and queued) must release immediately "
+           "on platform thread during teardown");
+    expect(!wrong_thread_release,
+           "platform call handles must never release on a worker thread");
+
+    release_slow.count_down();
+  }
+
+  pool.join_all();
+  // Destroy un-dispatched callbacks on a background thread to simulate
+  // GMainContext finalization from a worker thread after main loop stop.
+  std::thread cleanup([&]() {
+    std::lock_guard<std::mutex> lock(stopped_loop_mutex);
+    undelivered_callbacks.clear();
+  });
+  cleanup.join();
+
+  expect(responses.load() == 0,
+         "no response must be sent after teardown with stopped loop");
+  expect(!wrong_thread_release,
+         "destroying undelivered callbacks on another thread must not touch "
+         "platform call handles");
+}
+
+void test_concurrent_registration_and_discovery_on_service() {
+  ApplicationDiscoveryService service;
+  service.register_provider(std::make_unique<FakeDiscoveryProvider>(
+      "gio", true, DiscoveryResult{}));
+
+  std::thread reader([&]() {
+    for (int i = 0; i < 20; ++i) {
+      (void)service.discover_applications();
+    }
+  });
+  std::thread writer([&]() {
+    for (int i = 0; i < 5; ++i) {
+      service.register_provider(std::make_unique<FakeDiscoveryProvider>(
+          "extra", true, DiscoveryResult{}));
+    }
+  });
+
+  reader.join();
+  writer.join();
+  expect(service.provider_count() == 6,
+         "concurrent registration and discovery must not race");
+}
+
+// --- FlatpakDiscoveryProvider tests ---
+
+class FakeFlatpakBackend final : public FlatpakBackend {
+ public:
+  FakeFlatpakBackend(bool available, FlatpakBackendQueryResult result,
+                     int* list_calls = nullptr, int* destroyed_count = nullptr,
+                     std::string availability_err = "")
+      : available_(available),
+        result_(std::move(result)),
+        list_calls_(list_calls),
+        destroyed_count_(destroyed_count),
+        availability_error_(std::move(availability_err)) {}
+
+  ~FakeFlatpakBackend() override {
+    if (destroyed_count_ != nullptr) {
+      ++(*destroyed_count_);
+    }
+  }
+
+  bool is_available() const override { return available_; }
+
+  std::string availability_error() const override {
+    return availability_error_;
+  }
+
+  FlatpakBackendQueryResult list_installed_apps() override {
+    if (list_calls_ != nullptr) {
+      ++(*list_calls_);
+    }
+    return result_;
+  }
+
+ private:
+  bool available_;
+  FlatpakBackendQueryResult result_;
+  int* list_calls_;
+  int* destroyed_count_;
+  std::string availability_error_;
+};
+
+FlatpakInstalledAppRecord make_flatpak_ref(
+    const std::string& app_id, const std::string& branch,
+    const std::string& arch, int kind = kFlatpakRefKindApp,
+    const OptionalString& name = OptionalString::none(),
+    const OptionalString& version = OptionalString::none(),
+    const OptionalString& summary = OptionalString::none()) {
+  FlatpakInstalledAppRecord ref;
+  ref.app_id = app_id;
+  ref.branch = branch;
+  ref.arch = arch;
+  ref.ref_kind = kind;
+  ref.name = name;
+  ref.version = version;
+  ref.summary = summary;
+  return ref;
+}
+
+void test_flatpak_missing_backend_or_library_is_unavailable() {
+  FlatpakDiscoveryProvider null_provider(nullptr);
+  expect(std::string(null_provider.id()) == "flatpak",
+         "FlatpakDiscoveryProvider id() must be flatpak");
+  expect(!null_provider.is_available(),
+         "null backend must report unavailable");
+  const DiscoveryResult null_result = null_provider.discover();
+  expect(!null_result.ok, "discover() on unavailable backend must not succeed");
+
+  FlatpakDiscoveryProvider diag_provider(std::make_unique<FakeFlatpakBackend>(
+      false, FlatpakBackendQueryResult{}, nullptr, nullptr,
+      "failed to load libflatpak.so.0: cannot open shared object file"));
+  const DiscoveryResult diag_result = diag_provider.discover();
+  expect(!diag_result.ok &&
+             diag_result.error_message.find("failed to load libflatpak.so.0") !=
+                 std::string::npos,
+         "provider must surface backend availability_error() diagnostics");
+
+  int list_calls = 0;
+  ApplicationDiscoveryService service;
+  service.register_provider(std::make_unique<FlatpakDiscoveryProvider>(
+      std::make_unique<FakeFlatpakBackend>(false, FlatpakBackendQueryResult{},
+                                           &list_calls)));
+  const DiscoveryPassResult pass = service.discover_with_report();
+  expect(list_calls == 0,
+         "service must not invoke list_installed_apps() when libflatpak missing");
+  expect(pass.applications.empty(), "unavailable flatpak yields no apps");
+  expect(pass.provider_summaries.size() == 1 &&
+             pass.provider_summaries[0].provider_id == "flatpak" &&
+             pass.provider_summaries[0].status ==
+                 ProviderExecutionStatus::kUnavailable,
+         "missing libflatpak must report kUnavailable");
+}
+
+void test_flatpak_empty_installations() {
+  FlatpakBackendQueryResult query;
+  FlatpakInstallationQueryResult user;
+  user.installation_id = "user";
+  user.is_user = true;
+  FlatpakInstallationQueryResult sys;
+  sys.installation_id = "default";
+  sys.is_user = false;
+  query.installations.push_back(std::move(user));
+  query.installations.push_back(std::move(sys));
+
+  ApplicationDiscoveryService service;
+  service.register_provider(std::make_unique<FlatpakDiscoveryProvider>(
+      std::make_unique<FakeFlatpakBackend>(true, std::move(query))));
+
+  const DiscoveryPassResult pass = service.discover_with_report();
+  expect(pass.applications.empty(),
+         "empty Flatpak installations should return 0 apps");
+  expect(pass.provider_summaries.size() == 1 &&
+             pass.provider_summaries[0].status ==
+                 ProviderExecutionStatus::kSucceeded &&
+             pass.provider_summaries[0].discovered_count == 0 &&
+             pass.provider_summaries[0].error_message.empty(),
+         "empty healthy installations should report kSucceeded");
+}
+
+void test_flatpak_scopes_named_installs_branches_arches_metadata_and_runtimes() {
+  FlatpakBackendQueryResult query;
+
+  // User installation with full metadata + a runtime (must be excluded) +
+  // a second branch containing '/'.
+  FlatpakInstallationQueryResult user;
+  user.installation_id = "user";
+  user.is_user = true;
+  user.apps.push_back(make_flatpak_ref(
+      "org.example.Editor", "stable", "x86_64", kFlatpakRefKindApp,
+      OptionalString::of("Example Editor"), OptionalString::of("2.4.0"),
+      OptionalString::of("Fast text editor")));
+  user.apps.push_back(make_flatpak_ref(
+      "org.example.Editor", "beta/nightly", "x86_64", kFlatpakRefKindApp));
+  user.apps.push_back(make_flatpak_ref(
+      "org.freedesktop.Platform", "23.08", "x86_64", kFlatpakRefKindRuntime,
+      OptionalString::of("Platform Runtime")));
+  query.installations.push_back(std::move(user));
+
+  // Default system installation: same app_id with missing optional metadata
+  // (as on older libflatpak without appdata symbols) and two architectures.
+  FlatpakInstallationQueryResult sys_default;
+  sys_default.installation_id = "default";
+  sys_default.is_user = false;
+  sys_default.apps.push_back(
+      make_flatpak_ref("org.example.Editor", "stable", "x86_64"));
+  sys_default.apps.push_back(
+      make_flatpak_ref("org.example.Editor", "stable", "aarch64"));
+  query.installations.push_back(std::move(sys_default));
+
+  // Named extra system installation with the same app_id/branch/arch.
+  FlatpakInstallationQueryResult sys_extra;
+  sys_extra.installation_id = "extra-sys";
+  sys_extra.is_user = false;
+  sys_extra.apps.push_back(
+      make_flatpak_ref("org.example.Editor", "stable", "x86_64"));
+  query.installations.push_back(std::move(sys_extra));
+
+  FlatpakDiscoveryProvider provider(
+      std::make_unique<FakeFlatpakBackend>(true, std::move(query)));
+  const DiscoveryResult result = provider.discover();
+
+  expect(result.ok, "healthy Flatpak discovery should succeed");
+  expect(result.error_message.empty(),
+         "healthy Flatpak discovery should have no diagnostics");
+  expect(result.applications.size() == 5,
+         "runtime must be excluded while all 5 distinct app installs remain");
+  if (result.applications.size() != 5) return;
+
+  const auto& user_stable = result.applications[0];
+  const auto& user_beta = result.applications[1];
+  const auto& sys_x86 = result.applications[2];
+  const auto& sys_arm = result.applications[3];
+  const auto& extra_x86 = result.applications[4];
+
+  // Authoritative provenance, metadata, and unknown defaults on user_stable.
+  expect(user_stable.provenance.provider_id == "flatpak",
+         "provider_id must be flatpak");
+  expect(user_stable.provenance.native_id == "org.example.Editor",
+         "native_id must match Flatpak app ID");
+  expect(user_stable.provenance.installation_source ==
+             InstallationSource::kFlatpak,
+         "installation_source must be kFlatpak");
+  expect(user_stable.provenance.installation_scope == InstallationScope::kUser,
+         "user installation must have kUser scope");
+  expect(user_stable.package_id.has_value() &&
+             user_stable.package_id.value() == "org.example.Editor",
+         "package_id must equal Flatpak app ID");
+  expect(!user_stable.desktop_file_id.has_value(),
+         "Flatpak provider must NOT fabricate desktop_file_id");
+  expect(user_stable.classification == ApplicationClassification::kUnknown,
+         "Flatpak provider must NOT assume GUI classification");
+  expect(user_stable.desktop_menu_visibility == DesktopMenuVisibility::kUnknown,
+         "Flatpak provider must leave desktop_menu_visibility unknown");
+  expect(user_stable.capabilities.supports_files == CapabilityState::kUnknown &&
+             user_stable.capabilities.supports_uris ==
+                 CapabilityState::kUnknown &&
+             user_stable.capabilities.requires_terminal ==
+                 CapabilityState::kUnknown &&
+             user_stable.capabilities.launchable == CapabilityState::kUnknown,
+         "Flatpak provider must leave unsupported capabilities unknown");
+  expect(user_stable.metadata.name.has_value() &&
+             user_stable.metadata.name.value() == "Example Editor",
+         "appdata name must be preserved");
+  expect(user_stable.metadata.version.has_value() &&
+             user_stable.metadata.version.value() == "2.4.0",
+         "appdata version must be preserved");
+  expect(user_stable.metadata.description.has_value() &&
+             user_stable.metadata.description.value() == "Fast text editor",
+         "appdata summary must map to metadata.description");
+  expect(user_stable.metadata.architecture.has_value() &&
+             user_stable.metadata.architecture.value() == "x86_64",
+         "architecture must be preserved");
+  expect(user_stable.metadata.branch.has_value() &&
+             user_stable.metadata.branch.value() == "stable",
+         "branch must be preserved");
+
+  // Missing optional metadata remains unset on sys_x86.
+  expect(sys_x86.provenance.installation_scope == InstallationScope::kSystem,
+         "system installation must have kSystem scope");
+  expect(!sys_x86.metadata.name.has_value() &&
+             !sys_x86.metadata.version.has_value() &&
+             !sys_x86.metadata.description.has_value(),
+         "missing optional appdata fields must remain unset");
+
+  // Escaping of '/' in branch and distinctness of all 5 identities.
+  expect(user_beta.installation_id.has_value() &&
+             user_beta.installation_id.value() == "user/beta%2Fnightly/x86_64",
+         "branch containing '/' must percent-escape '/' in installation_id");
+
+  const std::vector<std::string> ids = {
+      user_stable.application_id, user_beta.application_id,
+      sys_x86.application_id, sys_arm.application_id, extra_x86.application_id};
+  for (size_t i = 0; i < ids.size(); ++i) {
+    for (size_t j = i + 1; j < ids.size(); ++j) {
+      expect(ids[i] != ids[j],
+             "distinct Flatpak installations must produce unique application_ids");
+    }
+  }
+}
+
+void test_flatpak_partial_and_total_installation_failures() {
+  // Partial failure: user installation fails, system installation succeeds.
+  {
+    FlatpakBackendQueryResult query;
+    FlatpakInstallationQueryResult user_failed;
+    user_failed.installation_id = "user";
+    user_failed.is_user = true;
+    user_failed.ok = false;
+    user_failed.error_message = "permission denied";
+    query.installations.push_back(std::move(user_failed));
+
+    FlatpakInstallationQueryResult sys_ok;
+    sys_ok.installation_id = "default";
+    sys_ok.is_user = false;
+    sys_ok.apps.push_back(
+        make_flatpak_ref("org.example.SystemApp", "stable", "x86_64"));
+    query.installations.push_back(std::move(sys_ok));
+
+    ApplicationDiscoveryService service;
+    service.register_provider(std::make_unique<FlatpakDiscoveryProvider>(
+        std::make_unique<FakeFlatpakBackend>(true, std::move(query))));
+
+    const DiscoveryPassResult pass = service.discover_with_report();
+    expect(pass.applications.size() == 1 &&
+               pass.applications[0].provenance.native_id ==
+                   "org.example.SystemApp",
+           "accessible system installation must still contribute apps when "
+           "another installation fails");
+    expect(pass.provider_summaries.size() == 1 &&
+               pass.provider_summaries[0].status ==
+                   ProviderExecutionStatus::kPartiallyFailed &&
+               pass.provider_summaries[0].error_message.find("permission denied") !=
+                   std::string::npos,
+           "partial failure must preserve accurate provider diagnostics");
+  }
+
+  // Total failure: all installations fail -> must NOT report empty success!
+  {
+    FlatpakBackendQueryResult query;
+    FlatpakInstallationQueryResult sys_failed;
+    sys_failed.installation_id = "default";
+    sys_failed.is_user = false;
+    sys_failed.ok = false;
+    sys_failed.error_message = "corrupt ostree repo";
+    query.installations.push_back(std::move(sys_failed));
+
+    ApplicationDiscoveryService service;
+    service.register_provider(std::make_unique<FlatpakDiscoveryProvider>(
+        std::make_unique<FakeFlatpakBackend>(true, std::move(query))));
+
+    const DiscoveryPassResult pass = service.discover_with_report();
+    expect(pass.applications.empty(), "total failure should return no apps");
+    expect(pass.provider_summaries.size() == 1 &&
+               pass.provider_summaries[0].status ==
+                   ProviderExecutionStatus::kFailed &&
+               pass.provider_summaries[0].error_message.find(
+                   "corrupt ostree repo") != std::string::npos,
+           "total installation failure must report kFailed, not empty success");
+  }
+}
+
+void test_flatpak_ownership_and_legacy_list_apps_compatibility() {
+  int backend_destroyed = 0;
+  {
+    DiscoveryResult gio_result;
+    gio_result.applications.push_back(make_gio_app(
+        "org.example.Visible.desktop", "Visible", true, false, false,
+        DesktopMenuVisibility::kVisible));
+    gio_result.applications.push_back(make_gio_app(
+        "org.example.NoDisplay.desktop", "NoDisplay", false, false, false,
+        DesktopMenuVisibility::kNotVisible));
+
+    FlatpakBackendQueryResult flatpak_query;
+    FlatpakInstallationQueryResult user;
+    user.installation_id = "user";
+    user.is_user = true;
+    user.apps.push_back(
+        make_flatpak_ref("org.example.NoDesktopTool", "stable", "x86_64"));
+    flatpak_query.installations.push_back(std::move(user));
+
+    ApplicationDiscoveryService service;
+    service.register_provider(std::make_unique<FakeDiscoveryProvider>(
+        "gio", true, std::move(gio_result)));
+    service.register_provider(std::make_unique<FlatpakDiscoveryProvider>(
+        std::make_unique<FakeFlatpakBackend>(true, std::move(flatpak_query),
+                                             nullptr, &backend_destroyed)));
+
+    const auto unified = service.discover_applications();
+    expect(unified.size() == 3,
+           "internal discovery should include both GIO and Flatpak records");
+
+    const auto legacy =
+        flutter_device_apps_linux::adapt_for_legacy_list_apps(unified);
+    expect(legacy.size() == 1 &&
+               legacy[0].desktop_file_id == "org.example.Visible.desktop",
+           "legacy listApps() must remain strictly visible GIO apps only");
+    expect(backend_destroyed == 0,
+           "FlatpakBackend must remain alive while service is alive");
+  }
+  expect(backend_destroyed == 1,
+         "FlatpakBackend must be deterministically destroyed with service");
+}
+
+// --- Provider filtering and SnapDiscoveryProvider tests ---
+
+class CountingProvider final : public ApplicationDiscoveryProvider {
+ public:
+  CountingProvider(std::string id, bool available, DiscoveryResult result,
+                   std::atomic<int>* availability_calls,
+                   std::atomic<int>* discover_calls)
+      : id_(std::move(id)),
+        available_(available),
+        result_(std::move(result)),
+        availability_calls_(availability_calls),
+        discover_calls_(discover_calls) {}
+
+  const char* id() const override { return id_.c_str(); }
+
+  bool is_available() const override {
+    if (availability_calls_ != nullptr) {
+      availability_calls_->fetch_add(1);
+    }
+    return available_;
+  }
+
+  DiscoveryResult discover() override {
+    if (discover_calls_ != nullptr) {
+      discover_calls_->fetch_add(1);
+    }
+    return result_;
+  }
+
+ private:
+  std::string id_;
+  bool available_;
+  DiscoveryResult result_;
+  std::atomic<int>* availability_calls_;
+  std::atomic<int>* discover_calls_;
+};
+
+void test_provider_filtering_legacy_gio_only_vs_unified() {
+  std::atomic<int> gio_avail{0};
+  std::atomic<int> gio_disc{0};
+  std::atomic<int> flatpak_avail{0};
+  std::atomic<int> flatpak_disc{0};
+  std::atomic<int> snap_avail{0};
+  std::atomic<int> snap_disc{0};
+
+  DiscoveryResult gio_result;
+  gio_result.applications.push_back(make_gio_app(
+      "org.example.Visible.desktop", "Visible", true, false, false));
+
+  DiscoveryResult flatpak_result;
+  flatpak_result.applications.push_back(make_non_desktop_app(
+      "flatpak", "org.example.FlatpakApp", InstallationSource::kFlatpak,
+      InstallationScope::kUser));
+
+  DiscoveryResult snap_result;
+  snap_result.applications.push_back(make_non_desktop_app(
+      "snap", "blender", InstallationSource::kSnap,
+      InstallationScope::kSystem));
+
+  auto service = std::make_shared<ApplicationDiscoveryService>();
+  service->register_provider(std::make_unique<CountingProvider>(
+      "gio", true, std::move(gio_result), &gio_avail, &gio_disc));
+  service->register_provider(std::make_unique<CountingProvider>(
+      "flatpak", true, std::move(flatpak_result), &flatpak_avail,
+      &flatpak_disc));
+  service->register_provider(std::make_unique<CountingProvider>(
+      "snap", true, std::move(snap_result), &snap_avail, &snap_disc));
+
+  // 1. Legacy GIO-only path via AsyncDiscoveryRunner: Flatpak and Snap must
+  // NOT perform availability checks or discovery.
+  TestPlatformLoop loop;
+  WorkerPoolFixture pool;
+  AsyncDiscoveryRunner runner(
+      service, pool.scheduler(),
+      [&loop](std::function<void()> cb) { loop.post(std::move(cb)); });
+
+  DiscoveryExecutionOutcome gio_only_outcome;
+  runner.discover_async(
+      [&](DiscoveryExecutionOutcome outcome) {
+        gio_only_outcome = std::move(outcome);
+      },
+      DiscoveryRequestOptions::only_providers({"gio"}));
+  loop.run_one();
+
+  expect(gio_avail.load() == 1 && gio_disc.load() == 1,
+         "GIO-only filter must execute GIO provider once");
+  expect(flatpak_avail.load() == 0 && flatpak_disc.load() == 0,
+         "unselected Flatpak provider must not check availability or discover");
+  expect(snap_avail.load() == 0 && snap_disc.load() == 0,
+         "unselected Snap provider must not check availability or discover");
+  expect(gio_only_outcome.applications.size() == 1 &&
+             gio_only_outcome.applications[0].provenance.provider_id == "gio",
+         "GIO-only discovery must return only GIO records");
+  expect(gio_only_outcome.provider_summaries.size() == 1 &&
+             gio_only_outcome.provider_summaries[0].provider_id == "gio",
+         "GIO-only summary must include only selected provider");
+
+  // 2. Unified discovery (all_providers) executes all registered providers.
+  DiscoveryExecutionOutcome unified_outcome;
+  runner.discover_async(
+      [&](DiscoveryExecutionOutcome outcome) {
+        unified_outcome = std::move(outcome);
+      },
+      DiscoveryRequestOptions::all_providers());
+  loop.run_one();
+  pool.join_all();
+
+  expect(gio_avail.load() == 2 && gio_disc.load() == 2,
+         "unified discovery must execute GIO");
+  expect(flatpak_avail.load() == 1 && flatpak_disc.load() == 1,
+         "unified discovery must execute Flatpak");
+  expect(snap_avail.load() == 1 && snap_disc.load() == 1,
+         "unified discovery must execute Snap");
+  expect(unified_outcome.applications.size() == 3,
+         "unified discovery must collect results from all 3 providers");
+}
+
+class FakeSnapBackend final : public SnapBackend {
+ public:
+  FakeSnapBackend(bool available, SnapBackendQueryResult result,
+                  int* list_calls = nullptr)
+      : available_(available),
+        result_(std::move(result)),
+        list_calls_(list_calls) {}
+
+  bool is_available() const override { return available_; }
+
+  SnapBackendQueryResult list_enabled_snaps() override {
+    if (list_calls_ != nullptr) {
+      ++(*list_calls_);
+    }
+    return result_;
+  }
+
+ private:
+  bool available_;
+  SnapBackendQueryResult result_;
+  int* list_calls_;
+};
+
+void test_snap_missing_backend_filtering_parallel_metadata_and_stable_id() {
+  // Missing / null backend.
+  SnapDiscoveryProvider null_provider(nullptr);
+  expect(std::string(null_provider.id()) == "snap",
+         "SnapDiscoveryProvider id() must be snap");
+  expect(!null_provider.is_available(), "null Snap backend is unavailable");
+  expect(!null_provider.discover().ok,
+         "discover() on unavailable Snap backend must fail cleanly");
+
+  int list_calls = 0;
+  {
+    ApplicationDiscoveryService service;
+    service.register_provider(std::make_unique<SnapDiscoveryProvider>(
+        std::make_unique<FakeSnapBackend>(false, SnapBackendQueryResult{},
+                                          &list_calls)));
+    const DiscoveryPassResult pass = service.discover_with_report();
+    expect(list_calls == 0,
+           "unavailable Snap backend must not invoke list_enabled_snaps()");
+    expect(pass.provider_summaries.size() == 1 &&
+               pass.provider_summaries[0].status ==
+                   ProviderExecutionStatus::kUnavailable,
+           "unavailable Snap provider must report kUnavailable");
+  }
+
+  // Filtering, parallel instances, missing optional metadata, and exclusions.
+  SnapBackendQueryResult query;
+  {
+    SnapInstalledRecord app;
+    app.instance_name = "blender";
+    app.package_name = "blender";
+    app.type = "app";
+    app.status = OptionalString::of("active");
+    app.title = OptionalString::of("Blender");
+    app.version = OptionalString::of("4.2.0");
+    app.revision = OptionalString::of("4800");
+    app.channel = OptionalString::of("latest/stable");
+    app.summary = OptionalString::of("3D creation suite");
+    app.description = OptionalString::of("Full 3D modeling and rendering.");
+    app.license = OptionalString::of("GPL-3.0");
+    query.snaps.push_back(std::move(app));
+  }
+  {
+    // Parallel instance with missing optional metadata (no title/version/etc.).
+    SnapInstalledRecord parallel;
+    parallel.instance_name = "blender_nightly";
+    parallel.package_name = "blender_nightly";
+    parallel.type = "app";
+    parallel.status = OptionalString::of("active");
+    query.snaps.push_back(std::move(parallel));
+  }
+  {
+    // Disabled / inactive revision must be excluded.
+    SnapInstalledRecord disabled;
+    disabled.instance_name = "old-app";
+    disabled.package_name = "old-app";
+    disabled.type = "app";
+    disabled.status = OptionalString::of("installed");
+    query.snaps.push_back(std::move(disabled));
+  }
+  for (const char* non_app_type :
+       {"base", "core", "os", "kernel", "gadget", "snapd"}) {
+    SnapInstalledRecord system_pkg;
+    system_pkg.instance_name = std::string("sys-") + non_app_type;
+    system_pkg.package_name = system_pkg.instance_name;
+    system_pkg.type = non_app_type;
+    system_pkg.status = OptionalString::of("active");
+    query.snaps.push_back(std::move(system_pkg));
+  }
+
+  SnapDiscoveryProvider provider(
+      std::make_unique<FakeSnapBackend>(true, std::move(query)));
+  const DiscoveryResult result = provider.discover();
+  expect(result.ok, "Snap discovery should succeed");
+  expect(result.applications.size() == 2,
+         "only active app-type snaps should be included");
+  if (result.applications.size() != 2) return;
+
+  const auto& main_app = result.applications[0];
+  const auto& parallel_app = result.applications[1];
+
+  expect(main_app.application_id == "snap:blender:system",
+         "standard snap application_id should match contract");
+  expect(main_app.provenance.provider_id == "snap" &&
+             main_app.provenance.native_id == "blender" &&
+             main_app.provenance.installation_source ==
+                 InstallationSource::kSnap &&
+             main_app.provenance.installation_scope ==
+                 InstallationScope::kSystem,
+         "Snap provenance must match contract");
+  expect(main_app.package_id.has_value() &&
+             main_app.package_id.value() == "blender",
+         "base package_id should be blender");
+  expect(!main_app.installation_id.has_value(),
+         "non-parallel snap should have unset installation_id");
+  expect(main_app.metadata.name.has_value() &&
+             main_app.metadata.name.value() == "Blender",
+         "title should populate metadata.name");
+  expect(main_app.metadata.version.has_value() &&
+             main_app.metadata.version.value() == "4.2.0",
+         "version should be populated");
+  expect(main_app.metadata.revision.has_value() &&
+             main_app.metadata.revision.value() == "4800",
+         "revision should be populated");
+  expect(main_app.metadata.channel.has_value() &&
+             main_app.metadata.channel.value() == "latest/stable",
+         "channel should be populated");
+  expect(main_app.metadata.summary.has_value() &&
+             main_app.metadata.summary.value() == "3D creation suite",
+         "summary should be populated");
+  expect(main_app.metadata.description.has_value() &&
+             main_app.metadata.description.value() ==
+                 "Full 3D modeling and rendering.",
+         "description should be populated");
+  expect(main_app.metadata.license.has_value() &&
+             main_app.metadata.license.value() == "GPL-3.0",
+         "license should be populated");
+  expect(!main_app.desktop_file_id.has_value() &&
+             !main_app.metadata.executable.has_value() &&
+             main_app.classification == ApplicationClassification::kUnknown &&
+             main_app.desktop_menu_visibility ==
+                 DesktopMenuVisibility::kUnknown &&
+             main_app.capabilities.launchable == CapabilityState::kUnknown,
+         "Snap provider must not fabricate desktop ID, executable, "
+         "classification, visibility, or capabilities");
+
+  // Parallel install checks.
+  expect(parallel_app.application_id == "snap:blender_nightly:system:nightly",
+         "parallel snap must preserve distinct instance identity");
+  expect(parallel_app.application_id != main_app.application_id,
+         "parallel install must not collide with default install");
+  expect(parallel_app.package_id.has_value() &&
+             parallel_app.package_id.value() == "blender",
+         "parallel install package_id should resolve to base snap name");
+  expect(parallel_app.installation_id.has_value() &&
+             parallel_app.installation_id.value() == "nightly",
+         "parallel install should record instance key in installation_id");
+  expect(parallel_app.metadata.name.has_value() &&
+             parallel_app.metadata.name.value() == "blender_nightly",
+         "missing title should fall back to instance name");
+  expect(!parallel_app.metadata.version.has_value() &&
+             !parallel_app.metadata.revision.has_value() &&
+             !parallel_app.metadata.channel.has_value() &&
+             !parallel_app.metadata.summary.has_value() &&
+             !parallel_app.metadata.description.has_value() &&
+             !parallel_app.metadata.license.has_value(),
+         "missing optional Snap metadata must stay unset");
+
+  // Identity stability across version, revision, and title updates.
+  SnapBackendQueryResult updated_query;
+  SnapInstalledRecord updated;
+  updated.instance_name = "blender";
+  updated.package_name = "blender";
+  updated.type = "app";
+  updated.status = OptionalString::of("active");
+  updated.title = OptionalString::of("Blender Studio");
+  updated.version = OptionalString::of("4.3.1");
+  updated.revision = OptionalString::of("5120");
+  updated_query.snaps.push_back(std::move(updated));
+
+  SnapDiscoveryProvider updated_provider(
+      std::make_unique<FakeSnapBackend>(true, std::move(updated_query)));
+  const DiscoveryResult updated_result = updated_provider.discover();
+  expect(updated_result.ok && updated_result.applications.size() == 1 &&
+             updated_result.applications[0].application_id ==
+                 main_app.application_id,
+         "Snap application_id must remain stable across updates and revisions");
+}
+
+void test_snap_provider_failure_isolation() {
+  DiscoveryResult gio_result;
+  gio_result.applications.push_back(make_gio_app(
+      "org.example.Editor.desktop", "Editor", true, false, false));
+
+  SnapBackendQueryResult snap_err;
+  snap_err.ok = false;
+  snap_err.error_kind = SnapQueryErrorKind::kPermissionDenied;
+  snap_err.error_message = "access denied";
+
+  ApplicationDiscoveryService service;
+  service.register_provider(std::make_unique<FakeDiscoveryProvider>(
+      "gio", true, std::move(gio_result)));
+  service.register_provider(std::make_unique<SnapDiscoveryProvider>(
+      std::make_unique<FakeSnapBackend>(true, std::move(snap_err))));
+
+  const DiscoveryPassResult pass = service.discover_with_report();
+  expect(pass.applications.size() == 1 &&
+             pass.applications[0].provenance.provider_id == "gio",
+         "Snap failure must not break GIO discovery");
+  expect(pass.provider_summaries.size() == 2 &&
+             pass.provider_summaries[1].provider_id == "snap" &&
+             pass.provider_summaries[1].status ==
+                 ProviderExecutionStatus::kFailed &&
+             pass.provider_summaries[1].error_message.find(
+                 "permission denied") != std::string::npos,
+         "Snap failure must be reported accurately");
+}
+
+// --- Real mock UNIX domain socket server tests for SnapdSocketBackend ---
+
+class MockUnixSocketServer {
+ public:
+  explicit MockUnixSocketServer(
+      std::function<void(int client_fd, const std::string& request)> handler)
+      : handler_(std::move(handler)) {
+    static std::atomic<int> counter{0};
+    socket_path_ = "/tmp/fda-snap-" + std::to_string(getpid()) + "-" +
+                   std::to_string(counter.fetch_add(1)) + ".sock";
+    unlink(socket_path_.c_str());
+
+    listen_fd_ = socket(AF_UNIX, SOCK_STREAM, 0);
+    expect(listen_fd_ >= 0, "mock unix socket creation must succeed");
+    if (listen_fd_ < 0) return;
+
+    struct sockaddr_un addr {};
+    addr.sun_family = AF_UNIX;
+    std::memcpy(addr.sun_path, socket_path_.c_str(), socket_path_.size() + 1);
+    const bool bound =
+        bind(listen_fd_, reinterpret_cast<struct sockaddr*>(&addr),
+             sizeof(addr)) == 0;
+    expect(bound, "mock unix socket bind must succeed");
+    const bool listening = bound && listen(listen_fd_, 4) == 0;
+    expect(listening, "mock unix socket listen must succeed");
+    if (!listening) {
+      close(listen_fd_);
+      listen_fd_ = -1;
+      return;
+    }
+
+    server_thread_ = std::thread([this]() {
+      const int client = accept(listen_fd_, nullptr, nullptr);
+      if (client < 0) return;
+      std::string request;
+      char buf[1024];
+      while (request.find("\r\n\r\n") == std::string::npos) {
+        const ssize_t n = recv(client, buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        request.append(buf, static_cast<size_t>(n));
+      }
+      if (handler_) {
+        handler_(client, request);
+      }
+      close(client);
+    });
+  }
+
+  ~MockUnixSocketServer() {
+    if (listen_fd_ >= 0) {
+      shutdown(listen_fd_, SHUT_RDWR);
+      close(listen_fd_);
+    }
+    if (server_thread_.joinable()) {
+      server_thread_.join();
+    }
+    if (!socket_path_.empty()) {
+      unlink(socket_path_.c_str());
+    }
+  }
+
+  const std::string& path() const { return socket_path_; }
+
+ private:
+  std::string socket_path_;
+  int listen_fd_ = -1;
+  std::function<void(int, const std::string&)> handler_;
+  std::thread server_thread_;
+};
+
+void send_all(int fd, const std::string& payload) {
+  size_t offset = 0;
+#ifdef MSG_NOSIGNAL
+  const int flags = MSG_NOSIGNAL;
+#else
+  const int flags = 0;
+#endif
+  while (offset < payload.size()) {
+    const ssize_t n = send(fd, payload.data() + offset,
+                           payload.size() - offset, flags);
+    if (n <= 0) break;
+    offset += static_cast<size_t>(n);
+  }
+}
+
+void test_snapd_socket_backend_end_to_end() {
+  // 1. Missing socket -> unavailable.
+  {
+    SnapdSocketConfig cfg;
+    cfg.socket_path = "/tmp/fda-snap-does-not-exist-99999.sock";
+    auto backend = create_snapd_socket_backend(cfg);
+    expect(!backend->is_available(),
+           "missing snapd socket must report is_available() == false");
+    const auto res = backend->list_enabled_snaps();
+    expect(!res.ok && res.error_kind == SnapQueryErrorKind::kDaemonUnavailable,
+           "missing socket query must report kDaemonUnavailable");
+  }
+
+  // 2. Stale socket (nobody listening -> ECONNREFUSED).
+  {
+    const std::string stale_path =
+        "/tmp/fda-snap-stale-" + std::to_string(getpid()) + ".sock";
+    unlink(stale_path.c_str());
+    const int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un addr {};
+    addr.sun_family = AF_UNIX;
+    std::memcpy(addr.sun_path, stale_path.c_str(), stale_path.size() + 1);
+    const bool bound =
+        fd >= 0 &&
+        bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0;
+    if (fd >= 0) close(fd);
+    expect(bound, "stale unix socket setup must succeed");
+
+    SnapdSocketConfig cfg;
+    cfg.socket_path = stale_path;
+    auto backend = create_snapd_socket_backend(cfg);
+    expect(backend->is_available(), "stale socket file exists as a socket");
+    const auto res = backend->list_enabled_snaps();
+    unlink(stale_path.c_str());
+    expect(!res.ok && res.error_kind == SnapQueryErrorKind::kDaemonUnavailable,
+           "refused snapd socket must report kDaemonUnavailable");
+  }
+
+  // 3. Valid HTTP/1.1 chunked response with app, parallel install, UTF-8
+  // escapes, and excluded non-app types.
+  {
+    std::string observed_request;
+    const std::string json_body =
+        R"({"type":"sync","status-code":200,"status":"OK","result":[)"
+        R"({"name":"code","type":"app","status":"active","title":"VS Code \u2713",)"
+        R"("version":"1.90.0","revision":"160","tracking-channel":"latest/stable",)"
+        R"("summary":"Code editor","description":"Extensible editor","license":"MIT"},)"
+        R"({"name":"code_insiders","instance-name":"code_insiders","instance-key":"insiders",)"
+        R"("type":"app","status":"active","version":"1.91.0","revision":161,"channel":"latest/edge"},)"
+        R"({"name":"core22","type":"base","status":"active"},)"
+        R"({"name":"snapd","type":"snapd","status":"active"})"
+        R"(]})";
+
+    // Split body into two HTTP chunks to exercise chunked decoding.
+    const size_t split = json_body.size() / 2;
+    char hex1[32];
+    char hex2[32];
+    std::snprintf(hex1, sizeof(hex1), "%zx", split);
+    std::snprintf(hex2, sizeof(hex2), "%zx", json_body.size() - split);
+    const std::string http =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/json\r\n"
+        "Transfer-Encoding: chunked\r\n\r\n" +
+        std::string(hex1) + "\r\n" + json_body.substr(0, split) + "\r\n" +
+        std::string(hex2) + "\r\n" + json_body.substr(split) + "\r\n0\r\n\r\n";
+
+    MockUnixSocketServer server([&](int client_fd, const std::string& req) {
+      observed_request = req;
+      send_all(client_fd, http);
+    });
+
+    SnapdSocketConfig cfg;
+    cfg.socket_path = server.path();
+    SnapDiscoveryProvider provider(create_snapd_socket_backend(cfg));
+    expect(provider.is_available(), "mock snapd socket must be available");
+    const DiscoveryResult result = provider.discover();
+
+    expect(observed_request.find("GET /v2/snaps?select=enabled HTTP/1.1\r\n") ==
+               0,
+           "backend must request GET /v2/snaps?select=enabled");
+    expect(result.ok && result.applications.size() == 2,
+           "chunked snapd response should yield 2 app-type snaps");
+    if (result.applications.size() == 2) {
+      expect(result.applications[0].application_id == "snap:code:system",
+             "first snap ID must match");
+      expect(result.applications[0].metadata.name.has_value() &&
+                 result.applications[0].metadata.name.value() ==
+                     "VS Code \xE2\x9C\x93",
+             "JSON \\u2713 escape must decode to UTF-8");
+      expect(result.applications[0].metadata.channel.has_value() &&
+                 result.applications[0].metadata.channel.value() ==
+                     "latest/stable",
+             "tracking-channel must be preferred");
+      expect(result.applications[1].application_id ==
+                 "snap:code_insiders:system:insiders",
+             "parallel snap over socket must keep distinct identity");
+      expect(result.applications[1].metadata.revision.has_value() &&
+                 result.applications[1].metadata.revision.value() == "161",
+             "numeric revision must decode cleanly");
+    }
+  }
+
+  // 4. Successful empty result.
+  {
+    const std::string body =
+        R"({"type":"sync","status-code":200,"status":"OK","result":[]})";
+    const std::string http =
+        "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(body.size()) +
+        "\r\n\r\n" + body;
+    MockUnixSocketServer server([&](int client_fd, const std::string&) {
+      send_all(client_fd, http);
+    });
+
+    SnapdSocketConfig cfg;
+    cfg.socket_path = server.path();
+    SnapDiscoveryProvider provider(create_snapd_socket_backend(cfg));
+    const DiscoveryResult result = provider.discover();
+    expect(result.ok && result.applications.empty(),
+           "empty snapd result array must succeed with 0 apps");
+  }
+
+  // 5. Permission denied (HTTP 403 error envelope).
+  {
+    const std::string body =
+        R"({"type":"error","status-code":403,"status":"Forbidden","result":{"message":"access denied"}})";
+    const std::string http =
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: " +
+        std::to_string(body.size()) + "\r\n\r\n" + body;
+    MockUnixSocketServer server([&](int client_fd, const std::string&) {
+      send_all(client_fd, http);
+    });
+
+    SnapdSocketConfig cfg;
+    cfg.socket_path = server.path();
+    auto backend = create_snapd_socket_backend(cfg);
+    const auto res = backend->list_enabled_snaps();
+    expect(!res.ok && res.error_kind == SnapQueryErrorKind::kPermissionDenied,
+           "HTTP 403 from snapd must report kPermissionDenied");
+  }
+
+  // 6. Request timeout (server holds socket open until client times out).
+  {
+    Latch release_server(1);
+    MockUnixSocketServer server([&](int, const std::string&) {
+      release_server.wait();
+    });
+
+    SnapdSocketConfig cfg;
+    cfg.socket_path = server.path();
+    cfg.connect_timeout_ms = 200;
+    cfg.request_timeout_ms = 60;
+    auto backend = create_snapd_socket_backend(cfg);
+    const auto res = backend->list_enabled_snaps();
+    release_server.count_down();
+    expect(!res.ok && res.error_kind == SnapQueryErrorKind::kTimeout,
+           "hung snapd server must trigger bounded kTimeout");
+  }
+
+  // 7. Malformed HTTP response.
+  {
+    MockUnixSocketServer server([&](int client_fd, const std::string&) {
+      send_all(client_fd, "NOT-HTTP\r\n\r\n{}");
+    });
+
+    SnapdSocketConfig cfg;
+    cfg.socket_path = server.path();
+    auto backend = create_snapd_socket_backend(cfg);
+    const auto res = backend->list_enabled_snaps();
+    expect(!res.ok && res.error_kind == SnapQueryErrorKind::kProtocolError,
+           "malformed HTTP response must report kProtocolError");
+  }
+
+  // 8. Malformed JSON response.
+  {
+    const std::string body = "{\"type\":\"sync\",\"result\":[unterminated";
+    const std::string http =
+        "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(body.size()) +
+        "\r\n\r\n" + body;
+    MockUnixSocketServer server([&](int client_fd, const std::string&) {
+      send_all(client_fd, http);
+    });
+
+    SnapdSocketConfig cfg;
+    cfg.socket_path = server.path();
+    auto backend = create_snapd_socket_backend(cfg);
+    const auto res = backend->list_enabled_snaps();
+    expect(!res.ok && res.error_kind == SnapQueryErrorKind::kProtocolError,
+           "malformed JSON must report kProtocolError");
+  }
+
+  // 9. Oversized response rejected cleanly.
+  {
+    const std::string body(2048, 'a');
+    const std::string http =
+        "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(body.size()) +
+        "\r\n\r\n" + body;
+    MockUnixSocketServer server([&](int client_fd, const std::string&) {
+      send_all(client_fd, http);
+    });
+
+    SnapdSocketConfig cfg;
+    cfg.socket_path = server.path();
+    cfg.max_response_bytes = 256;
+    auto backend = create_snapd_socket_backend(cfg);
+    const auto res = backend->list_enabled_snaps();
+    expect(!res.ok && res.error_kind == SnapQueryErrorKind::kProtocolError,
+           "oversized snapd response must be rejected with kProtocolError");
+  }
+}
+
+// --- AppStreamMetadataProvider tests ---
+
+class FakeAppStreamBackend final : public AppStreamBackend {
+ public:
+  FakeAppStreamBackend(bool available, std::string abi,
+                       AppStreamBackendResult result,
+                       std::atomic<int>* avail_calls = nullptr,
+                       std::atomic<int>* load_calls = nullptr)
+      : available_(available),
+        abi_(std::move(abi)),
+        result_(std::move(result)),
+        avail_calls_(avail_calls),
+        load_calls_(load_calls) {}
+
+  bool is_available() const override {
+    if (avail_calls_ != nullptr) avail_calls_->fetch_add(1);
+    return available_;
+  }
+
+  std::string abi_description() const override { return abi_; }
+
+  AppStreamBackendResult load_local_metadata() override {
+    if (load_calls_ != nullptr) load_calls_->fetch_add(1);
+    return result_;
+  }
+
+ private:
+  bool available_;
+  std::string abi_;
+  AppStreamBackendResult result_;
+  std::atomic<int>* avail_calls_;
+  std::atomic<int>* load_calls_;
+};
+
+void test_appstream_missing_library_unsupported_abi_and_malformed_errors() {
+  // Missing / null backend.
+  AppStreamMetadataProvider null_provider(nullptr);
+  expect(std::string(null_provider.id()) == "appstream",
+         "AppStreamMetadataProvider id() must be appstream");
+  expect(!null_provider.is_available(), "null AppStream backend is unavailable");
+  expect(!null_provider.load_metadata().ok,
+         "load_metadata() on null backend must fail cleanly");
+
+  // Unsupported ABI reported by backend.
+  {
+    AppStreamBackendResult err;
+    err.ok = false;
+    err.error_kind = AppStreamQueryErrorKind::kUnsupportedAbi;
+    err.error_message = "SONAME mismatch";
+    AppStreamMetadataProvider provider(std::make_unique<FakeAppStreamBackend>(
+        true, "unsupported", std::move(err)));
+    const AppStreamMetadataResult res = provider.load_metadata();
+    expect(!res.ok &&
+               res.error_message.find("unsupported libappstream ABI") !=
+                   std::string::npos,
+           "unsupported ABI error must be preserved cleanly");
+  }
+
+  // Malformed metadata error.
+  {
+    AppStreamBackendResult err;
+    err.ok = false;
+    err.error_kind = AppStreamQueryErrorKind::kMalformedMetadata;
+    err.error_message = "invalid XML document";
+    AppStreamMetadataProvider provider(std::make_unique<FakeAppStreamBackend>(
+        true, "libappstream.so.5", std::move(err)));
+    const AppStreamMetadataResult res = provider.load_metadata();
+    expect(!res.ok &&
+               res.error_message.find("malformed AppStream metadata") !=
+                   std::string::npos,
+           "malformed metadata error must be preserved cleanly");
+  }
+}
+
+void test_appstream_metadata_fields_ambiguous_candidates_and_install_evidence() {
+  AppStreamBackendResult backend_res;
+
+  // Candidate 1: Catalog-only desktop application (NOT installed!).
+  {
+    AppStreamMetadataRecord catalog_app;
+    catalog_app.component_id = "org.example.Editor";
+    catalog_app.component_kind = "desktop-application";
+    catalog_app.name = OptionalString::of("Editör");
+    catalog_app.summary = OptionalString::of("Metin düzenleyici");
+    catalog_app.description = OptionalString::of("Yerelleştirilmiş açıklama.");
+    catalog_app.project_license = OptionalString::of("MIT");
+    catalog_app.homepage = OptionalString::of("https://example.org/editor");
+    catalog_app.package_names.push_back("example-editor");
+    catalog_app.bundles.push_back({"flatpak", "app/org.example.Editor/x86_64/stable"});
+    catalog_app.desktop_launchable_ids.push_back("org.example.Editor.desktop");
+    catalog_app.categories.push_back("Utility");
+    catalog_app.categories.push_back("TextEditor");
+    catalog_app.icons.push_back({"stock", "org.example.Editor"});
+    catalog_app.icons.push_back({"remote", "https://example.org/icon.png"});
+    AppStreamReleaseMetadata rel;
+    rel.version = OptionalString::of("9.9.9");
+    rel.date = OptionalString::of("2026-10-01");
+    rel.urgency = OptionalString::of("medium");
+    catalog_app.releases.push_back(std::move(rel));
+    catalog_app.provenance.origin = OptionalString::of("ubuntu-noble-main");
+    catalog_app.provenance.data_id =
+        OptionalString::of("system/ubuntu-noble-main/package/org.example.Editor/*");
+    catalog_app.provenance.scope = InstallationScope::kSystem;
+    catalog_app.provenance.origin_kind = AppStreamMetadataOriginKind::kCatalog;
+    // Even if a buggy backend tried to set is_installation_proof = true, the
+    // provider must enforce false.
+    catalog_app.provenance.is_installation_proof = true;
+    backend_res.records.push_back(std::move(catalog_app));
+  }
+
+  // Candidate 2: Ambiguous second candidate with the SAME component_id from
+  // Flathub catalog — must be preserved without deduplication!
+  {
+    AppStreamMetadataRecord flatpak_candidate;
+    flatpak_candidate.component_id = "org.example.Editor";
+    flatpak_candidate.component_kind = "desktop-application";
+    flatpak_candidate.bundles.push_back(
+        {"flatpak", "app/org.example.Editor/x86_64/beta"});
+    flatpak_candidate.desktop_launchable_ids.push_back(
+        "org.example.Editor.desktop");
+    flatpak_candidate.provenance.origin = OptionalString::of("flathub-beta");
+    flatpak_candidate.provenance.data_id =
+        OptionalString::of("user/flathub-beta/flatpak/org.example.Editor/beta");
+    flatpak_candidate.provenance.scope = InstallationScope::kUser;
+    flatpak_candidate.provenance.origin_kind =
+        AppStreamMetadataOriginKind::kCatalog;
+    backend_res.records.push_back(std::move(flatpak_candidate));
+  }
+
+  // Candidate 3: Locally installed metainfo for a console application.
+  {
+    AppStreamMetadataRecord console_meta;
+    console_meta.component_id = "org.example.Ripgrep";
+    console_meta.component_kind = "console-application";
+    console_meta.package_names.push_back("ripgrep");
+    console_meta.provenance.origin = OptionalString::of("metainfo");
+    console_meta.provenance.scope = InstallationScope::kSystem;
+    console_meta.provenance.origin_kind =
+        AppStreamMetadataOriginKind::kMetainfo;
+    backend_res.records.push_back(std::move(console_meta));
+  }
+
+  // Candidate 4: Record missing component_id (malformed) -> skipped.
+  {
+    AppStreamMetadataRecord empty_id;
+    empty_id.component_kind = "desktop-application";
+    backend_res.records.push_back(std::move(empty_id));
+  }
+
+  std::atomic<int> appstream_avail_calls{0};
+  std::atomic<int> appstream_load_calls{0};
+
+  ApplicationDiscoveryService service;
+  service.register_provider(
+      std::make_unique<FakeDiscoveryProvider>("gio", true, DiscoveryResult{}));
+  service.set_metadata_provider(std::make_unique<AppStreamMetadataProvider>(
+      std::make_unique<FakeAppStreamBackend>(
+          true, "libappstream.so.5 (AppStream 1.0 ABI)",
+          std::move(backend_res), &appstream_avail_calls,
+          &appstream_load_calls)));
+
+  // 1. Legacy GIO-only discovery AND unified installed-application discovery
+  // must NOT invoke AppStream or emit catalog-only apps as installed!
+  const auto legacy_pass = service.discover_with_report(
+      DiscoveryRequestOptions::only_providers({"gio"}));
+  const auto unified_installed = service.discover_applications(
+      DiscoveryRequestOptions::all_providers());
+  expect(legacy_pass.applications.empty() && unified_installed.empty(),
+         "catalog-only and metainfo-only AppStream records must NEVER appear "
+         "as installed applications");
+  expect(appstream_avail_calls.load() == 0 && appstream_load_calls.load() == 0,
+         "legacy listApps() and installed discovery must incur zero AppStream "
+         "latency");
+
+  // 2. Explicit AppStream metadata load returns all 3 valid candidates,
+  // preserving ambiguous duplicates and provenance invariants.
+  expect(service.has_metadata_provider(),
+         "service should report configured AppStream metadata provider");
+  const AppStreamMetadataResult meta = service.load_appstream_metadata();
+  expect(meta.ok, "AppStream metadata load should succeed");
+  expect(meta.records.size() == 3,
+         "all 3 valid candidates (including ambiguous duplicates) must be "
+         "preserved while empty-ID record is skipped");
+  if (meta.records.size() != 3) return;
+
+  const auto& first = meta.records[0];
+  const auto& second = meta.records[1];
+  const auto& third = meta.records[2];
+
+  expect(first.component_id == "org.example.Editor" &&
+             second.component_id == "org.example.Editor",
+         "ambiguous candidates sharing component_id must both be preserved");
+  expect(first.provenance.data_id != second.provenance.data_id,
+         "ambiguous candidates must remain distinguishable by provenance");
+  expect(!first.provenance.is_installation_proof &&
+             !second.provenance.is_installation_proof &&
+             !third.provenance.is_installation_proof,
+         "AppStream records must NEVER claim installation proof");
+  expect(first.component_kind == "desktop-application" &&
+             third.component_kind == "console-application",
+         "component kinds must be preserved accurately");
+  expect(first.name.has_value() && first.name.value() == "Editör" &&
+             first.summary.has_value() &&
+             first.summary.value() == "Metin düzenleyici",
+         "localized metadata fields must be preserved");
+  expect(first.project_license.has_value() &&
+             first.project_license.value() == "MIT" &&
+             first.homepage.has_value() &&
+             first.homepage.value() == "https://example.org/editor",
+         "license and homepage must be preserved");
+  expect(first.desktop_launchable_ids.size() == 1 &&
+             first.desktop_launchable_ids[0] == "org.example.Editor.desktop",
+         "desktop launchable IDs must be preserved for future matching");
+  expect(first.package_names.size() == 1 &&
+             first.package_names[0] == "example-editor" &&
+             first.bundles.size() == 1 && first.bundles[0].kind == "flatpak",
+         "package names and bundle identifiers must be preserved");
+  expect(first.releases.size() == 1 &&
+             first.releases[0].version.has_value() &&
+             first.releases[0].version.value() == "9.9.9",
+         "catalog release metadata must remain on AppStreamReleaseMetadata");
+  expect(third.provenance.origin_kind == AppStreamMetadataOriginKind::kMetainfo,
+         "metainfo origin kind must be distinct from catalog origin kind");
+}
+
+// --- DpkgDiscoveryProvider tests ---
+
+class TempStatusFile {
+ public:
+  explicit TempStatusFile(const std::string& content) {
+    static std::atomic<int> counter{0};
+    path_ = "/tmp/fda-dpkg-" + std::to_string(getpid()) + "-" +
+            std::to_string(counter.fetch_add(1)) + ".status";
+    std::ofstream out(path_.c_str(), std::ios::binary | std::ios::trunc);
+    out.write(content.data(), static_cast<std::streamsize>(content.size()));
+  }
+
+  ~TempStatusFile() {
+    if (!path_.empty()) {
+      unlink(path_.c_str());
+    }
+  }
+
+  const std::string& path() const { return path_; }
+
+ private:
+  std::string path_;
+};
+
+class CountingPackageProvider final : public PackageDiscoveryProvider {
+ public:
+  CountingPackageProvider(std::string id, bool available,
+                          PackageDiscoveryResult result,
+                          std::atomic<int>* avail_calls,
+                          std::atomic<int>* disc_calls)
+      : id_(std::move(id)),
+        available_(available),
+        result_(std::move(result)),
+        avail_calls_(avail_calls),
+        disc_calls_(disc_calls) {}
+
+  const char* id() const override { return id_.c_str(); }
+
+  bool is_available() const override {
+    if (avail_calls_ != nullptr) avail_calls_->fetch_add(1);
+    return available_;
+  }
+
+  PackageDiscoveryResult discover_packages() override {
+    if (disc_calls_ != nullptr) disc_calls_->fetch_add(1);
+    return result_;
+  }
+
+ private:
+  std::string id_;
+  bool available_;
+  PackageDiscoveryResult result_;
+  std::atomic<int>* avail_calls_;
+  std::atomic<int>* disc_calls_;
+};
+
+void test_dpkg_missing_empty_and_unreadable_databases() {
+  // Missing file.
+  {
+    DpkgDiscoveryConfig cfg;
+    cfg.status_file_path = "/tmp/fda-dpkg-does-not-exist-99999.status";
+    DpkgDiscoveryProvider provider(cfg);
+    expect(std::string(provider.id()) == "dpkg",
+           "DpkgDiscoveryProvider id() must be dpkg");
+    expect(!provider.is_available(),
+           "missing dpkg status file must report unavailable");
+    expect(!provider.discover_packages().ok,
+           "missing dpkg status file query must fail cleanly");
+  }
+
+  // Non-regular path (directory).
+  {
+    DpkgDiscoveryConfig cfg;
+    cfg.status_file_path = "/tmp";
+    DpkgDiscoveryProvider provider(cfg);
+    expect(!provider.is_available(),
+           "directory path must not be treated as valid dpkg status file");
+  }
+
+  // Empty database -> succeeds with 0 packages.
+  {
+    TempStatusFile empty("");
+    DpkgDiscoveryConfig cfg;
+    cfg.status_file_path = empty.path();
+    DpkgDiscoveryProvider provider(cfg);
+    expect(provider.is_available(), "empty status file should be available");
+    const PackageDiscoveryResult res = provider.discover_packages();
+    expect(res.ok && res.packages.empty() && res.error_message.empty(),
+           "empty dpkg status file must succeed cleanly with 0 packages");
+  }
+}
+
+void test_dpkg_states_multiarch_multiline_missing_fields_and_upgrade_id() {
+  const std::string status_db =
+      // 1. Standard installed package with arbitrary field ordering,
+      // case-insensitive field names, and multiline description with '.' break.
+      "Version: 14.1.0-1\n"
+      "Architecture: amd64\n"
+      "status: install ok installed\n"
+      "Package: ripgrep\n"
+      "Section: utils\n"
+      "Priority: optional\n"
+      "Homepage: https://github.com/BurntSushi/ripgrep\n"
+      "Maintainer: Debian Rust Maintainers <pkg-rust@example.org>\n"
+      "Description: Recursively searches directories for a regex pattern\n"
+      " ripgrep is a line-oriented search tool.\n"
+      " .\n"
+      " It respects gitignore rules by default.\n"
+      "\n"
+      // 2. Held package -> MUST be included with selection=kHold,
+      // installation=kInstalled.
+      "Package: vim\n"
+      "Status: hold ok installed\n"
+      "Architecture: amd64\n"
+      "Version: 2:9.1.0-1\n"
+      "\n"
+      // 3. Multi-arch packages (same name, distinct architectures) + pending
+      // triggers -> BOTH MUST be included with distinct identities!
+      "Package: libc6\n"
+      "Status: install ok triggers-pending\n"
+      "Architecture: amd64\n"
+      "Version: 2.39-0ubuntu8\n"
+      "\n"
+      "Package: libc6\n"
+      "Status: hold ok triggers-awaited\n"
+      "Architecture: i386\n"
+      "Version: 2.39-0ubuntu8\n"
+      "\n"
+      // 4. Marked for deinstall, but STILL actually installed -> MUST be
+      // included with selection=kDeinstall, installation=kInstalled.
+      "Package: tzdata\n"
+      "Status: deinstall ok installed\n"
+      "Architecture: all\n"
+      "Version: 2024a-2\n"
+      "\n"
+      // 5. Residual config only (removed) -> EXCLUDED.
+      "Package: removed-rc\n"
+      "Status: deinstall ok config-files\n"
+      "Architecture: amd64\n"
+      "Version: 1.0-1\n"
+      "\n"
+      // 6. Not installed -> EXCLUDED.
+      "Package: purged-pkg\n"
+      "Status: purge ok not-installed\n"
+      "Architecture: amd64\n"
+      "\n"
+      // 7. Broken reinstreq -> EXCLUDED even if status says installed!
+      "Package: broken-reinstreq\n"
+      "Status: install reinstreq installed\n"
+      "Architecture: amd64\n"
+      "Version: 1.0-1\n"
+      "\n"
+      // 8. Half-installed / unpacked / half-configured -> ALL EXCLUDED.
+      "Package: partial-half-inst\n"
+      "Status: install ok half-installed\n"
+      "Architecture: amd64\n"
+      "Version: 1.0-1\n"
+      "\n"
+      "Package: partial-unpacked\n"
+      "Status: install ok unpacked\n"
+      "Architecture: amd64\n"
+      "Version: 1.0-1\n"
+      "\n"
+      "Package: partial-half-conf\n"
+      "Status: install ok half-configured\n"
+      "Architecture: amd64\n"
+      "Version: 1.0-1\n";
+
+  TempStatusFile db_file(status_db);
+  DpkgDiscoveryConfig cfg;
+  cfg.status_file_path = db_file.path();
+  DpkgDiscoveryProvider provider(cfg);
+  const PackageDiscoveryResult res = provider.discover_packages();
+
+  expect(res.ok && res.error_message.empty(),
+         "valid dpkg status DB should parse cleanly with no diagnostics");
+  expect(res.packages.size() == 5,
+         "must include installed, held, deinstall-still-installed, and "
+         "triggers-pending/awaited while excluding removed/broken/partial");
+  if (res.packages.size() != 5) return;
+
+  const auto& rg = res.packages[0];
+  const auto& vim = res.packages[1];
+  const auto& libc_amd64 = res.packages[2];
+  const auto& libc_i386 = res.packages[3];
+  const auto& tzdata = res.packages[4];
+
+  expect(rg.package_identity_id == "dpkg:ripgrep:system:amd64",
+         "dpkg identity must encode provider, package name, scope, and arch");
+  expect(rg.provenance.provider_id == "dpkg" &&
+             rg.provenance.native_id == "ripgrep" &&
+             rg.provenance.installation_source == InstallationSource::kDpkg &&
+             rg.provenance.installation_scope == InstallationScope::kSystem,
+         "DPKG provenance must match contract");
+  expect(rg.version.has_value() && rg.version.value() == "14.1.0-1",
+         "installed version must be parsed");
+  expect(rg.section.has_value() && rg.section.value() == "utils" &&
+             rg.priority.has_value() && rg.priority.value() == "optional" &&
+             rg.homepage.has_value() &&
+             rg.homepage.value() == "https://github.com/BurntSushi/ripgrep" &&
+             rg.maintainer.has_value() &&
+             rg.maintainer.value() ==
+                 "Debian Rust Maintainers <pkg-rust@example.org>",
+         "optional DPKG metadata fields must be preserved");
+  expect(rg.summary.has_value() &&
+             rg.summary.value() ==
+                 "Recursively searches directories for a regex pattern",
+         "first line of Description must populate summary");
+  expect(rg.description.has_value() &&
+             rg.description.value() ==
+                 "ripgrep is a line-oriented search tool.\n\nIt respects "
+                 "gitignore rules by default.",
+         "multiline continuation lines with '.' paragraph break must decode");
+  expect(rg.installation_state == PackageInstallationState::kInstalled &&
+             rg.selection_state == PackageSelectionState::kInstall &&
+             rg.classification == ApplicationClassification::kUnknown,
+         "state and unknown classification must be preserved");
+
+  // Held package with missing optional metadata.
+  expect(vim.package_identity_id == "dpkg:vim:system:amd64" &&
+             vim.selection_state == PackageSelectionState::kHold &&
+             vim.installation_state == PackageInstallationState::kInstalled,
+         "held installed package must preserve hold selection + installed state");
+  expect(!vim.summary.has_value() && !vim.description.has_value() &&
+             !vim.section.has_value() && !vim.priority.has_value() &&
+             !vim.homepage.has_value() && !vim.maintainer.has_value(),
+         "missing optional fields must remain unset");
+
+  // Multi-arch + trigger states.
+  expect(libc_amd64.package_identity_id == "dpkg:libc6:system:amd64" &&
+             libc_i386.package_identity_id == "dpkg:libc6:system:i386" &&
+             libc_amd64.package_identity_id != libc_i386.package_identity_id,
+         "multi-arch packages must have distinct identities");
+  expect(libc_amd64.installation_state ==
+             PackageInstallationState::kTriggersPending &&
+             libc_i386.installation_state ==
+                 PackageInstallationState::kTriggersAwaited &&
+             libc_i386.selection_state == PackageSelectionState::kHold,
+         "triggers-pending and triggers-awaited states must be distinguished");
+
+  expect(tzdata.package_identity_id == "dpkg:tzdata:system:all" &&
+             tzdata.selection_state == PackageSelectionState::kDeinstall &&
+             tzdata.installation_state == PackageInstallationState::kInstalled,
+         "deinstall-selected package that is still installed must preserve "
+         "actual installed state");
+
+  // Stable identity across version upgrade.
+  const std::string upgraded_db =
+      "Package: ripgrep\n"
+      "Status: install ok installed\n"
+      "Architecture: amd64\n"
+      "Version: 15.0.0-2\n";
+  TempStatusFile upgraded_file(upgraded_db);
+  DpkgDiscoveryConfig upgraded_cfg;
+  upgraded_cfg.status_file_path = upgraded_file.path();
+  const PackageDiscoveryResult upgraded_res =
+      DpkgDiscoveryProvider(upgraded_cfg).discover_packages();
+  expect(upgraded_res.ok && upgraded_res.packages.size() == 1 &&
+             upgraded_res.packages[0].package_identity_id ==
+                 rg.package_identity_id &&
+             upgraded_res.packages[0].version.value() == "15.0.0-2",
+         "DPKG package identity must stay stable across version upgrades");
+}
+
+void test_dpkg_malformed_duplicate_and_legacy_isolation() {
+  // Partial malformed + duplicate stanzas -> valid packages returned with
+  // partial-failure diagnostics.
+  const std::string mixed_db =
+      " this line starts with space before any field\n"
+      "Package: broken-stanza\n"
+      "\n"
+      "NotAValidHeaderLineWithoutColon\n"
+      "\n"
+      "Package: curl\n"
+      "Status: install ok installed\n"
+      "Architecture: amd64\n"
+      "Version: 8.5.0-1\n"
+      "\n"
+      "Package: curl\n"
+      "Status: install ok installed\n"
+      "Architecture: amd64\n"
+      "Version: 8.5.0-2\n";
+  TempStatusFile mixed_file(mixed_db);
+  DpkgDiscoveryConfig mixed_cfg;
+  mixed_cfg.status_file_path = mixed_file.path();
+
+  ApplicationDiscoveryService service;
+  service.register_provider(std::make_unique<FakeDiscoveryProvider>(
+      "gio", true, []() {
+        DiscoveryResult r;
+        r.applications.push_back(make_gio_app(
+            "org.example.Visible.desktop", "Visible", true, false, false));
+        return r;
+      }()));
+  service.register_package_provider(
+      std::make_unique<DpkgDiscoveryProvider>(mixed_cfg));
+
+  // Unified discovery separates confirmed applications from raw packages and
+  // surfaces partial-failure diagnostics on dpkg.
+  const DiscoveryPassResult unified =
+      service.discover_with_report(DiscoveryRequestOptions::all_providers());
+  expect(unified.applications.size() == 1 &&
+             unified.applications[0].provenance.provider_id == "gio",
+         "DPKG packages must NEVER appear in confirmed applications vector");
+  expect(unified.packages.size() == 1 &&
+             unified.packages[0].package_name == "curl" &&
+             unified.packages[0].version.value() == "8.5.0-2",
+         "duplicate package stanza should resolve deterministically");
+  expect(unified.provider_summaries.size() == 2 &&
+             unified.provider_summaries[1].provider_id == "dpkg" &&
+             unified.provider_summaries[1].status ==
+                 ProviderExecutionStatus::kPartiallyFailed &&
+             unified.provider_summaries[1].error_message.find("malformed") !=
+                 std::string::npos &&
+             unified.provider_summaries[1].error_message.find("duplicate") !=
+                 std::string::npos,
+         "malformed and duplicate stanzas must preserve partial diagnostics");
+
+  // All-malformed database -> fails cleanly instead of returning empty success.
+  TempStatusFile all_bad("garbage without colon\n\nPackage: missing-status\n");
+  DpkgDiscoveryConfig bad_cfg;
+  bad_cfg.status_file_path = all_bad.path();
+  const PackageDiscoveryResult bad_res =
+      DpkgDiscoveryProvider(bad_cfg).discover_packages();
+  expect(!bad_res.ok && bad_res.packages.empty(),
+         "all-malformed status file must fail rather than report empty success");
+
+  // Legacy listApps() GIO-only isolation via AsyncDiscoveryRunner: DPKG must
+  // NEVER check availability or read the database!
+  std::atomic<int> dpkg_avail{0};
+  std::atomic<int> dpkg_disc{0};
+  auto isolated_service = std::make_shared<ApplicationDiscoveryService>();
+  isolated_service->register_provider(
+      std::make_unique<FakeDiscoveryProvider>("gio", true, DiscoveryResult{}));
+  isolated_service->register_package_provider(
+      std::make_unique<CountingPackageProvider>(
+          "dpkg", true, PackageDiscoveryResult{}, &dpkg_avail, &dpkg_disc));
+
+  TestPlatformLoop loop;
+  WorkerPoolFixture pool;
+  AsyncDiscoveryRunner runner(
+      isolated_service, pool.scheduler(),
+      [&loop](std::function<void()> cb) { loop.post(std::move(cb)); });
+
+  DiscoveryExecutionOutcome legacy_outcome;
+  runner.discover_async(
+      [&](DiscoveryExecutionOutcome outcome) {
+        legacy_outcome = std::move(outcome);
+      },
+      DiscoveryRequestOptions::only_providers({"gio"}));
+  loop.run_one();
+  pool.join_all();
+
+  expect(dpkg_avail.load() == 0 && dpkg_disc.load() == 0,
+         "legacy GIO-only listApps() must not run DPKG availability or parsing");
+  expect(legacy_outcome.packages.empty(),
+         "legacy GIO-only outcome must contain no package inventory records");
+}
+
+// --- RpmDiscoveryProvider tests ---
+
+class FakeRpmBackend final : public RpmBackend {
+ public:
+  FakeRpmBackend(bool available, RpmBackendQueryResult result,
+                 std::string abi = "librpm.so.10",
+                 std::string availability_err = "",
+                 std::atomic<int>* avail_calls = nullptr,
+                 std::atomic<int>* list_calls = nullptr)
+      : available_(available),
+        result_(std::move(result)),
+        abi_(std::move(abi)),
+        availability_error_(std::move(availability_err)),
+        avail_calls_(avail_calls),
+        list_calls_(list_calls) {}
+
+  bool is_available() const override {
+    if (avail_calls_ != nullptr) avail_calls_->fetch_add(1);
+    return available_;
+  }
+
+  std::string availability_error() const override {
+    return availability_error_;
+  }
+
+  std::string abi_description() const override { return abi_; }
+
+  RpmBackendQueryResult list_installed_packages() override {
+    if (list_calls_ != nullptr) list_calls_->fetch_add(1);
+    return result_;
+  }
+
+ private:
+  bool available_;
+  RpmBackendQueryResult result_;
+  std::string abi_;
+  std::string availability_error_;
+  std::atomic<int>* avail_calls_;
+  std::atomic<int>* list_calls_;
+};
+
+void test_rpm_availability_abi_empty_and_provider_failures() {
+  RpmDiscoveryProvider null_provider(nullptr);
+  expect(std::string(null_provider.id()) == "rpm",
+         "RpmDiscoveryProvider id() must be rpm");
+  expect(!null_provider.is_available(), "null RPM backend is unavailable");
+  expect(!null_provider.discover_packages().ok,
+         "null RPM backend discover_packages() must fail cleanly");
+
+  // Missing library / unsupported ABI diagnostic surfaced.
+  {
+    RpmDiscoveryProvider provider(std::make_unique<FakeRpmBackend>(
+        false, RpmBackendQueryResult{}, "unavailable",
+        "missing required symbols in librpm.so.10: rpmtsOpenDB"));
+    const PackageDiscoveryResult res = provider.discover_packages();
+    expect(!res.ok && res.error_message.find("missing required symbols") !=
+                          std::string::npos,
+           "RPM availability_error() diagnostic must be surfaced");
+  }
+
+  // Empty RPM database -> kSucceeded with 0 packages.
+  {
+    ApplicationDiscoveryService service;
+    service.register_package_provider(std::make_unique<RpmDiscoveryProvider>(
+        std::make_unique<FakeRpmBackend>(true, RpmBackendQueryResult{})));
+    const DiscoveryPassResult pass = service.discover_with_report();
+    expect(pass.packages.empty() && pass.provider_summaries.size() == 1 &&
+               pass.provider_summaries[0].provider_id == "rpm" &&
+               pass.provider_summaries[0].status ==
+                   ProviderExecutionStatus::kSucceeded,
+           "empty RPM database must succeed cleanly with 0 packages");
+  }
+
+  // Absent DB / permission error failure isolation alongside GIO.
+  {
+    RpmBackendQueryResult perm_err;
+    perm_err.ok = false;
+    perm_err.error_kind = RpmQueryErrorKind::kPermissionDenied;
+    perm_err.error_message = "Permission denied";
+
+    ApplicationDiscoveryService service;
+    service.register_provider(std::make_unique<FakeDiscoveryProvider>(
+        "gio", true, []() {
+          DiscoveryResult r;
+          r.applications.push_back(make_gio_app(
+              "org.example.Visible.desktop", "Visible", true, false, false));
+          return r;
+        }()));
+    service.register_package_provider(std::make_unique<RpmDiscoveryProvider>(
+        std::make_unique<FakeRpmBackend>(true, std::move(perm_err))));
+
+    const DiscoveryPassResult pass = service.discover_with_report();
+    expect(pass.applications.size() == 1 && pass.packages.empty(),
+           "RPM failure must not impact GIO discovery");
+    expect(pass.provider_summaries.size() == 2 &&
+               pass.provider_summaries[1].provider_id == "rpm" &&
+               pass.provider_summaries[1].status ==
+                   ProviderExecutionStatus::kFailed &&
+               pass.provider_summaries[1].error_message.find(
+                   "permission denied") != std::string::npos,
+           "RPM permission failure must be reported cleanly");
+  }
+}
+
+void test_rpm_metadata_multiarch_multi_version_and_legacy_isolation() {
+  RpmBackendQueryResult query;
+
+  // 1. Package with full RPM metadata including Epoch, Vendor, Group, License.
+  {
+    RpmInstalledPackageRecord pkg;
+    pkg.name = "kernel-core";
+    pkg.epoch = OptionalString::of("1");
+    pkg.version = OptionalString::of("6.8.1");
+    pkg.release = OptionalString::of("100.fc40");
+    pkg.architecture = OptionalString::of("x86_64");
+    pkg.summary = OptionalString::of("The Linux kernel");
+    pkg.description = OptionalString::of("Core Linux kernel image.");
+    pkg.license = OptionalString::of("GPL-2.0-only");
+    pkg.homepage = OptionalString::of("https://www.kernel.org/");
+    pkg.vendor = OptionalString::of("Fedora Project");
+    pkg.package_group = OptionalString::of("System Environment/Kernel");
+    query.packages.push_back(std::move(pkg));
+  }
+  // 2. Second simultaneously installed version of the SAME package!
+  {
+    RpmInstalledPackageRecord pkg;
+    pkg.name = "kernel-core";
+    pkg.epoch = OptionalString::of("1");
+    pkg.version = OptionalString::of("6.9.2");
+    pkg.release = OptionalString::of("200.fc40");
+    pkg.architecture = OptionalString::of("x86_64");
+    pkg.summary = OptionalString::of("The Linux kernel");
+    query.packages.push_back(std::move(pkg));
+  }
+  // 3. Multi-arch sibling (glibc x86_64 + glibc i686) with missing optional
+  // metadata (no Epoch, no Homepage, no Vendor).
+  {
+    RpmInstalledPackageRecord pkg;
+    pkg.name = "glibc";
+    pkg.version = OptionalString::of("2.39");
+    pkg.release = OptionalString::of("12.fc40");
+    pkg.architecture = OptionalString::of("x86_64");
+    query.packages.push_back(std::move(pkg));
+  }
+  {
+    RpmInstalledPackageRecord pkg;
+    pkg.name = "glibc";
+    pkg.version = OptionalString::of("2.39");
+    pkg.release = OptionalString::of("12.fc40");
+    pkg.architecture = OptionalString::of("i686");
+    query.packages.push_back(std::move(pkg));
+  }
+  // 4. Malformed empty-name record -> skipped with partial diagnostics.
+  {
+    RpmInstalledPackageRecord bad;
+    bad.version = OptionalString::of("1.0");
+    query.packages.push_back(std::move(bad));
+  }
+
+  std::atomic<int> rpm_avail{0};
+  std::atomic<int> rpm_list{0};
+  auto service = std::make_shared<ApplicationDiscoveryService>();
+  service->register_provider(
+      std::make_unique<FakeDiscoveryProvider>("gio", true, DiscoveryResult{}));
+  service->register_package_provider(std::make_unique<RpmDiscoveryProvider>(
+      std::make_unique<FakeRpmBackend>(true, std::move(query), "librpm.so.10",
+                                       "", &rpm_avail, &rpm_list)));
+
+  // Legacy GIO-only listApps() must NOT invoke RPM availability or DB queries!
+  const DiscoveryPassResult legacy = service->discover_with_report(
+      DiscoveryRequestOptions::only_providers({"gio"}));
+  expect(rpm_avail.load() == 0 && rpm_list.load() == 0 &&
+             legacy.packages.empty(),
+         "legacy GIO-only path must never invoke RPM provider");
+
+  // Full unified discovery separates RPM packages from applications and
+  // preserves all 4 valid RPM installations (including multi-version kernels).
+  const DiscoveryPassResult unified = service->discover_with_report(
+      DiscoveryRequestOptions::all_providers());
+  expect(unified.applications.empty(),
+         "RPM packages must never appear in confirmed applications vector");
+  expect(unified.packages.size() == 4,
+         "all 4 valid RPM installations (2 kernels + 2 multiarch glibc) must "
+         "be preserved while malformed header is skipped");
+  expect(unified.provider_summaries.size() == 2 &&
+             unified.provider_summaries[1].provider_id == "rpm" &&
+             unified.provider_summaries[1].status ==
+                 ProviderExecutionStatus::kPartiallyFailed,
+         "skipped malformed RPM header should surface kPartiallyFailed");
+  if (unified.packages.size() != 4) return;
+
+  const auto& k1 = unified.packages[0];
+  const auto& k2 = unified.packages[1];
+  const auto& glibc64 = unified.packages[2];
+  const auto& glibc32 = unified.packages[3];
+
+  expect(k1.provenance.provider_id == "rpm" &&
+             k1.provenance.installation_source == InstallationSource::kRpm &&
+             k1.provenance.installation_scope == InstallationScope::kSystem &&
+             k1.classification == ApplicationClassification::kUnknown &&
+             k1.installation_state == PackageInstallationState::kInstalled,
+         "RPM provenance, state, and unknown classification must match");
+  expect(k1.epoch.has_value() && k1.epoch.value() == "1" &&
+             k1.version.has_value() && k1.version.value() == "6.8.1" &&
+             k1.release.has_value() && k1.release.value() == "100.fc40" &&
+             k1.license.has_value() && k1.license.value() == "GPL-2.0-only" &&
+             k1.homepage.has_value() &&
+             k1.homepage.value() == "https://www.kernel.org/" &&
+             k1.vendor.has_value() && k1.vendor.value() == "Fedora Project" &&
+             k1.package_group.has_value() &&
+             k1.package_group.value() == "System Environment/Kernel",
+         "authoritative RPM metadata fields must be preserved");
+
+  // Multi-version identity contract:
+  // - Stable package_identity_id is IDENTICAL across versions of kernel-core.
+  // - Version-specific installation_identity_id is DISTINCT across versions.
+  expect(k1.package_identity_id == "rpm:kernel-core:system:x86_64" &&
+             k1.package_identity_id == k2.package_identity_id,
+         "stable package_identity_id must stay identical across RPM versions");
+  expect(k1.installation_identity_id.has_value() &&
+             k2.installation_identity_id.has_value() &&
+             k1.installation_identity_id.value() !=
+                 k2.installation_identity_id.value(),
+         "multiple installed versions must have distinct "
+         "installation_identity_ids without collisions");
+
+  // Multi-arch sibling check + missing optional fields.
+  expect(glibc64.package_identity_id == "rpm:glibc:system:x86_64" &&
+             glibc32.package_identity_id == "rpm:glibc:system:i686" &&
+             glibc64.package_identity_id != glibc32.package_identity_id,
+         "multiarch RPM packages must have distinct package_identity_ids");
+  expect(!glibc64.epoch.has_value() && !glibc64.vendor.has_value() &&
+             !glibc64.homepage.has_value(),
+         "missing optional RPM fields must stay unset");
+}
+
+// --- PacmanDiscoveryProvider tests ---
+
+class FakePacmanBackend final : public PacmanBackend {
+ public:
+  FakePacmanBackend(bool available, PacmanBackendQueryResult result,
+                    std::string abi = "libalpm.so.16",
+                    std::string availability_err = "",
+                    std::atomic<int>* avail_calls = nullptr,
+                    std::atomic<int>* list_calls = nullptr)
+      : available_(available),
+        result_(std::move(result)),
+        abi_(std::move(abi)),
+        availability_error_(std::move(availability_err)),
+        avail_calls_(avail_calls),
+        list_calls_(list_calls) {}
+
+  bool is_available() const override {
+    if (avail_calls_ != nullptr) avail_calls_->fetch_add(1);
+    return available_;
+  }
+
+  std::string availability_error() const override {
+    return availability_error_;
+  }
+
+  std::string abi_description() const override { return abi_; }
+
+  PacmanBackendQueryResult list_installed_packages() override {
+    if (list_calls_ != nullptr) list_calls_->fetch_add(1);
+    return result_;
+  }
+
+ private:
+  bool available_;
+  PacmanBackendQueryResult result_;
+  std::string abi_;
+  std::string availability_error_;
+  std::atomic<int>* avail_calls_;
+  std::atomic<int>* list_calls_;
+};
+
+void test_pacman_conf_resolution() {
+  // Missing pacman.conf -> standard defaults.
+  {
+    const PacmanResolvedPaths p =
+        resolve_pacman_db_paths("/tmp/fda-pacman-conf-missing-99999.conf");
+    expect(p.root_dir == "/" && p.db_path == "/var/lib/pacman/",
+           "missing pacman.conf must fall back to / and /var/lib/pacman/");
+  }
+
+  // RootDir without DBPath -> derives <RootDir>/var/lib/pacman/.
+  {
+    TempStatusFile conf(
+        "# Comment line\n"
+        "[options]\n"
+        "RootDir = /mnt/arch\n"
+        "[core]\n"
+        "DBPath = /should/be/ignored\n");
+    const PacmanResolvedPaths p = resolve_pacman_db_paths(conf.path());
+    expect(p.root_dir == "/mnt/arch" &&
+               p.db_path == "/mnt/arch/var/lib/pacman/",
+           "RootDir without explicit DBPath must derive <RootDir>/var/lib/pacman/");
+  }
+
+  // Explicit DBPath in [options] and non-[options] section isolation.
+  {
+    TempStatusFile conf(
+        "  # Leading comment\n"
+        "[core]\n"
+        "DBPath = /wrong/before/options\n"
+        "[options]\n"
+        "  DBPath = /custom/pacman/db  \n"
+        "  # DBPath = /commented/out\n"
+        "[extra]\n"
+        "DBPath = /wrong/after/options\n");
+    const PacmanResolvedPaths p = resolve_pacman_db_paths(conf.path());
+    expect(p.root_dir == "/" && p.db_path == "/custom/pacman/db",
+           "pacman.conf [options] DBPath must be respected while ignoring other sections");
+
+    // Explicit overrides take precedence over pacman.conf.
+    const PacmanResolvedPaths overridden =
+        resolve_pacman_db_paths(conf.path(), "/override/root", "/override/db");
+    expect(overridden.root_dir == "/override/root" &&
+               overridden.db_path == "/override/db",
+           "explicit root_dir/db_path overrides must take precedence over pacman.conf");
+  }
+}
+
+void test_pacman_availability_abi_empty_and_provider_failures() {
+  PacmanDiscoveryProvider null_provider(nullptr);
+  expect(std::string(null_provider.id()) == "pacman",
+         "PacmanDiscoveryProvider id() must be pacman");
+  expect(!null_provider.is_available(), "null Pacman backend is unavailable");
+  expect(!null_provider.discover_packages().ok,
+         "null Pacman backend discover_packages() must fail cleanly");
+
+  // Missing library / unsupported ABI diagnostic surfaced.
+  {
+    PacmanDiscoveryProvider provider(std::make_unique<FakePacmanBackend>(
+        false, PacmanBackendQueryResult{}, "unavailable",
+        "missing required symbols in libalpm.so.16: alpm_db_get_pkgcache"));
+    const PackageDiscoveryResult res = provider.discover_packages();
+    expect(!res.ok && res.error_message.find("missing required symbols") !=
+                          std::string::npos,
+           "Pacman availability_error() diagnostic must be surfaced");
+  }
+
+  // Empty local Pacman database -> kSucceeded with 0 packages.
+  {
+    ApplicationDiscoveryService service;
+    service.register_package_provider(std::make_unique<PacmanDiscoveryProvider>(
+        std::make_unique<FakePacmanBackend>(true,
+                                            PacmanBackendQueryResult{})));
+    const DiscoveryPassResult pass = service.discover_with_report();
+    expect(pass.packages.empty() && pass.provider_summaries.size() == 1 &&
+               pass.provider_summaries[0].provider_id == "pacman" &&
+               pass.provider_summaries[0].status ==
+                   ProviderExecutionStatus::kSucceeded,
+           "empty Pacman local database must succeed cleanly with 0 packages");
+  }
+
+  // Inaccessible DB / permission failure isolation alongside GIO.
+  {
+    PacmanBackendQueryResult perm_err;
+    perm_err.ok = false;
+    perm_err.error_kind = PacmanQueryErrorKind::kPermissionDenied;
+    perm_err.error_message = "/var/lib/pacman/local: Permission denied";
+
+    ApplicationDiscoveryService service;
+    service.register_provider(std::make_unique<FakeDiscoveryProvider>(
+        "gio", true, []() {
+          DiscoveryResult r;
+          r.applications.push_back(make_gio_app(
+              "org.example.Visible.desktop", "Visible", true, false, false));
+          return r;
+        }()));
+    service.register_package_provider(std::make_unique<PacmanDiscoveryProvider>(
+        std::make_unique<FakePacmanBackend>(true, std::move(perm_err))));
+
+    const DiscoveryPassResult pass = service.discover_with_report();
+    expect(pass.applications.size() == 1 && pass.packages.empty(),
+           "Pacman failure must not impact GIO discovery");
+    expect(pass.provider_summaries.size() == 2 &&
+               pass.provider_summaries[1].provider_id == "pacman" &&
+               pass.provider_summaries[1].status ==
+                   ProviderExecutionStatus::kFailed &&
+               pass.provider_summaries[1].error_message.find(
+                   "permission denied") != std::string::npos,
+           "Pacman permission failure must be reported cleanly");
+  }
+}
+
+void test_pacman_metadata_reasons_upgrade_id_malformed_and_legacy_isolation() {
+  PacmanBackendQueryResult query;
+
+  // 1. Explicitly installed package with full metadata (licenses, groups,
+  // packager, homepage, description).
+  {
+    PacmanInstalledPackageRecord pkg;
+    pkg.name = "ripgrep";
+    pkg.version = OptionalString::of("14.1.1-1");
+    pkg.architecture = OptionalString::of("x86_64");
+    pkg.description = OptionalString::of(
+        "A search tool that combines the usability of ag with the raw speed of grep");
+    pkg.homepage = OptionalString::of("https://github.com/BurntSushi/ripgrep");
+    pkg.licenses = {"MIT", "Unlicense"};
+    pkg.groups = {"cli-tools", "rust-utils"};
+    pkg.packager = OptionalString::of("Arch Packager <pkg@archlinux.org>");
+    pkg.install_reason = PackageInstallReason::kExplicit;
+    query.packages.push_back(std::move(pkg));
+  }
+  // 2. Dependency-installed package with minimal optional metadata.
+  {
+    PacmanInstalledPackageRecord pkg;
+    pkg.name = "pcre2";
+    pkg.version = OptionalString::of("10.44-1");
+    pkg.architecture = OptionalString::of("x86_64");
+    pkg.install_reason = PackageInstallReason::kDependency;
+    query.packages.push_back(std::move(pkg));
+  }
+  // 3. Package with unknown install reason and arch=any.
+  {
+    PacmanInstalledPackageRecord pkg;
+    pkg.name = "archlinux-keyring";
+    pkg.version = OptionalString::of("20250101-1");
+    pkg.architecture = OptionalString::of("any");
+    pkg.install_reason = PackageInstallReason::kUnknown;
+    query.packages.push_back(std::move(pkg));
+  }
+  // 4. Malformed empty-name record -> skipped with partial diagnostic.
+  {
+    PacmanInstalledPackageRecord bad;
+    bad.version = OptionalString::of("1.0-1");
+    query.packages.push_back(std::move(bad));
+  }
+  // 5. Duplicate record -> skipped with partial diagnostic.
+  {
+    PacmanInstalledPackageRecord dup;
+    dup.name = "ripgrep";
+    dup.version = OptionalString::of("14.1.1-1");
+    dup.architecture = OptionalString::of("x86_64");
+    query.packages.push_back(std::move(dup));
+  }
+
+  std::atomic<int> pacman_avail{0};
+  std::atomic<int> pacman_list{0};
+  auto service = std::make_shared<ApplicationDiscoveryService>();
+  service->register_provider(
+      std::make_unique<FakeDiscoveryProvider>("gio", true, DiscoveryResult{}));
+  service->register_package_provider(std::make_unique<PacmanDiscoveryProvider>(
+      std::make_unique<FakePacmanBackend>(true, std::move(query),
+                                          "libalpm.so.16", "", &pacman_avail,
+                                          &pacman_list)));
+
+  // Legacy GIO-only listApps() must NOT invoke Pacman availability or queries!
+  const DiscoveryPassResult legacy = service->discover_with_report(
+      DiscoveryRequestOptions::only_providers({"gio"}));
+  expect(pacman_avail.load() == 0 && pacman_list.load() == 0 &&
+             legacy.packages.empty(),
+         "legacy GIO-only path must never invoke Pacman provider");
+
+  // Also verify GIO-only isolation through AsyncDiscoveryRunner.
+  {
+    TestPlatformLoop loop;
+    WorkerPoolFixture pool;
+    AsyncDiscoveryRunner runner(
+        service, pool.scheduler(),
+        [&loop](std::function<void()> cb) { loop.post(std::move(cb)); });
+    DiscoveryExecutionOutcome async_legacy;
+    runner.discover_async(
+        [&](DiscoveryExecutionOutcome outcome) {
+          async_legacy = std::move(outcome);
+        },
+        DiscoveryRequestOptions::only_providers({"gio"}));
+    loop.run_one();
+    pool.join_all();
+    expect(pacman_avail.load() == 0 && pacman_list.load() == 0 &&
+               async_legacy.packages.empty(),
+           "async legacy GIO-only path must never invoke Pacman provider");
+  }
+
+  // Full unified discovery separates Pacman packages from applications.
+  const DiscoveryPassResult unified = service->discover_with_report(
+      DiscoveryRequestOptions::all_providers());
+  expect(unified.applications.empty(),
+         "Pacman packages must never appear in confirmed applications vector");
+  expect(unified.packages.size() == 3,
+         "3 valid Pacman packages must be returned while malformed/duplicate "
+         "entries are skipped");
+  expect(unified.provider_summaries.size() == 2 &&
+             unified.provider_summaries[1].provider_id == "pacman" &&
+             unified.provider_summaries[1].status ==
+                 ProviderExecutionStatus::kPartiallyFailed,
+         "malformed/duplicate Pacman entries must surface kPartiallyFailed");
+  if (unified.packages.size() != 3) return;
+
+  const auto& rg = unified.packages[0];
+  const auto& pcre2 = unified.packages[1];
+  const auto& keyring = unified.packages[2];
+
+  expect(rg.package_identity_id == "pacman:ripgrep:system:x86_64" &&
+             rg.provenance.provider_id == "pacman" &&
+             rg.provenance.native_id == "ripgrep" &&
+             rg.provenance.installation_source == InstallationSource::kPacman &&
+             rg.provenance.installation_scope == InstallationScope::kSystem &&
+             rg.installation_state == PackageInstallationState::kInstalled &&
+             rg.classification == ApplicationClassification::kUnknown,
+         "Pacman provenance, state, identity, and unknown classification must match");
+  expect(rg.version.has_value() && rg.version.value() == "14.1.1-1" &&
+             rg.architecture.has_value() &&
+             rg.architecture.value() == "x86_64" &&
+             rg.description.has_value() &&
+             rg.homepage.has_value() &&
+             rg.homepage.value() == "https://github.com/BurntSushi/ripgrep" &&
+             rg.packager.has_value() &&
+             rg.packager.value() == "Arch Packager <pkg@archlinux.org>" &&
+             rg.licenses.size() == 2 && rg.licenses[0] == "MIT" &&
+             rg.licenses[1] == "Unlicense" &&
+             rg.groups.size() == 2 && rg.groups[0] == "cli-tools" &&
+             rg.groups[1] == "rust-utils" &&
+             rg.install_reason == PackageInstallReason::kExplicit,
+         "authoritative Pacman metadata fields must be preserved");
+
+  expect(pcre2.install_reason == PackageInstallReason::kDependency &&
+             !pcre2.description.has_value() && !pcre2.homepage.has_value() &&
+             !pcre2.packager.has_value() && pcre2.licenses.empty() &&
+             pcre2.groups.empty(),
+         "dependency reason and missing optional fields must remain accurate");
+  expect(keyring.package_identity_id == "pacman:archlinux-keyring:system:any" &&
+             keyring.install_reason == PackageInstallReason::kUnknown,
+         "unknown install reason and arch=any identity must be preserved");
+
+  // Stable package_identity_id across version upgrade.
+  PacmanBackendQueryResult upgraded;
+  {
+    PacmanInstalledPackageRecord pkg;
+    pkg.name = "ripgrep";
+    pkg.version = OptionalString::of("15.0.0-1");
+    pkg.architecture = OptionalString::of("x86_64");
+    pkg.install_reason = PackageInstallReason::kExplicit;
+    upgraded.packages.push_back(std::move(pkg));
+  }
+  PacmanDiscoveryProvider upgraded_provider(std::make_unique<FakePacmanBackend>(
+      true, std::move(upgraded)));
+  const PackageDiscoveryResult upgraded_res =
+      upgraded_provider.discover_packages();
+  expect(upgraded_res.ok && upgraded_res.packages.size() == 1 &&
+             upgraded_res.packages[0].package_identity_id ==
+                 rg.package_identity_id &&
+             upgraded_res.packages[0].version.value() == "15.0.0-1",
+         "Pacman package_identity_id must stay stable across version upgrades");
+}
+
+// --- NixDiscoveryProvider tests ---
+
+class TempNixDir {
+ public:
+  TempNixDir() {
+    static std::atomic<int> counter{0};
+    path_ = "/tmp/fda-nix-test-" + std::to_string(getpid()) + "-" +
+            std::to_string(counter.fetch_add(1));
+    mkdir(path_.c_str(), 0700);
+  }
+
+  ~TempNixDir() {
+    for (auto it = files_.rbegin(); it != files_.rend(); ++it) {
+      unlink(it->c_str());
+    }
+    for (auto it = dirs_.rbegin(); it != dirs_.rend(); ++it) {
+      rmdir(it->c_str());
+    }
+    rmdir(path_.c_str());
+  }
+
+  const std::string& path() const { return path_; }
+
+  std::string make_dir(const std::string& rel) {
+    std::string cur = path_;
+    size_t pos = 0;
+    while (pos < rel.size()) {
+      size_t slash = rel.find('/', pos);
+      if (slash == std::string::npos) slash = rel.size();
+      const std::string seg = rel.substr(pos, slash - pos);
+      if (!seg.empty()) {
+        cur += "/" + seg;
+        if (mkdir(cur.c_str(), 0700) == 0) {
+          dirs_.push_back(cur);
+        }
+      }
+      pos = slash + 1;
+    }
+    return cur;
+  }
+
+  std::string write_file(const std::string& rel, const std::string& content) {
+    const size_t slash = rel.rfind('/');
+    if (slash != std::string::npos) {
+      make_dir(rel.substr(0, slash));
+    }
+    const std::string full = path_ + "/" + rel;
+    std::ofstream out(full.c_str(), std::ios::binary);
+    out << content;
+    out.close();
+    files_.push_back(full);
+    return full;
+  }
+
+  std::string make_symlink(const std::string& rel, const std::string& target) {
+    const size_t slash = rel.rfind('/');
+    if (slash != std::string::npos) {
+      make_dir(rel.substr(0, slash));
+    }
+    const std::string full = path_ + "/" + rel;
+    unlink(full.c_str());
+    if (symlink(target.c_str(), full.c_str()) == 0) {
+      files_.push_back(full);
+    }
+    return full;
+  }
+
+ private:
+  std::string path_;
+  std::vector<std::string> dirs_;
+  std::vector<std::string> files_;
+};
+
+void test_nix_manifest_versions_v1_v2_v3_and_multiple_outputs() {
+  TempNixDir root;
+
+  // Version 1 manifest (array elements, uri / originalUri, multiple outputs).
+  const std::string p_v1 = root.make_dir("p_v1");
+  root.write_file(
+      "p_v1/manifest.json",
+      "{\n"
+      "  \"version\": 1,\n"
+      "  \"elements\": [\n"
+      "    {\n"
+      "      \"active\": true,\n"
+      "      \"attrPath\": \"legacyPackages.x86_64-linux.ripgrep\",\n"
+      "      \"originalUri\": \"flake:nixpkgs\",\n"
+      "      \"uri\": \"github:NixOS/nixpkgs/1111111\",\n"
+      "      \"outputs\": [\"out\", \"man\"],\n"
+      "      \"priority\": 5,\n"
+      "      \"storePaths\": [\n"
+      "        \"/nix/store/0123456789abcdfghijklmnpqrsvwxyz-ripgrep-14.1.0\",\n"
+      "        \"/nix/store/0123456789abcdfghijklmnpqrsvwxyz-ripgrep-14.1.0-man\"\n"
+      "      ]\n"
+      "    },\n"
+      "    {\n"
+      "      \"active\": false,\n"
+      "      \"attrPath\": \"legacyPackages.x86_64-linux.hidden-pkg\",\n"
+      "      \"originalUri\": \"flake:nixpkgs\",\n"
+      "      \"uri\": \"github:NixOS/nixpkgs/1111111\",\n"
+      "      \"storePaths\": [\"/nix/store/0123456789abcdfghijklmnpqrsvwxyz-hidden-pkg-1.0\"]\n"
+      "    }\n"
+      "  ]\n"
+      "}\n");
+
+  // Version 2 manifest (array elements, url / originalUrl, separate output
+  // elements for the same attrPath must stay distinct).
+  const std::string p_v2 = root.make_dir("p_v2");
+  root.write_file(
+      "p_v2/manifest.json",
+      "{\n"
+      "  \"version\": 2,\n"
+      "  \"elements\": [\n"
+      "    {\n"
+      "      \"active\": true,\n"
+      "      \"attrPath\": \"legacyPackages.x86_64-linux.openssl\",\n"
+      "      \"originalUrl\": \"flake:nixpkgs\",\n"
+      "      \"url\": \"github:NixOS/nixpkgs/2222222\",\n"
+      "      \"outputs\": [\"bin\"],\n"
+      "      \"storePaths\": [\"/nix/store/0123456789abcdfghijklmnpqrsvwxyz-openssl-3.0.13-bin\"]\n"
+      "    },\n"
+      "    {\n"
+      "      \"active\": true,\n"
+      "      \"attrPath\": \"legacyPackages.x86_64-linux.openssl\",\n"
+      "      \"originalUrl\": \"flake:nixpkgs\",\n"
+      "      \"url\": \"github:NixOS/nixpkgs/2222222\",\n"
+      "      \"outputs\": [\"man\"],\n"
+      "      \"storePaths\": [\"/nix/store/0123456789abcdfghijklmnpqrsvwxyz-openssl-3.0.13-man\"]\n"
+      "    }\n"
+      "  ]\n"
+      "}\n");
+
+  // Version 3 manifest (object map elements, url / originalUrl, active +
+  // inactive elements, null outputs, multiple storePaths).
+  const std::string p_v3 = root.make_dir("p_v3");
+  root.write_file(
+      "p_v3/manifest.json",
+      "{\n"
+      "  \"version\": 3,\n"
+      "  \"elements\": {\n"
+      "    \"hello\": {\n"
+      "      \"active\": true,\n"
+      "      \"attrPath\": \"packages.aarch64-linux.hello\",\n"
+      "      \"originalUrl\": \"flake:nixpkgs\",\n"
+      "      \"url\": \"github:NixOS/nixpkgs/3333333\",\n"
+      "      \"outputs\": null,\n"
+      "      \"priority\": 10,\n"
+      "      \"storePaths\": [\n"
+      "        \"/nix/store/0123456789abcdfghijklmnpqrsvwxyz-hello-2.12.1\",\n"
+      "        \"/nix/store/0123456789abcdfghijklmnpqrsvwxyz-hello-2.12.1-doc\"\n"
+      "      ]\n"
+      "    },\n"
+      "    \"inactive-tool\": {\n"
+      "      \"active\": false,\n"
+      "      \"attrPath\": \"legacyPackages.aarch64-linux.inactive-tool\",\n"
+      "      \"originalUrl\": \"flake:nixpkgs\",\n"
+      "      \"storePaths\": [\"/nix/store/0123456789abcdfghijklmnpqrsvwxyz-inactive-tool-1.0\"]\n"
+      "    }\n"
+      "  }\n"
+      "}\n");
+
+  NixDiscoveryConfig cfg;
+  cfg.include_standard_profiles = false;
+  cfg.explicit_profiles.push_back({p_v1, InstallationScope::kUser, "v1"});
+  cfg.explicit_profiles.push_back({p_v2, InstallationScope::kUser, "v2"});
+  cfg.explicit_profiles.push_back({p_v3, InstallationScope::kUser, "v3"});
+
+  NixDiscoveryProvider provider(cfg);
+  expect(std::string(provider.id()) == "nix" && provider.is_available(),
+         "NixDiscoveryProvider must report id=nix and available for fixtures");
+
+  const PackageDiscoveryResult res = provider.discover_packages();
+  expect(res.ok && res.error_message.empty(),
+         "valid v1/v2/v3 Nix manifests must succeed cleanly");
+  expect(res.packages.size() == 4,
+         "must discover 4 active elements (1 v1 + 2 v2 outputs + 1 v3) and "
+         "exclude inactive elements");
+  if (res.packages.size() != 4) return;
+
+  const auto& v1_rg = res.packages[0];
+  const auto& v2_bin = res.packages[1];
+  const auto& v2_man = res.packages[2];
+  const auto& v3_hello = res.packages[3];
+
+  expect(v1_rg.package_name == "ripgrep" &&
+             v1_rg.version.has_value() && v1_rg.version.value() == "14.1.0" &&
+             v1_rg.architecture.has_value() &&
+             v1_rg.architecture.value() == "x86_64-linux" &&
+             v1_rg.source_url.has_value() &&
+             v1_rg.source_url.value() == "flake:nixpkgs" &&
+             v1_rg.locked_url.has_value() &&
+             v1_rg.locked_url.value() == "github:NixOS/nixpkgs/1111111" &&
+             v1_rg.outputs.size() == 2 && v1_rg.store_paths.size() == 2 &&
+             v1_rg.install_priority.has_value() &&
+             v1_rg.install_priority.value() == 5 &&
+             v1_rg.provenance.installation_source == InstallationSource::kNix &&
+             v1_rg.classification == ApplicationClassification::kUnknown,
+         "v1 manifest metadata, outputs, storePaths, priority, and provenance "
+         "must be preserved");
+
+  expect(v2_bin.package_name == "openssl" &&
+             v2_bin.version.has_value() && v2_bin.version.value() == "3.0.13" &&
+             v2_man.package_name == "openssl" &&
+             v2_bin.package_identity_id != v2_man.package_identity_id,
+         "v2 separate output installs of same attrPath must strip output "
+         "suffix from version and have distinct identities");
+
+  expect(v3_hello.package_name == "hello" &&
+             v3_hello.version.has_value() &&
+             v3_hello.version.value() == "2.12.1" &&
+             v3_hello.architecture.has_value() &&
+             v3_hello.architecture.value() == "aarch64-linux" &&
+             v3_hello.outputs.empty() && v3_hello.store_paths.size() == 2 &&
+             v3_hello.install_priority.has_value() &&
+             v3_hello.install_priority.value() == 10 &&
+             v3_hello.package_identity_id == "nix:hello:user:v3",
+         "v3 object-map element metadata, multiple storePaths, and stable "
+         "identity must match");
+}
+
+void test_nix_profile_aliases_separate_installations_and_upgrade_identity() {
+  TempNixDir root;
+
+  // Simulated Nix store generation directories for user profile (gen 1 & gen 2)
+  // and a separate system default profile.
+  const std::string gen1_store = root.make_dir("store/gen1-profile");
+  root.write_file(
+      "store/gen1-profile/manifest.json",
+      "{\n"
+      "  \"version\": 3,\n"
+      "  \"elements\": {\n"
+      "    \"ripgrep\": {\n"
+      "      \"active\": true,\n"
+      "      \"attrPath\": \"legacyPackages.x86_64-linux.ripgrep\",\n"
+      "      \"originalUrl\": \"flake:nixpkgs\",\n"
+      "      \"url\": \"github:NixOS/nixpkgs/aaaa\",\n"
+      "      \"storePaths\": [\"/nix/store/0123456789abcdfghijklmnpqrsvwxyz-ripgrep-14.0.0\"]\n"
+      "    }\n"
+      "  }\n"
+      "}\n");
+
+  const std::string gen2_store = root.make_dir("store/gen2-profile");
+  root.write_file(
+      "store/gen2-profile/manifest.json",
+      "{\n"
+      "  \"version\": 3,\n"
+      "  \"elements\": {\n"
+      "    \"ripgrep\": {\n"
+      "      \"active\": true,\n"
+      "      \"attrPath\": \"legacyPackages.x86_64-linux.ripgrep\",\n"
+      "      \"originalUrl\": \"flake:nixpkgs\",\n"
+      "      \"url\": \"github:NixOS/nixpkgs/bbbb\",\n"
+      "      \"storePaths\": [\"/nix/store/zyxwvsqrpnmkljihgfcdba9876543210-ripgrep-15.0.0\"]\n"
+      "    }\n"
+      "  }\n"
+      "}\n");
+
+  const std::string sys_store = root.make_dir("store/system-default");
+  root.write_file(
+      "store/system-default/manifest.json",
+      "{\n"
+      "  \"version\": 3,\n"
+      "  \"elements\": {\n"
+      "    \"ripgrep\": {\n"
+      "      \"active\": true,\n"
+      "      \"attrPath\": \"legacyPackages.x86_64-linux.ripgrep\",\n"
+      "      \"originalUrl\": \"flake:nixpkgs\",\n"
+      "      \"storePaths\": [\"/nix/store/0123456789abcdfghijklmnpqrsvwxyz-ripgrep-14.0.0\"]\n"
+      "    }\n"
+      "  }\n"
+      "}\n");
+
+  // Historical generation link in the same directory must NOT be scanned.
+  root.make_symlink("profiles/per-user/alice/profile-1-link", gen1_store);
+  root.make_symlink("profiles/per-user/alice/profile-2-link", gen2_store);
+
+  // Active user profile aliases: XDG profile, ~/.nix-profile, and
+  // per-user/alice/profile ALL point to gen1_store -> must deduplicate aliases!
+  const std::string per_user_link =
+      root.make_symlink("profiles/per-user/alice/profile", gen1_store);
+  root.make_symlink("home/.nix-profile", per_user_link);
+  root.make_symlink("xdg/nix/profile", per_user_link);
+
+  // Separate system default profile points to sys_store -> must be preserved!
+  root.make_symlink("profiles/default", sys_store);
+
+  NixDiscoveryConfig cfg;
+  cfg.include_standard_profiles = true;
+  cfg.home_dir_override = OptionalString::of(root.path() + "/home");
+  cfg.xdg_state_home_override = OptionalString::of(root.path() + "/xdg");
+  cfg.user_name_override = OptionalString::of("alice");
+  cfg.system_profiles_root = root.path() + "/profiles";
+
+  NixDiscoveryProvider provider(cfg);
+  const PackageDiscoveryResult gen1_res = provider.discover_packages();
+  expect(gen1_res.ok && gen1_res.error_message.empty(),
+         "standard user/XDG/system Nix profiles must discover cleanly");
+  expect(gen1_res.packages.size() == 2,
+         "3 symlink aliases of the user profile must deduplicate to 1 while "
+         "separate system default profile is preserved (total 2)");
+  if (gen1_res.packages.size() != 2) return;
+
+  const auto& user_rg_v1 = gen1_res.packages[0];
+  const auto& sys_rg = gen1_res.packages[1];
+  expect(user_rg_v1.provenance.installation_scope == InstallationScope::kUser &&
+             sys_rg.provenance.installation_scope == InstallationScope::kSystem,
+         "user and system profile scopes must remain distinct");
+  expect(user_rg_v1.package_identity_id != sys_rg.package_identity_id,
+         "same package installed in user and system profiles must have "
+         "distinct package_identity_ids");
+
+  // Upgrade user profile generation symlink from gen1_store -> gen2_store
+  // (both profile store hash AND package store hash + version change).
+  root.make_symlink("profiles/per-user/alice/profile", gen2_store);
+  const PackageDiscoveryResult gen2_res = provider.discover_packages();
+  expect(gen2_res.ok && gen2_res.packages.size() == 2,
+         "upgraded user profile generation must still return 2 active records");
+  if (gen2_res.packages.size() != 2) return;
+
+  const auto& user_rg_v2 = gen2_res.packages[0];
+  expect(user_rg_v2.package_identity_id == user_rg_v1.package_identity_id,
+         "Nix package_identity_id must stay stable across store-hash and "
+         "profile-generation upgrades");
+  expect(user_rg_v2.version.has_value() && user_rg_v2.version.value() == "15.0.0",
+         "upgraded Nix package version must reflect new generation");
+}
+
+void test_nix_missing_empty_malformed_unsupported_legacy_and_isolation() {
+  // 1. Missing profile directories -> unavailable.
+  {
+    NixDiscoveryConfig cfg;
+    cfg.include_standard_profiles = false;
+    cfg.explicit_profiles.push_back(
+        {"/tmp/fda-nix-missing-profile-99999", InstallationScope::kUser, "u"});
+    NixDiscoveryProvider provider(cfg);
+    expect(!provider.is_available(),
+           "absent Nix profiles must report is_available() == false");
+  }
+
+  TempNixDir root;
+
+  // 2. Empty profile dir -> succeeds with 0 packages.
+  {
+    const std::string empty_dir = root.make_dir("empty_profile");
+    NixDiscoveryConfig cfg;
+    cfg.include_standard_profiles = false;
+    cfg.explicit_profiles.push_back(
+        {empty_dir, InstallationScope::kUser, "empty"});
+    NixDiscoveryProvider provider(cfg);
+    expect(provider.is_available(), "existing empty profile is available");
+    const PackageDiscoveryResult res = provider.discover_packages();
+    expect(res.ok && res.packages.empty() && res.error_message.empty(),
+           "empty Nix profile must succeed cleanly with 0 packages");
+  }
+
+  // 3. Legacy manifest.nix -> explicitly reported unsupported, never evaluated.
+  {
+    const std::string legacy_dir = root.make_dir("legacy_nix");
+    root.write_file("legacy_nix/manifest.nix",
+                    "[ { name = \"hello-2.12\"; outPath = \"/nix/store/x\"; } ]\n");
+    NixDiscoveryConfig cfg;
+    cfg.include_standard_profiles = false;
+    cfg.explicit_profiles.push_back(
+        {legacy_dir, InstallationScope::kUser, "legacy"});
+    NixDiscoveryProvider provider(cfg);
+    const PackageDiscoveryResult res = provider.discover_packages();
+    expect(!res.ok && res.packages.empty() &&
+               res.error_message.find("manifest.nix") != std::string::npos &&
+               res.error_message.find("unsupported") != std::string::npos,
+           "legacy manifest.nix must fail with explicit unsupported diagnostic");
+  }
+
+  // 4. Unsupported manifest.json schema version -> explicit diagnostic.
+  {
+    const std::string v99_dir = root.make_dir("unsupported_v99");
+    root.write_file("unsupported_v99/manifest.json",
+                    "{\"version\": 99, \"elements\": {}}\n");
+    NixDiscoveryConfig cfg;
+    cfg.include_standard_profiles = false;
+    cfg.explicit_profiles.push_back(
+        {v99_dir, InstallationScope::kUser, "v99"});
+    const PackageDiscoveryResult res =
+        NixDiscoveryProvider(cfg).discover_packages();
+    expect(!res.ok &&
+               res.error_message.find("unsupported") != std::string::npos,
+           "unsupported Nix manifest.json version must be explicitly reported");
+  }
+
+  // 5. Malformed JSON + malformed element mixed with valid profile + GIO
+  // isolation + legacy GIO-only listApps() isolation.
+  const std::string bad_json_dir = root.make_dir("bad_json");
+  root.write_file("bad_json/manifest.json", "{ broken json");
+
+  const std::string mixed_dir = root.make_dir("mixed_valid");
+  root.write_file(
+      "mixed_valid/manifest.json",
+      "{\n"
+      "  \"version\": 3,\n"
+      "  \"elements\": {\n"
+      "    \"bad\": {\"active\": true, \"storePaths\": []},\n"
+      "    \"jq\": {\n"
+      "      \"active\": true,\n"
+      "      \"attrPath\": \"legacyPackages.x86_64-linux.jq\",\n"
+      "      \"storePaths\": [\"/nix/store/0123456789abcdfghijklmnpqrsvwxyz-jq-1.7.1\"]\n"
+      "    }\n"
+      "  }\n"
+      "}\n");
+
+  NixDiscoveryConfig mixed_cfg;
+  mixed_cfg.include_standard_profiles = false;
+  mixed_cfg.explicit_profiles.push_back(
+      {bad_json_dir, InstallationScope::kOther, "bad"});
+  mixed_cfg.explicit_profiles.push_back(
+      {mixed_dir, InstallationScope::kUser, "mixed"});
+
+  ApplicationDiscoveryService service;
+  service.register_provider(std::make_unique<FakeDiscoveryProvider>(
+      "gio", true, []() {
+        DiscoveryResult r;
+        r.applications.push_back(make_gio_app(
+            "org.example.Visible.desktop", "Visible", true, false, false));
+        return r;
+      }()));
+  service.register_package_provider(
+      std::make_unique<NixDiscoveryProvider>(mixed_cfg));
+
+  const DiscoveryPassResult unified =
+      service.discover_with_report(DiscoveryRequestOptions::all_providers());
+  expect(unified.applications.size() == 1 &&
+             unified.applications[0].provenance.provider_id == "gio",
+         "Nix packages must NEVER appear in confirmed applications vector");
+  expect(unified.packages.size() == 1 &&
+             unified.packages[0].package_name == "jq" &&
+             unified.packages[0].classification ==
+                 ApplicationClassification::kUnknown,
+         "valid Nix profile must still yield packages despite sibling bad JSON "
+         "and malformed elements");
+  expect(unified.provider_summaries.size() == 2 &&
+             unified.provider_summaries[1].provider_id == "nix" &&
+             unified.provider_summaries[1].status ==
+                 ProviderExecutionStatus::kPartiallyFailed,
+         "mixed Nix profile errors must surface kPartiallyFailed");
+
+  // Legacy GIO-only listApps() must NEVER execute Nix provider.
+  std::atomic<int> nix_avail{0};
+  std::atomic<int> nix_disc{0};
+  auto isolated_service = std::make_shared<ApplicationDiscoveryService>();
+  isolated_service->register_provider(
+      std::make_unique<FakeDiscoveryProvider>("gio", true, DiscoveryResult{}));
+  isolated_service->register_package_provider(
+      std::make_unique<CountingPackageProvider>(
+          "nix", true, PackageDiscoveryResult{}, &nix_avail, &nix_disc));
+
+  TestPlatformLoop loop;
+  WorkerPoolFixture pool;
+  AsyncDiscoveryRunner runner(
+      isolated_service, pool.scheduler(),
+      [&loop](std::function<void()> cb) { loop.post(std::move(cb)); });
+  DiscoveryExecutionOutcome legacy_outcome;
+  runner.discover_async(
+      [&](DiscoveryExecutionOutcome outcome) {
+        legacy_outcome = std::move(outcome);
+      },
+      DiscoveryRequestOptions::only_providers({"gio"}));
+  loop.run_one();
+  pool.join_all();
+  expect(nix_avail.load() == 0 && nix_disc.load() == 0 &&
+             legacy_outcome.packages.empty(),
+         "legacy GIO-only listApps() must never run Nix provider");
+}
+
+// --- Step 9: Identity Resolution, Deduplication & Classification tests ---
+
+class FakeOwnershipLookup final : public PackageOwnershipLookup {
+ public:
+  void add(const std::string& path, PackageOwnershipEvidence evidence) {
+    owners_[path].push_back(std::move(evidence));
+  }
+
+  std::vector<PackageOwnershipEvidence> lookup_file_owners(
+      const std::string& file_path) const override {
+    const auto it = owners_.find(file_path);
+    if (it == owners_.end()) return {};
+    return it->second;
+  }
+
+ private:
+  std::unordered_map<std::string, std::vector<PackageOwnershipEvidence>>
+      owners_;
+};
+
+const ResolvedApplication* find_resolved_by_id(
+    const ResolvedDiscoveryInventory& inv, const std::string& id) {
+  for (const auto& app : inv.applications) {
+    if (app.resolved_id == id) return &app;
+  }
+  return nullptr;
+}
+
+void test_resolution_dedup_separate_installations_and_order_independence() {
+  DiscoveryPassResult pass;
+
+  // 1. Flatpak app org.example.Suite (user, stable) + TWO GIO desktop entries
+  // referencing X-Flatpak=org.example.Suite -> MUST merge into ONE installation
+  // with 2 desktop_entries!
+  DiscoveredApplication fp_suite;
+  fp_suite.provenance.provider_id = "flatpak";
+  fp_suite.provenance.native_id = "org.example.Suite";
+  fp_suite.provenance.installation_source = InstallationSource::kFlatpak;
+  fp_suite.provenance.installation_scope = InstallationScope::kUser;
+  fp_suite.package_id = OptionalString::of("org.example.Suite");
+  fp_suite.installation_id = OptionalString::of("user/stable/x86_64");
+  fp_suite.application_id = build_application_id(
+      "flatpak", "org.example.Suite", InstallationScope::kUser,
+      fp_suite.installation_id);
+  fp_suite.metadata.name = OptionalString::of("Suite");
+  fp_suite.metadata.version = OptionalString::of("2.4.0");
+  fp_suite.metadata.architecture = OptionalString::of("x86_64");
+  fp_suite.metadata.branch = OptionalString::of("stable");
+  pass.applications.push_back(fp_suite);
+
+  DiscoveredApplication gio_suite_main = make_gio_app(
+      "org.example.Suite.desktop", "Suite", true, true, false);
+  gio_suite_main.correlation_hints.flatpak_app_id = OptionalString::of("org.example.Suite");
+  pass.applications.push_back(gio_suite_main);
+
+  DiscoveredApplication gio_suite_viewer = make_gio_app(
+      "org.example.Suite.Viewer.desktop", "Suite Viewer", true, false, false);
+  gio_suite_viewer.correlation_hints.flatpak_app_id = OptionalString::of("org.example.Suite");
+  pass.applications.push_back(gio_suite_viewer);
+
+  // 2. Same display name "Firefox" installed separately as Flatpak (system),
+  // Snap primary ("firefox"), Snap parallel instance ("firefox_beta"), AND
+  // native GIO entry -> MUST NEVER merge across package managers or parallel
+  // instances!
+  DiscoveredApplication fp_ff;
+  fp_ff.provenance.provider_id = "flatpak";
+  fp_ff.provenance.native_id = "org.mozilla.firefox";
+  fp_ff.provenance.installation_source = InstallationSource::kFlatpak;
+  fp_ff.provenance.installation_scope = InstallationScope::kSystem;
+  fp_ff.package_id = OptionalString::of("org.mozilla.firefox");
+  fp_ff.installation_id = OptionalString::of("default/stable/x86_64");
+  fp_ff.application_id = build_application_id(
+      "flatpak", "org.mozilla.firefox", InstallationScope::kSystem,
+      fp_ff.installation_id);
+  fp_ff.metadata.name = OptionalString::of("Firefox");
+  fp_ff.metadata.version = OptionalString::of("130.0");
+  pass.applications.push_back(fp_ff);
+
+  DiscoveredApplication snap_ff;
+  snap_ff.provenance.provider_id = "snap";
+  snap_ff.provenance.native_id = "firefox";
+  snap_ff.provenance.installation_source = InstallationSource::kSnap;
+  snap_ff.provenance.installation_scope = InstallationScope::kSystem;
+  snap_ff.package_id = OptionalString::of("firefox");
+  snap_ff.application_id =
+      build_application_id("snap", "firefox", InstallationScope::kSystem);
+  snap_ff.metadata.name = OptionalString::of("Firefox");
+  snap_ff.metadata.version = OptionalString::of("131.0");
+  pass.applications.push_back(snap_ff);
+
+  DiscoveredApplication snap_ff_beta;
+  snap_ff_beta.provenance.provider_id = "snap";
+  snap_ff_beta.provenance.native_id = "firefox_beta";
+  snap_ff_beta.provenance.installation_source = InstallationSource::kSnap;
+  snap_ff_beta.provenance.installation_scope = InstallationScope::kSystem;
+  snap_ff_beta.package_id = OptionalString::of("firefox");
+  snap_ff_beta.installation_id = OptionalString::of("beta");
+  snap_ff_beta.application_id = build_application_id(
+      "snap", "firefox_beta", InstallationScope::kSystem,
+      snap_ff_beta.installation_id);
+  snap_ff_beta.metadata.name = OptionalString::of("Firefox");
+  snap_ff_beta.metadata.version = OptionalString::of("132.0b1");
+  pass.applications.push_back(snap_ff_beta);
+
+  // GIO entry with X-SnapInstanceName=firefox -> merges ONLY into snap_ff, NOT
+  // into snap_ff_beta or fp_ff!
+  DiscoveredApplication gio_snap_ff =
+      make_gio_app("firefox_firefox.desktop", "Firefox", true, true, false);
+  gio_snap_ff.correlation_hints.snap_instance_name = OptionalString::of("firefox");
+  pass.applications.push_back(gio_snap_ff);
+
+  // Unmarked native GIO Firefox entry -> MUST stay separate (never merged by
+  // display name "Firefox" alone!).
+  DiscoveredApplication gio_native_ff =
+      make_gio_app("firefox.desktop", "Firefox", true, true, false);
+  pass.applications.push_back(gio_native_ff);
+
+  const ResolvedDiscoveryInventory forward = resolve_discovery_inventory(pass);
+
+  // Reverse input ordering and verify 100% deterministic identical output.
+  DiscoveryPassResult reversed_pass = pass;
+  std::reverse(reversed_pass.applications.begin(),
+               reversed_pass.applications.end());
+  const ResolvedDiscoveryInventory backward =
+      resolve_discovery_inventory(reversed_pass);
+
+  expect(forward.applications.size() == 5,
+         "expected 5 separate resolved installations (1 merged Flatpak Suite + "
+         "4 distinct Firefox installations across Flatpak, Snap, Snap beta, "
+         "and native GIO)");
+  expect(forward.applications.size() == backward.applications.size(),
+         "reversed provider order must produce identical application count");
+
+  for (size_t i = 0;
+       i < forward.applications.size() && i < backward.applications.size();
+       ++i) {
+    expect(forward.applications[i].resolved_id ==
+               backward.applications[i].resolved_id &&
+               forward.applications[i].desktop_entries.size() ==
+                   backward.applications[i].desktop_entries.size() &&
+               forward.applications[i].original_record_ids ==
+                   backward.applications[i].original_record_ids,
+           "resolution output must be deterministic and independent of "
+           "provider execution order");
+  }
+
+  const auto* suite = find_resolved_by_id(forward, fp_suite.application_id);
+  expect(suite != nullptr, "merged Flatpak Suite must exist");
+  if (suite != nullptr) {
+    expect(suite->desktop_entries.size() == 2,
+           "both desktop entries belonging to Flatpak Suite must be attached");
+    expect(suite->original_record_ids.size() == 3,
+           "all 3 original provider IDs must be preserved in provenance");
+    expect(suite->metadata.version.has_value() &&
+               suite->metadata.version.value() == "2.4.0",
+           "installed Flatpak version must be preserved");
+    expect(suite->classification == ApplicationClassification::kUnknown,
+           "Terminal=false desktop entries alone must NOT classify Suite as "
+           "GUI without authoritative metadata");
+  }
+
+  const auto* resolved_snap_ff =
+      find_resolved_by_id(forward, snap_ff.application_id);
+  const auto* resolved_snap_beta =
+      find_resolved_by_id(forward, snap_ff_beta.application_id);
+  expect(resolved_snap_ff != nullptr &&
+             resolved_snap_ff->desktop_entries.size() == 1 &&
+             resolved_snap_ff->desktop_entries[0].desktop_file_id ==
+                 "firefox_firefox.desktop",
+         "Snap primary instance must absorb its X-SnapInstanceName desktop "
+         "entry");
+  expect(resolved_snap_beta != nullptr &&
+             resolved_snap_beta->desktop_entries.empty(),
+         "Snap parallel beta instance must remain separate without absorbing "
+         "primary instance desktop entry");
+}
+
+void test_resolution_ambiguous_matches_and_conflicting_metadata() {
+  DiscoveryPassResult pass;
+
+  // 1. Ambiguous X-Flatpak: org.example.Dual installed in BOTH user and system
+  // scopes; GIO entry has X-Flatpak=org.example.Dual with scope=kUnknown ->
+  // MUST NOT guess; must preserve GIO separately with explicit ambiguity!
+  DiscoveredApplication fp_user;
+  fp_user.provenance.provider_id = "flatpak";
+  fp_user.provenance.native_id = "org.example.Dual";
+  fp_user.provenance.installation_source = InstallationSource::kFlatpak;
+  fp_user.provenance.installation_scope = InstallationScope::kUser;
+  fp_user.package_id = OptionalString::of("org.example.Dual");
+  fp_user.installation_id = OptionalString::of("user/stable/x86_64");
+  fp_user.application_id = build_application_id(
+      "flatpak", "org.example.Dual", InstallationScope::kUser,
+      fp_user.installation_id);
+  fp_user.metadata.version = OptionalString::of("1.0.0");
+  pass.applications.push_back(fp_user);
+
+  DiscoveredApplication fp_sys = fp_user;
+  fp_sys.provenance.installation_scope = InstallationScope::kSystem;
+  fp_sys.installation_id = OptionalString::of("default/stable/x86_64");
+  fp_sys.application_id = build_application_id(
+      "flatpak", "org.example.Dual", InstallationScope::kSystem,
+      fp_sys.installation_id);
+  pass.applications.push_back(fp_sys);
+
+  DiscoveredApplication gio_dual =
+      make_gio_app("org.example.Dual.desktop", "Dual App", true, false, false);
+  gio_dual.correlation_hints.flatpak_app_id = OptionalString::of("org.example.Dual");
+  pass.applications.push_back(gio_dual);
+
+  // 2. Conflicting metadata + installed vs catalog release version separation:
+  // Snap "editor" (installed version 1.2.3, license MIT) + GIO entry ("Editor
+  // Desktop") + AppStream metainfo ("Editor AppStream", license GPL-3.0,
+  // catalog release 9.9.9).
+  DiscoveredApplication snap_ed;
+  snap_ed.provenance.provider_id = "snap";
+  snap_ed.provenance.native_id = "editor";
+  snap_ed.provenance.installation_source = InstallationSource::kSnap;
+  snap_ed.provenance.installation_scope = InstallationScope::kSystem;
+  snap_ed.package_id = OptionalString::of("editor");
+  snap_ed.application_id =
+      build_application_id("snap", "editor", InstallationScope::kSystem);
+  snap_ed.metadata.name = OptionalString::of("Editor Snap");
+  snap_ed.metadata.version = OptionalString::of("1.2.3");
+  snap_ed.metadata.license = OptionalString::of("MIT");
+  snap_ed.metadata.summary = OptionalString::of("Snap summary");
+  pass.applications.push_back(snap_ed);
+
+  DiscoveredApplication gio_ed = make_gio_app(
+      "editor_editor.desktop", "Editor Desktop", true, true, false);
+  gio_ed.correlation_hints.snap_instance_name = OptionalString::of("editor");
+  pass.applications.push_back(gio_ed);
+
+  AppStreamMetadataRecord as_ed;
+  as_ed.component_id = "org.example.Editor";
+  as_ed.component_kind = "desktop-application";
+  as_ed.name = OptionalString::of("Editor AppStream");
+  as_ed.summary = OptionalString::of("AppStream metainfo summary");
+  as_ed.project_license = OptionalString::of("GPL-3.0");
+  as_ed.desktop_launchable_ids = {"editor_editor.desktop"};
+  as_ed.bundles.push_back({"snap", "editor"});
+  as_ed.provenance.origin_kind = AppStreamMetadataOriginKind::kMetainfo;
+  AppStreamReleaseMetadata rel;
+  rel.version = OptionalString::of("9.9.9");
+  rel.date = OptionalString::of("2026-11-01");
+  as_ed.releases.push_back(rel);
+
+  // 3. Ambiguous AppStream: two distinct component_ids claiming the same
+  // desktop_file_id -> MUST preserve ambiguity instead of guessing!
+  DiscoveredApplication gio_amb = make_gio_app(
+      "org.example.Ambig.desktop", "Ambiguous", false, false, false);
+  pass.applications.push_back(gio_amb);
+
+  AppStreamMetadataRecord as_amb_1;
+  as_amb_1.component_id = "org.example.AmbigOne";
+  as_amb_1.component_kind = "desktop-application";
+  as_amb_1.desktop_launchable_ids = {"org.example.Ambig.desktop"};
+  AppStreamMetadataRecord as_amb_2;
+  as_amb_2.component_id = "org.example.AmbigTwo";
+  as_amb_2.component_kind = "desktop-application";
+  as_amb_2.desktop_launchable_ids = {"org.example.Ambig.desktop"};
+
+  const ResolvedDiscoveryInventory inv =
+      resolve_discovery_inventory(pass, {as_ed, as_amb_1, as_amb_2});
+
+  // Verify Dual ambiguity preserved (user + system + standalone GIO = 3).
+  const auto* standalone_dual = find_resolved_by_id(inv, gio_dual.application_id);
+  expect(standalone_dual != nullptr && !standalone_dual->ambiguities.empty() &&
+             standalone_dual->ambiguities[0].candidate_ids.size() == 2,
+         "ambiguous X-Flatpak across user/system installs must be preserved "
+         "with candidate IDs instead of guessed");
+
+  // Verify Editor precedence, conflict preservation, and version separation.
+  const auto* ed = find_resolved_by_id(inv, snap_ed.application_id);
+  expect(ed != nullptr, "merged Snap Editor must exist");
+  if (ed != nullptr) {
+    expect(ed->metadata.version.has_value() &&
+               ed->metadata.version.value() == "1.2.3",
+           "installed version must remain 1.2.3 (never overwritten by catalog "
+           "release 9.9.9)");
+    expect(ed->catalog_releases.latest_version.has_value() &&
+               ed->catalog_releases.latest_version.value() == "9.9.9",
+           "AppStream catalog release version must stay in catalog_releases");
+    expect(ed->metadata.name.has_value() &&
+               ed->metadata.name.value() == "Editor Desktop",
+           "GIO display name must take precedence over Snap/AppStream");
+    expect(ed->metadata.summary.has_value() &&
+               ed->metadata.summary.value() == "AppStream metainfo summary",
+           "AppStream metainfo summary must take precedence over Snap summary");
+    expect(ed->metadata.license.has_value() &&
+               ed->metadata.license.value() == "MIT",
+           "installed Snap license must take precedence over AppStream license");
+    expect(ed->metadata_conflicts.size() >= 3,
+           "disagreeing name, summary, and license must be recorded in "
+           "metadata_conflicts");
+  }
+
+  // Verify ambiguous AppStream preserved without linking an arbitrary pick.
+  const auto* amb = find_resolved_by_id(inv, gio_amb.application_id);
+  expect(amb != nullptr && amb->linked_appstream_component_ids.empty() &&
+             !amb->ambiguities.empty() &&
+             amb->ambiguities[0].candidate_ids.size() == 2,
+         "ambiguous AppStream component matches must be preserved rather than "
+         "guessed");
+
+  // Verify stable resolved_id across version upgrade.
+  DiscoveryPassResult upgraded_pass = pass;
+  upgraded_pass.applications[3].metadata.version = OptionalString::of("2.0.0");
+  const ResolvedDiscoveryInventory upgraded_inv =
+      resolve_discovery_inventory(upgraded_pass, {as_ed});
+  const auto* ed_upgraded =
+      find_resolved_by_id(upgraded_inv, snap_ed.application_id);
+  expect(ed != nullptr && ed_upgraded != nullptr &&
+             ed->resolved_id == ed_upgraded->resolved_id &&
+             ed_upgraded->metadata.version.value() == "2.0.0",
+         "resolved_id must remain identical across upgrades");
+}
+
+void test_resolution_classification_ownership_catalog_only_and_isolation() {
+  DiscoveryPassResult pass;
+
+  // 1. Multiple desktop entries owned by ONE DPKG package via documented
+  // PackageOwnershipLookup -> both stay separate apps referencing the SAME
+  // owning package_identity_id!
+  DiscoveredApplication writer = make_gio_app(
+      "libreoffice-writer.desktop", "LibreOffice Writer", true, false, false);
+  writer.desktop_file_path =
+      OptionalString::of("/usr/share/applications/libreoffice-writer.desktop");
+  pass.applications.push_back(writer);
+
+  DiscoveredApplication calc = make_gio_app(
+      "libreoffice-calc.desktop", "LibreOffice Calc", true, false, false);
+  calc.desktop_file_path =
+      OptionalString::of("/usr/share/applications/libreoffice-calc.desktop");
+  pass.applications.push_back(calc);
+
+  // 2. Terminal desktop entry -> MUST stay kUnknown (Terminal flag alone is not
+  // sufficient evidence).
+  DiscoveredApplication htop_desktop =
+      make_gio_app("htop.desktop", "htop", false, false, true);
+  pass.applications.push_back(htop_desktop);
+
+  // 3. GIO desktop entry residing inside an active Nix store path -> linked
+  // authoritatively to owning Nix package without filesystem heuristics.
+  DiscoveredApplication nix_gui =
+      make_gio_app("org.example.NixApp.desktop", "Nix App", false, false, false);
+  nix_gui.desktop_file_path = OptionalString::of(
+      "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-nixapp-3.0/share/"
+      "applications/org.example.NixApp.desktop");
+  pass.applications.push_back(nix_gui);
+
+  // Installed packages across DPKG, RPM, Pacman, Nix:
+  auto make_pkg = [](const char* prov, InstallationSource src,
+                     InstallationScope scope, const char* name,
+                     const char* arch, const char* ver,
+                     const char* section = "") {
+    InstalledPackageRecord p;
+    p.provenance.provider_id = prov;
+    p.provenance.native_id = name;
+    p.provenance.installation_source = src;
+    p.provenance.installation_scope = scope;
+    p.package_name = name;
+    p.architecture = OptionalString::of(arch);
+    p.version = OptionalString::of(ver);
+    if (*section != '\0') p.section = OptionalString::of(section);
+    p.installation_state = PackageInstallationState::kInstalled;
+    p.package_identity_id =
+        build_application_id(prov, name, scope, p.architecture);
+    return p;
+  };
+
+  InstalledPackageRecord pkg_lo =
+      make_pkg("dpkg", InstallationSource::kDpkg, InstallationScope::kSystem,
+               "libreoffice-core", "amd64", "24.2.0-1", "editors");
+  InstalledPackageRecord pkg_rg =
+      make_pkg("dpkg", InstallationSource::kDpkg, InstallationScope::kSystem,
+               "ripgrep", "amd64", "14.1.0-1", "utils");
+  InstalledPackageRecord pkg_svc =
+      make_pkg("rpm", InstallationSource::kRpm, InstallationScope::kSystem,
+               "example-daemon", "x86_64", "1.0.0");
+  InstalledPackageRecord pkg_lib =
+      make_pkg("pacman", InstallationSource::kPacman,
+               InstallationScope::kSystem, "libexample", "x86_64", "2.0-1");
+  InstalledPackageRecord pkg_rt =
+      make_pkg("pacman", InstallationSource::kPacman,
+               InstallationScope::kSystem, "example-runtime", "x86_64", "4.0-1");
+  // Package with tempting name "libssl3" and Section "libs" but NO AppStream
+  // evidence -> MUST stay kUnknown and strictly in packages!
+  InstalledPackageRecord pkg_unclassified =
+      make_pkg("dpkg", InstallationSource::kDpkg, InstallationScope::kSystem,
+               "libssl3", "amd64", "3.0.13", "libs");
+  InstalledPackageRecord pkg_nix =
+      make_pkg("nix", InstallationSource::kNix, InstallationScope::kUser,
+               "nixapp", "x86_64-linux", "3.0");
+  pkg_nix.store_paths.push_back(
+      "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-nixapp-3.0");
+
+  pass.packages = {pkg_lo,  pkg_rg,           pkg_svc, pkg_lib,
+                   pkg_rt,  pkg_unclassified, pkg_nix};
+
+  FakeOwnershipLookup ownership;
+  PackageOwnershipEvidence lo_owner;
+  lo_owner.package_provider_id = "dpkg";
+  lo_owner.package_identity_id = OptionalString::of(pkg_lo.package_identity_id);
+  lo_owner.package_name = "libreoffice-core";
+  ownership.add("/usr/share/applications/libreoffice-writer.desktop", lo_owner);
+  ownership.add("/usr/share/applications/libreoffice-calc.desktop", lo_owner);
+
+  // AppStream records covering CLI, service, library, runtime, AND catalog-only
+  // (uninstalled) app!
+  AppStreamMetadataRecord as_rg;
+  as_rg.component_id = "org.example.ripgrep";
+  as_rg.component_kind = "console-application";
+  as_rg.name = OptionalString::of("ripgrep");
+  as_rg.package_names = {"ripgrep"};
+  as_rg.provenance.origin_kind = AppStreamMetadataOriginKind::kCatalog;
+
+  AppStreamMetadataRecord as_svc;
+  as_svc.component_id = "org.example.daemon";
+  as_svc.component_kind = "service";
+  as_svc.package_names = {"example-daemon"};
+
+  AppStreamMetadataRecord as_lib;
+  as_lib.component_id = "org.example.libexample";
+  as_lib.component_kind = "library";
+  as_lib.package_names = {"libexample"};
+
+  AppStreamMetadataRecord as_rt;
+  as_rt.component_id = "org.example.runtime";
+  as_rt.component_kind = "runtime";
+  as_rt.package_names = {"example-runtime"};
+
+  // Catalog-only app NOT installed anywhere -> MUST NEVER appear in
+  // applications!
+  AppStreamMetadataRecord as_catalog_only;
+  as_catalog_only.component_id = "org.example.NotInstalled";
+  as_catalog_only.component_kind = "desktop-application";
+  as_catalog_only.name = OptionalString::of("Ghost App");
+  as_catalog_only.package_names = {"not-installed-pkg"};
+  as_catalog_only.desktop_launchable_ids = {"org.example.NotInstalled.desktop"};
+  as_catalog_only.provenance.origin_kind =
+      AppStreamMetadataOriginKind::kCatalog;
+
+  const ResolvedDiscoveryInventory inv = resolve_discovery_inventory(
+      pass, {as_rg, as_svc, as_lib, as_rt, as_catalog_only}, &ownership);
+
+  // Check multiple desktop entries belonging to one package.
+  const auto* res_writer = find_resolved_by_id(inv, writer.application_id);
+  const auto* res_calc = find_resolved_by_id(inv, calc.application_id);
+  expect(res_writer != nullptr && res_calc != nullptr &&
+             res_writer->linked_package_identity_ids.size() == 1 &&
+             res_calc->linked_package_identity_ids.size() == 1 &&
+             res_writer->linked_package_identity_ids[0] ==
+                 pkg_lo.package_identity_id &&
+             res_calc->linked_package_identity_ids[0] ==
+                 pkg_lo.package_identity_id &&
+             res_writer->metadata.version.has_value() &&
+             res_writer->metadata.version.value() == "24.2.0-1",
+         "multiple desktop entries belonging to one package must stay distinct "
+         "applications linked to the same package_identity_id");
+
+  // Check Terminal=true desktop entry -> kCliApplication.
+  const auto* res_htop = find_resolved_by_id(inv, htop_desktop.application_id);
+  expect(res_htop != nullptr &&
+             res_htop->classification == ApplicationClassification::kUnknown,
+         "Terminal=true desktop entry alone must NOT classify as CLI");
+
+  // Check Nix store-path ownership link.
+  const auto* res_nix = find_resolved_by_id(inv, nix_gui.application_id);
+  expect(res_nix != nullptr &&
+             res_nix->linked_package_identity_ids.size() == 1 &&
+             res_nix->linked_package_identity_ids[0] ==
+                 pkg_nix.package_identity_id &&
+             res_nix->primary_provenance.installation_source ==
+                 InstallationSource::kNix,
+         "GIO entry inside active Nix store path must link to owning Nix "
+         "package");
+
+  // Check verified DPKG + AppStream console-application promoted cleanly, while
+  // service, library, runtime, unclassified package, and catalog-only record
+  // are NOT promoted!
+  bool found_promoted_rg = false;
+  bool found_ghost = false;
+  bool found_unclassified_app = false;
+  for (const auto& app : inv.applications) {
+    if (app.primary_provenance.native_id == "ripgrep" &&
+        app.classification == ApplicationClassification::kCliApplication) {
+      found_promoted_rg = true;
+    }
+    if (app.resolved_id.find("NotInstalled") != std::string::npos) {
+      found_ghost = true;
+    }
+    if (app.primary_provenance.native_id == "libssl3") {
+      found_unclassified_app = true;
+    }
+  }
+  expect(found_promoted_rg,
+         "installed package with strong AppStream console-application match "
+         "must be classified as CLI application");
+  expect(!found_ghost,
+         "catalog-only AppStream record must NEVER be promoted to installed "
+         "applications");
+  expect(!found_unclassified_app,
+         "insufficiently identified package (libssl3) must stay in package "
+         "inventory");
+  expect(inv.unmatched_appstream_records.size() == 1 &&
+             inv.unmatched_appstream_records[0].component_id ==
+                 "org.example.NotInstalled",
+         "catalog-only record must remain in unmatched_appstream_records");
+
+  // Verify authoritative classification on package inventory (and kUnknown for
+  // libssl3 despite name/section!).
+  for (const auto& pkg : inv.packages) {
+    if (pkg.package_name == "example-daemon") {
+      expect(pkg.classification == ApplicationClassification::kService,
+             "AppStream service must classify package as kService");
+    } else if (pkg.package_name == "libexample") {
+      expect(pkg.classification == ApplicationClassification::kLibrary,
+             "AppStream library must classify package as kLibrary");
+    } else if (pkg.package_name == "example-runtime") {
+      expect(pkg.classification == ApplicationClassification::kRuntime,
+             "AppStream runtime must classify package as kRuntime");
+    } else if (pkg.package_name == "libssl3") {
+      expect(pkg.classification == ApplicationClassification::kUnknown,
+             "packages must NEVER be classified by name (lib*) or section "
+             "(libs) alone");
+    }
+  }
+
+  // Verify ApplicationDiscoveryService::discover_resolved() failure isolation.
+  {
+    ApplicationDiscoveryService service;
+    service.register_provider(std::make_unique<FakeDiscoveryProvider>(
+        "gio", true, [&]() {
+          DiscoveryResult r;
+          r.applications.push_back(writer);
+          return r;
+        }()));
+    DiscoveryResult failed_fp;
+    failed_fp.ok = false;
+    failed_fp.error_message = "flatpak failure";
+    service.register_provider(std::make_unique<FakeDiscoveryProvider>(
+        "flatpak", true, std::move(failed_fp)));
+    AppStreamBackendResult failed_as;
+    failed_as.ok = false;
+    failed_as.error_kind = AppStreamQueryErrorKind::kLoadFailed;
+    failed_as.error_message = "appstream failure";
+    service.set_metadata_provider(std::make_unique<AppStreamMetadataProvider>(
+        std::make_unique<FakeAppStreamBackend>(
+            true, "libappstream.so.5", std::move(failed_as))));
+
+    const ResolvedDiscoveryInventory res = service.discover_resolved();
+    expect(res.applications.size() == 1 &&
+               res.applications[0].resolved_id == writer.application_id,
+           "provider and AppStream failures must not block GIO resolution");
+    expect(res.provider_summaries.size() == 3 &&
+               res.provider_summaries[1].status ==
+                   ProviderExecutionStatus::kFailed &&
+               res.provider_summaries[2].provider_id == "appstream" &&
+               res.provider_summaries[2].status ==
+                   ProviderExecutionStatus::kFailed,
+           "failure summaries must be preserved in discover_resolved()");
+  }
+}
+
+void test_resolution_large_inventory_indexed_performance() {
+  DiscoveryPassResult pass;
+  std::vector<AppStreamMetadataRecord> appstream;
+
+  const size_t kPackageCount = 3000;
+  const size_t kAppCount = 600;
+  const size_t kCatalogOnlyCount = 400;
+
+  pass.packages.reserve(kPackageCount);
+  for (size_t i = 0; i < kPackageCount; ++i) {
+    InstalledPackageRecord pkg;
+    pkg.provenance.provider_id = "dpkg";
+    pkg.provenance.native_id = "pkg-" + std::to_string(i);
+    pkg.provenance.installation_source = InstallationSource::kDpkg;
+    pkg.provenance.installation_scope = InstallationScope::kSystem;
+    pkg.package_name = pkg.provenance.native_id;
+    pkg.architecture = OptionalString::of("amd64");
+    pkg.version = OptionalString::of("1.0." + std::to_string(i));
+    pkg.installation_state = PackageInstallationState::kInstalled;
+    pkg.package_identity_id = build_application_id(
+        "dpkg", pkg.package_name, InstallationScope::kSystem, pkg.architecture);
+    pass.packages.push_back(std::move(pkg));
+  }
+
+  pass.applications.reserve(kAppCount * 2);
+  appstream.reserve(kAppCount + kCatalogOnlyCount);
+  for (size_t i = 0; i < kAppCount; ++i) {
+    const std::string app_id = "org.example.ScaleApp" + std::to_string(i);
+    DiscoveredApplication fp;
+    fp.provenance.provider_id = "flatpak";
+    fp.provenance.native_id = app_id;
+    fp.provenance.installation_source = InstallationSource::kFlatpak;
+    fp.provenance.installation_scope = InstallationScope::kSystem;
+    fp.package_id = OptionalString::of(app_id);
+    fp.installation_id = OptionalString::of("default/stable/x86_64");
+    fp.application_id = build_application_id(
+        "flatpak", app_id, InstallationScope::kSystem, fp.installation_id);
+    fp.metadata.name = OptionalString::of("Scale App " + std::to_string(i));
+    fp.metadata.version = OptionalString::of("1.0.0");
+    pass.applications.push_back(std::move(fp));
+
+    const std::string desktop_id = app_id + ".desktop";
+    const std::string display_name = "Scale App " + std::to_string(i);
+    DiscoveredApplication gio =
+        make_gio_app(desktop_id.c_str(), display_name.c_str(), true, false,
+                     false);
+    gio.correlation_hints.flatpak_app_id = OptionalString::of(app_id);
+    pass.applications.push_back(std::move(gio));
+
+    AppStreamMetadataRecord as;
+    as.component_id = app_id;
+    as.component_kind = "desktop-application";
+    as.desktop_launchable_ids = {app_id + ".desktop"};
+    as.bundles.push_back({"flatpak", "app/" + app_id + "/x86_64/stable"});
+    appstream.push_back(std::move(as));
+  }
+
+  for (size_t i = 0; i < kCatalogOnlyCount; ++i) {
+    AppStreamMetadataRecord ghost;
+    ghost.component_id = "org.example.CatalogOnly" + std::to_string(i);
+    ghost.component_kind = "desktop-application";
+    ghost.package_names = {"uninstalled-" + std::to_string(i)};
+    appstream.push_back(std::move(ghost));
+  }
+
+  const ResolvedDiscoveryInventory inv =
+      resolve_discovery_inventory(pass, appstream);
+  expect(inv.applications.size() == kAppCount,
+         "indexed resolution must merge all 600 GIO+Flatpak pairs cleanly");
+  expect(inv.packages.size() == kPackageCount,
+         "all 3000 unclassified packages must remain in package inventory");
+  expect(inv.unmatched_appstream_records.size() == kCatalogOnlyCount,
+         "all 400 catalog-only AppStream records must stay unmatched");
+  expect(inv.ambiguities.empty(),
+         "unambiguous large inventory must produce zero ambiguities");
+}
+
+
+// --- Step 9.1: runtime ownership adapters and hardening tests ---
+
+namespace fdal = flutter_device_apps_linux;
+
+InstalledPackageRecord make_owned_pkg(const char* provider,
+                                      InstallationSource source,
+                                      const char* name, const char* arch,
+                                      const char* version) {
+  InstalledPackageRecord p;
+  p.provenance.provider_id = provider;
+  p.provenance.native_id = name;
+  p.provenance.installation_source = source;
+  p.provenance.installation_scope = InstallationScope::kSystem;
+  p.package_name = name;
+  p.architecture = OptionalString::of(arch);
+  p.version = OptionalString::of(version);
+  p.installation_state = PackageInstallationState::kInstalled;
+  p.package_identity_id = build_application_id(
+      provider, name, InstallationScope::kSystem, p.architecture);
+  return p;
+}
+
+class CountingIndexer final : public fdal::PackageOwnershipIndexer {
+ public:
+  CountingIndexer(std::string id, bool ok, fdal::PackageOwnershipIndexResult r,
+                  std::atomic<int>* calls)
+      : id_(std::move(id)), ok_(ok), result_(std::move(r)), calls_(calls) {}
+  const char* id() const override { return id_.c_str(); }
+  fdal::PackageOwnershipIndexResult build_index(
+      const std::vector<std::string>&,
+      const std::vector<InstalledPackageRecord>&) override {
+    calls_->fetch_add(1);
+    fdal::PackageOwnershipIndexResult out = result_;
+    out.ok = ok_;
+    return out;
+  }
+
+ private:
+  std::string id_;
+  bool ok_;
+  fdal::PackageOwnershipIndexResult result_;
+  std::atomic<int>* calls_;
+};
+
+void test_ownership_dpkg_indexer_multiarch_diversions_and_symlinks() {
+  TempNixDir root;
+  root.make_dir("info");
+  root.write_file("info/libreoffice-core.list",
+                  "/.\n/usr\n/usr/share/applications/libreoffice-writer.desktop\n"
+                  "/usr/share/applications/libreoffice-calc.desktop\n");
+  root.write_file("info/shared:amd64.list",
+                  "/usr/share/applications/shared.desktop\n");
+  root.write_file("info/shared:i386.list",
+                  "/usr/share/applications/shared.desktop\n");
+  root.write_file("info/divpkg.list",
+                  "/usr/share/applications/diverted.desktop\n");
+  root.write_file("diversions",
+                  "/usr/share/applications/diverted.desktop\n"
+                  "/usr/share/applications/diverted.desktop.distrib\nlocal\n");
+
+  fdal::DpkgOwnershipConfig cfg;
+  cfg.info_dir = root.path() + "/info";
+  cfg.diversions_path = root.path() + "/diversions";
+  auto indexer = fdal::create_dpkg_ownership_indexer(cfg);
+
+  std::vector<InstalledPackageRecord> pkgs = {
+      make_owned_pkg("dpkg", InstallationSource::kDpkg, "libreoffice-core",
+                     "amd64", "24.2"),
+      make_owned_pkg("dpkg", InstallationSource::kDpkg, "shared", "amd64", "1"),
+      make_owned_pkg("dpkg", InstallationSource::kDpkg, "shared", "i386", "1"),
+      make_owned_pkg("dpkg", InstallationSource::kDpkg, "divpkg", "amd64", "1"),
+      make_owned_pkg("dpkg", InstallationSource::kDpkg, "ghost", "amd64", "1"),
+      make_owned_pkg("rpm", InstallationSource::kRpm, "ignored-rpm", "x86_64",
+                     "1")};
+
+  const auto idx = indexer->build_index(
+      {"//usr/share/applications//libreoffice-writer.desktop",
+       "/usr/share/applications/libreoffice-calc.desktop",
+       "/usr/share/applications/shared.desktop",
+       "/usr/share/applications/diverted.desktop",
+       "/usr/share/applications/unowned.desktop"},
+      pkgs);
+  expect(idx.ok, "dpkg ownership index must succeed with partial diagnostics");
+  expect(idx.error_message.find("without readable file list") !=
+             std::string::npos,
+         "missing dpkg file list must be reported as partial failure");
+
+  const auto writer =
+      idx.owners_by_path.find("/usr/share/applications/libreoffice-writer.desktop");
+  expect(writer != idx.owners_by_path.end() && writer->second.size() == 1 &&
+             writer->second[0].package_identity_id.value() ==
+                 pkgs[0].package_identity_id &&
+             !writer->second[0].diverted_ambiguous,
+         "exact full-path dpkg ownership must be recorded with package identity");
+  const auto shared =
+      idx.owners_by_path.find("/usr/share/applications/shared.desktop");
+  expect(shared != idx.owners_by_path.end() && shared->second.size() == 2,
+         "multiarch owners (amd64+i386) must both be preserved");
+  const auto diverted =
+      idx.owners_by_path.find("/usr/share/applications/diverted.desktop");
+  expect(diverted != idx.owners_by_path.end() &&
+             diverted->second[0].diverted_ambiguous,
+         "diverted paths must be flagged ambiguous");
+  expect(idx.owners_by_path.count("/usr/share/applications/unowned.desktop") ==
+             0,
+         "unowned paths must have no evidence (no heuristics)");
+
+  // Symlinked directory: ownership is keyed by canonical path.
+  root.write_file("real/x.desktop", "[Desktop Entry]\n");
+  root.make_symlink("link", root.path() + "/real");
+  fdal::PackageOwnershipIndexResult canonical_index;
+  fdal::PackageOwnershipEvidence ev;
+  ev.package_provider_id = "dpkg";
+  ev.package_name = "x";
+  canonical_index.owners_by_path[fdal::resolve_canonical_file_path(
+      root.path() + "/real/x.desktop")]
+      .push_back(ev);
+  fdal::CompositePackageOwnershipLookup lookup;
+  lookup.merge(canonical_index);
+  expect(lookup.lookup_file_owners(root.path() + "/link/x.desktop").size() == 1,
+         "symlinked desktop path must resolve to canonical package-owned file");
+  expect(lookup.lookup_file_owners(root.path() + "/link/missing.desktop")
+             .empty(),
+         "unknown symlinked path must stay unowned");
+}
+
+void test_ownership_nix_rpm_pacman_indexers() {
+  // Nix: verified active-profile store paths only.
+  {
+    InstalledPackageRecord nix_pkg =
+        make_owned_pkg("nix", InstallationSource::kNix, "nixapp",
+                       "x86_64-linux", "3.0");
+    nix_pkg.profile_path = OptionalString::of("/home/u/.nix-profile");
+    nix_pkg.provenance.installation_scope = InstallationScope::kUser;
+    nix_pkg.store_paths = {"/nix/store/0123456789abcdfghijklmnpqrsvwxyz-nixapp-3.0"};
+    auto indexer = fdal::create_nix_ownership_indexer();
+    const auto idx = indexer->build_index(
+        {"/nix/store/0123456789abcdfghijklmnpqrsvwxyz-nixapp-3.0/share/"
+         "applications/a.desktop",
+         "/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-other-1.0/share/b.desktop",
+         "/usr/share/applications/c.desktop"},
+        {nix_pkg});
+    expect(idx.owners_by_path.size() == 1,
+           "only store paths of active profile elements may be owned");
+    const auto& ev = idx.owners_by_path.begin()->second;
+    expect(ev.size() == 1 && ev[0].profile_path.has_value() &&
+               ev[0].profile_path.value() == "/home/u/.nix-profile" &&
+               ev[0].scope == InstallationScope::kUser,
+           "Nix ownership must preserve active profile and scope");
+  }
+
+  // RPM: installation identity distinguishes parallel versions.
+  class OwnershipRpmBackend final : public RpmBackend {
+   public:
+    bool is_available() const override { return true; }
+    RpmBackendQueryResult list_installed_packages() override { return {}; }
+    fdal::RpmFileOwnershipResult find_file_owners(
+        const std::vector<std::string>& paths) override {
+      fdal::RpmFileOwnershipResult r;
+      for (const auto& p : paths) {
+        fdal::RpmFileOwnerRecord o;
+        o.path = p;
+        o.package.name = "kernel-tools";
+        o.package.architecture = OptionalString::of("x86_64");
+        o.package.epoch = OptionalString::of("1");
+        o.package.version = OptionalString::of("6.8.1");
+        o.package.release = OptionalString::of("1");
+        r.owners.push_back(o);
+      }
+      return r;
+    }
+  };
+  {
+    auto indexer = fdal::create_rpm_ownership_indexer(
+        std::make_unique<OwnershipRpmBackend>());
+    const auto idx = indexer->build_index(
+        {"/usr/share/applications/k.desktop"}, {});
+    expect(idx.ok && idx.owners_by_path.size() == 1,
+           "RPM indexer must map backend owners by exact path");
+    const auto& ev = idx.owners_by_path.begin()->second[0];
+    expect(ev.package_identity_id.value() == "rpm:kernel-tools:system:x86_64" &&
+               ev.installation_identity_id.has_value(),
+           "RPM evidence must carry package and installation identities");
+    auto missing = fdal::create_rpm_ownership_indexer(nullptr);
+    expect(!missing->build_index({"/a"}, {}).ok,
+           "unavailable librpm must fail the RPM index conservatively");
+  }
+
+  // Pacman: default backend capability is unsupported -> conservative failure.
+  class OwnershipPacmanBackend final : public PacmanBackend {
+   public:
+    bool is_available() const override { return true; }
+    PacmanBackendQueryResult list_installed_packages() override { return {}; }
+    fdal::PacmanFileOwnershipResult find_file_owners(
+        const std::vector<std::string>& paths) override {
+      fdal::PacmanFileOwnershipResult r;
+      for (const auto& p : paths) {
+        fdal::PacmanFileOwnerRecord o;
+        o.path = p;
+        o.package_name = "example-app";
+        o.architecture = OptionalString::of("x86_64");
+        r.owners.push_back(o);
+      }
+      return r;
+    }
+  };
+  class PlainPacmanBackend final : public PacmanBackend {
+   public:
+    bool is_available() const override { return true; }
+    PacmanBackendQueryResult list_installed_packages() override { return {}; }
+  };
+  {
+    auto indexer = fdal::create_pacman_ownership_indexer(
+        std::make_unique<OwnershipPacmanBackend>());
+    const auto idx =
+        indexer->build_index({"/usr/share/applications/e.desktop"}, {});
+    expect(idx.ok && idx.owners_by_path.begin()->second[0]
+                             .package_identity_id.value() ==
+                         "pacman:example-app:system:x86_64",
+           "Pacman evidence must use the stable package identity");
+    auto plain = fdal::create_pacman_ownership_indexer(
+        std::make_unique<PlainPacmanBackend>());
+    expect(!plain->build_index({"/a"}, {}).ok,
+           "backend without file ownership support must fail conservatively");
+  }
+}
+
+void test_ownership_resolution_parallel_versions_diversions_and_hints() {
+  // Parallel RPM kernels share a package identity but differ by installation.
+  InstalledPackageRecord k1 = make_owned_pkg(
+      "rpm", InstallationSource::kRpm, "kernel-tools", "x86_64", "6.8.1");
+  InstalledPackageRecord k2 = make_owned_pkg(
+      "rpm", InstallationSource::kRpm, "kernel-tools", "x86_64", "6.9.2");
+  k1.installation_identity_id = OptionalString::of("inst-1");
+  k2.installation_identity_id = OptionalString::of("inst-2");
+
+  DiscoveredApplication gio =
+      make_gio_app("k.desktop", "Kernel Tools", false, false, false);
+  gio.desktop_file_path = OptionalString::of("/usr/share/applications/k.desktop");
+
+  DiscoveryPassResult pass;
+  pass.applications.push_back(gio);
+  pass.packages = {k1, k2};
+
+  FakeOwnershipLookup exact;
+  PackageOwnershipEvidence ev;
+  ev.package_provider_id = "rpm";
+  ev.package_identity_id = OptionalString::of(k1.package_identity_id);
+  ev.installation_identity_id = OptionalString::of("inst-1");
+  ev.package_name = "kernel-tools";
+  exact.add("/usr/share/applications/k.desktop", ev);
+  ResolvedDiscoveryInventory inv = resolve_discovery_inventory(pass, {}, &exact);
+  expect(inv.applications.size() == 1 &&
+             inv.applications[0].linked_package_identity_ids.size() == 1 &&
+             inv.applications[0].metadata.version.has_value() &&
+             inv.applications[0].metadata.version.value() == "6.8.1" &&
+             inv.ambiguities.empty(),
+         "installation identity must pick the exact parallel version");
+
+  FakeOwnershipLookup vague;
+  PackageOwnershipEvidence vague_ev = ev;
+  vague_ev.installation_identity_id = OptionalString::none();
+  vague.add("/usr/share/applications/k.desktop", vague_ev);
+  inv = resolve_discovery_inventory(pass, {}, &vague);
+  expect(inv.applications[0].linked_package_identity_ids.empty() &&
+             inv.ambiguities.size() == 1 &&
+             inv.ambiguities[0].candidate_ids.size() == 2,
+         "parallel versions without installation evidence must stay ambiguous");
+
+  FakeOwnershipLookup diverted;
+  PackageOwnershipEvidence div_ev = ev;
+  div_ev.diverted_ambiguous = true;
+  diverted.add("/usr/share/applications/k.desktop", div_ev);
+  inv = resolve_discovery_inventory(pass, {}, &diverted);
+  expect(inv.applications[0].linked_package_identity_ids.empty() &&
+             !inv.ambiguities.empty(),
+         "diverted ownership must never link a package");
+
+  // Desktop markers are correlation hints, never installation proof.
+  DiscoveryPassResult hint_pass;
+  DiscoveredApplication marked =
+      make_gio_app("ghost.desktop", "Ghost", false, false, false);
+  marked.correlation_hints.flatpak_app_id =
+      OptionalString::of("org.example.Ghost");
+  hint_pass.applications.push_back(marked);
+  const ResolvedDiscoveryInventory hinted = resolve_discovery_inventory(hint_pass);
+  expect(hinted.applications.size() == 1 &&
+             hinted.applications[0].primary_provenance.installation_source ==
+                 InstallationSource::kUnknown &&
+             hinted.applications[0].linked_package_identity_ids.empty() &&
+             hinted.applications[0].classification ==
+                 ApplicationClassification::kUnknown,
+         "X-Flatpak without a verified Flatpak installation must not set "
+         "installation source or classification");
+}
+
+void test_ownership_service_single_pass_failure_isolation_and_legacy() {
+  // Counters outlive every service created below (providers keep pointers).
+  std::atomic<int> pkg_avail_calls{0};
+  std::atomic<int> pkg_disc_calls{0};
+  auto make_service = [&pkg_avail_calls, &pkg_disc_calls](
+                          bool indexer_ok, std::atomic<int>* dpkg_calls,
+                          std::atomic<int>* pacman_calls) {
+    auto service = std::make_shared<ApplicationDiscoveryService>();
+    DiscoveryResult gio_result;
+    for (int i = 0; i < 40; ++i) {
+      const std::string id = "app" + std::to_string(i) + ".desktop";
+      DiscoveredApplication app =
+          make_gio_app(id.c_str(), "App", true, false, false);
+      app.desktop_file_path =
+          OptionalString::of("/usr/share/applications/" + id);
+      gio_result.applications.push_back(std::move(app));
+    }
+    service->register_provider(std::make_unique<FakeDiscoveryProvider>(
+        "gio", true, std::move(gio_result)));
+
+    PackageDiscoveryResult pkg_result;
+    pkg_result.packages.push_back(make_owned_pkg(
+        "dpkg", InstallationSource::kDpkg, "suite", "amd64", "1.0"));
+    service->register_package_provider(std::make_unique<CountingPackageProvider>(
+        "dpkg", true, std::move(pkg_result), &pkg_avail_calls,
+        &pkg_disc_calls));
+
+    fdal::PackageOwnershipIndexResult index;
+    fdal::PackageOwnershipEvidence ev;
+    ev.package_provider_id = "dpkg";
+    ev.package_name = "suite";
+    ev.package_identity_id = OptionalString::of(build_application_id(
+        "dpkg", "suite", InstallationScope::kSystem,
+        OptionalString::of("amd64")));
+    for (int i = 0; i < 40; ++i) {
+      index.owners_by_path["/usr/share/applications/app" + std::to_string(i) +
+                           ".desktop"]
+          .push_back(ev);
+    }
+    service->register_ownership_indexer(std::make_unique<CountingIndexer>(
+        "dpkg", indexer_ok, std::move(index), dpkg_calls));
+    service->register_ownership_indexer(std::make_unique<CountingIndexer>(
+        "pacman", true, fdal::PackageOwnershipIndexResult{}, pacman_calls));
+    return service;
+  };
+
+  std::atomic<int> dpkg_calls{0};
+  std::atomic<int> pacman_calls{0};
+  auto service = make_service(true, &dpkg_calls, &pacman_calls);
+  const ResolvedDiscoveryInventory ok_inv = service->discover_resolved();
+  expect(dpkg_calls.load() == 1,
+         "ownership index must be built once per pass, not per desktop entry");
+  expect(pacman_calls.load() == 0,
+         "indexers for providers without packages must not run");
+  size_t linked = 0;
+  for (const auto& app : ok_inv.applications) {
+    if (app.linked_package_identity_ids.size() == 1) ++linked;
+  }
+  expect(ok_inv.applications.size() == 40 && linked == 40,
+         "all 40 desktop entries must link to the owning package");
+
+  // Legacy GIO-only path never touches indexers.
+  (void)service->discover_with_report(
+      DiscoveryRequestOptions::only_providers({"gio"}));
+  expect(dpkg_calls.load() == 1,
+         "legacy GIO-only discovery must not run ownership indexers");
+
+  // Failing index: conservative (no links), reported, GIO apps preserved.
+  std::atomic<int> fail_calls{0};
+  std::atomic<int> unused{0};
+  auto failing = make_service(false, &fail_calls, &unused);
+  const ResolvedDiscoveryInventory bad_inv = failing->discover_resolved();
+  bool saw_failure = false;
+  for (const auto& summary : bad_inv.provider_summaries) {
+    if (summary.provider_id == "dpkg-ownership" &&
+        summary.status == ProviderExecutionStatus::kFailed) {
+      saw_failure = true;
+    }
+  }
+  size_t bad_linked = 0;
+  for (const auto& app : bad_inv.applications) {
+    if (!app.linked_package_identity_ids.empty()) ++bad_linked;
+  }
+  expect(saw_failure && bad_inv.applications.size() == 40 && bad_linked == 0,
+         "ownership index failure must be isolated and leave records unlinked");
+}
+
+void test_resolution_step92_integrity_cross_provider_parallel_rpm_and_scoped_dedup() {
+  // 1. Cross-provider false-correlation prevention via bare AppStream pkgnames:
+  // (a) An unowned desktop entry must NOT be linked to an installed package
+  //     solely because AppStream mentions both desktop-id and pkgname.
+  // (b) When two distinct package providers (dpkg + rpm) both have a package
+  //     with the same name, bare AppStream pkgname must report ambiguity rather
+  //     than falsely correlating either/both across providers.
+  // (c) Distro kCatalog AppStream records must NOT match Nix profile packages,
+  //     and Flatpak/Snap bundle records must NOT match DPKG packages.
+  {
+    DiscoveryPassResult pass;
+    DiscoveredApplication foreign_desktop = make_gio_app(
+        "org.example.Manual.desktop", "Manual App", false, false, false);
+    foreign_desktop.desktop_file_path =
+        OptionalString::of("/usr/local/share/applications/org.example.Manual.desktop");
+    pass.applications.push_back(foreign_desktop);
+
+    InstalledPackageRecord dpkg_manual = make_owned_pkg(
+        "dpkg", InstallationSource::kDpkg, "manual-app", "amd64", "1.0-1");
+    InstalledPackageRecord dpkg_shared = make_owned_pkg(
+        "dpkg", InstallationSource::kDpkg, "shared-cli", "amd64", "2.0-1");
+    InstalledPackageRecord rpm_shared = make_owned_pkg(
+        "rpm", InstallationSource::kRpm, "shared-cli", "x86_64", "2.0");
+    rpm_shared.release = OptionalString::of("1");
+    rpm_shared.installation_identity_id = OptionalString::of(
+        fdal::build_rpm_installation_identity_id(
+            "shared-cli", rpm_shared.architecture, rpm_shared.epoch,
+            rpm_shared.version, rpm_shared.release));
+    InstalledPackageRecord nix_only = make_owned_pkg(
+        "nix", InstallationSource::kNix, "nix-tool", "x86_64-linux", "1.0");
+    nix_only.provenance.installation_scope = InstallationScope::kUser;
+    nix_only.package_identity_id =
+        build_application_id("nix", "nix-tool", InstallationScope::kUser,
+                             OptionalString::of("user"));
+    InstalledPackageRecord dpkg_bundle_collision = make_owned_pkg(
+        "dpkg", InstallationSource::kDpkg, "bundle-tool", "amd64", "1.0-1");
+    pass.packages = {dpkg_manual, dpkg_shared, rpm_shared, nix_only,
+                     dpkg_bundle_collision};
+
+    AppStreamMetadataRecord as_manual;
+    as_manual.component_id = "org.example.Manual";
+    as_manual.component_kind = "desktop-application";
+    as_manual.desktop_launchable_ids = {"org.example.Manual.desktop"};
+    as_manual.package_names = {"manual-app"};
+    as_manual.provenance.origin_kind = AppStreamMetadataOriginKind::kCatalog;
+
+    AppStreamMetadataRecord as_shared;
+    as_shared.component_id = "org.example.SharedCli";
+    as_shared.component_kind = "console-application";
+    as_shared.package_names = {"shared-cli"};
+    as_shared.provenance.origin_kind = AppStreamMetadataOriginKind::kCatalog;
+
+    AppStreamMetadataRecord as_nix_catalog;
+    as_nix_catalog.component_id = "org.example.NixTool";
+    as_nix_catalog.component_kind = "console-application";
+    as_nix_catalog.package_names = {"nix-tool"};
+    as_nix_catalog.provenance.origin_kind =
+        AppStreamMetadataOriginKind::kCatalog;
+
+    AppStreamMetadataRecord as_bundle;
+    as_bundle.component_id = "org.example.BundleTool";
+    as_bundle.component_kind = "console-application";
+    as_bundle.package_names = {"bundle-tool"};
+    as_bundle.bundles.push_back({"flatpak", "app/org.example.BundleTool/x86_64/stable"});
+
+    const ResolvedDiscoveryInventory inv = resolve_discovery_inventory(
+        pass, {as_manual, as_shared, as_nix_catalog, as_bundle});
+
+    const auto* res_manual =
+        find_resolved_by_id(inv, foreign_desktop.application_id);
+    expect(res_manual != nullptr &&
+               res_manual->linked_package_identity_ids.empty() &&
+               res_manual->primary_provenance.installation_source ==
+                   InstallationSource::kUnknown,
+           "unowned GIO desktop entry must NOT link to dpkg package solely via "
+           "AppStream package_names");
+
+    bool promoted_shared = false;
+    bool promoted_nix_from_catalog = false;
+    bool promoted_bundle_dpkg = false;
+    for (const auto& app : inv.applications) {
+      if (app.primary_provenance.native_id == "shared-cli") {
+        promoted_shared = true;
+      }
+      if (app.primary_provenance.native_id == "nix-tool") {
+        promoted_nix_from_catalog = true;
+      }
+      if (app.primary_provenance.native_id == "bundle-tool") {
+        promoted_bundle_dpkg = true;
+      }
+    }
+    expect(!promoted_shared,
+           "ambiguous cross-provider pkgname (dpkg + rpm) must NOT promote "
+           "either package");
+    expect(!promoted_nix_from_catalog,
+           "distro kCatalog AppStream pkgname must NOT falsely correlate to "
+           "Nix package");
+    expect(!promoted_bundle_dpkg,
+           "AppStream record with Flatpak bundle must NOT match DPKG package");
+
+    bool saw_cross_provider_amb = false;
+    for (const auto& amb : inv.ambiguities) {
+      if (amb.reason.find("cross-provider") != std::string::npos &&
+          amb.candidate_ids.size() == 2) {
+        saw_cross_provider_amb = true;
+      }
+    }
+    expect(saw_cross_provider_amb,
+           "cross-provider AppStream pkgname collision must record ambiguity");
+
+    for (const auto& pkg : inv.packages) {
+      if (pkg.package_name == "shared-cli" || pkg.package_name == "nix-tool" ||
+          pkg.package_name == "bundle-tool") {
+        expect(pkg.classification == ApplicationClassification::kUnknown,
+               "rejected/ambiguous cross-provider pkgname matches must leave "
+               "package classification kUnknown");
+      }
+    }
+  }
+
+  // 2. Parallel RPM installations preserved with distinct deterministic IDs,
+  //    AND installation-scoped component deduplication (not global by CID).
+  {
+    DiscoveryPassResult pass;
+
+    InstalledPackageRecord rpm_v1 = make_owned_pkg(
+        "rpm", InstallationSource::kRpm, "example-multi", "noarch", "1.0.0");
+    rpm_v1.epoch = OptionalString::of("1");
+    rpm_v1.release = OptionalString::of("1");
+    rpm_v1.installation_identity_id = OptionalString::of(
+        fdal::build_rpm_installation_identity_id(
+            "example-multi", rpm_v1.architecture, rpm_v1.epoch, rpm_v1.version,
+            rpm_v1.release));
+
+    InstalledPackageRecord rpm_v2 = make_owned_pkg(
+        "rpm", InstallationSource::kRpm, "example-multi", "noarch", "2.0.0");
+    rpm_v2.epoch = OptionalString::of("1");
+    rpm_v2.release = OptionalString::of("2");
+    rpm_v2.installation_identity_id = OptionalString::of(
+        fdal::build_rpm_installation_identity_id(
+            "example-multi", rpm_v2.architecture, rpm_v2.epoch, rpm_v2.version,
+            rpm_v2.release));
+
+    pass.packages = {rpm_v1, rpm_v2};
+
+    AppStreamMetadataRecord as_multi;
+    as_multi.component_id = "org.example.MultiCli";
+    as_multi.component_kind = "console-application";
+    as_multi.package_names = {"example-multi"};
+    as_multi.provenance.origin_kind = AppStreamMetadataOriginKind::kCatalog;
+
+    const ResolvedDiscoveryInventory fwd =
+        resolve_discovery_inventory(pass, {as_multi});
+    DiscoveryPassResult rev_pass = pass;
+    std::reverse(rev_pass.packages.begin(), rev_pass.packages.end());
+    const ResolvedDiscoveryInventory rev =
+        resolve_discovery_inventory(rev_pass, {as_multi});
+
+    expect(fwd.applications.size() == 2 && rev.applications.size() == 2,
+           "both parallel RPM installations must be preserved as distinct "
+           "applications");
+    if (fwd.applications.size() == 2 && rev.applications.size() == 2) {
+      expect(fwd.applications[0].resolved_id !=
+                 fwd.applications[1].resolved_id,
+             "parallel RPM installations must have distinct resolved_ids");
+      expect(fwd.applications[0].resolved_id ==
+                     rev.applications[0].resolved_id &&
+                 fwd.applications[1].resolved_id ==
+                     rev.applications[1].resolved_id,
+             "parallel RPM resolved_ids must be deterministic across order");
+      expect(fwd.applications[0].metadata.version.has_value() &&
+                 fwd.applications[1].metadata.version.has_value() &&
+                 fwd.applications[0].metadata.version.value() !=
+                     fwd.applications[1].metadata.version.value(),
+             "each parallel RPM record must retain its own installed version");
+    }
+
+    // If rpm_v1 owns a desktop entry matching org.example.MultiCli, only
+    // rpm_v1 is deduplicated while rpm_v2 stays preserved!
+    DiscoveredApplication v1_desktop = make_gio_app(
+        "org.example.MultiCli.desktop", "Multi v1", false, false, false);
+    v1_desktop.desktop_file_path =
+        OptionalString::of("/usr/share/applications/org.example.MultiCli.desktop");
+    pass.applications.push_back(v1_desktop);
+    as_multi.desktop_launchable_ids = {"org.example.MultiCli.desktop"};
+
+    FakeOwnershipLookup v1_owner;
+    PackageOwnershipEvidence ev;
+    ev.package_provider_id = "rpm";
+    ev.package_identity_id = OptionalString::of(rpm_v1.package_identity_id);
+    ev.installation_identity_id = rpm_v1.installation_identity_id;
+    ev.package_name = "example-multi";
+    v1_owner.add("/usr/share/applications/org.example.MultiCli.desktop", ev);
+
+    const ResolvedDiscoveryInventory with_v1_desktop =
+        resolve_discovery_inventory(pass, {as_multi}, &v1_owner);
+    expect(with_v1_desktop.applications.size() == 2,
+           "desktop entry owned by rpm_v1 must deduplicate ONLY rpm_v1 while "
+           "preserving parallel rpm_v2");
+
+    // Single RPM upgrade keeps resolved_id stable.
+    DiscoveryPassResult single_v1;
+    single_v1.packages = {rpm_v1};
+    DiscoveryPassResult single_v2;
+    single_v2.packages = {rpm_v2};
+    AppStreamMetadataRecord as_cli_only = as_multi;
+    as_cli_only.desktop_launchable_ids.clear();
+    const ResolvedDiscoveryInventory up1 =
+        resolve_discovery_inventory(single_v1, {as_cli_only});
+    const ResolvedDiscoveryInventory up2 =
+        resolve_discovery_inventory(single_v2, {as_cli_only});
+    expect(up1.applications.size() == 1 && up2.applications.size() == 1 &&
+               up1.applications[0].resolved_id ==
+                   up2.applications[0].resolved_id,
+           "single RPM installation must keep stable resolved_id across "
+           "version upgrades");
+  }
+
+  // 3. Installation-scoped component deduplication across Flatpak + DPKG:
+  //    Flatpak matching org.example.DualTool must NOT suppress a separate
+  //    verified DPKG installation sharing the same AppStream component ID!
+  {
+    DiscoveryPassResult pass;
+
+    DiscoveredApplication fp;
+    fp.provenance.provider_id = "flatpak";
+    fp.provenance.native_id = "org.example.DualTool";
+    fp.provenance.installation_source = InstallationSource::kFlatpak;
+    fp.provenance.installation_scope = InstallationScope::kUser;
+    fp.package_id = OptionalString::of("org.example.DualTool");
+    fp.installation_id = OptionalString::of("user/stable/x86_64");
+    fp.application_id = build_application_id(
+        "flatpak", "org.example.DualTool", InstallationScope::kUser,
+        fp.installation_id);
+    fp.metadata.version = OptionalString::of("3.0.0");
+    pass.applications.push_back(fp);
+
+    InstalledPackageRecord dpkg_dual = make_owned_pkg(
+        "dpkg", InstallationSource::kDpkg, "dual-tool", "amd64", "2.5.0-1");
+    InstalledPackageRecord dpkg_owned = make_owned_pkg(
+        "dpkg", InstallationSource::kDpkg, "owned-tool", "amd64", "1.1.0-1");
+    pass.packages = {dpkg_dual, dpkg_owned};
+
+    DiscoveredApplication owned_desktop = make_gio_app(
+        "org.example.OwnedTool.desktop", "Owned Tool", false, false, false);
+    owned_desktop.desktop_file_path =
+        OptionalString::of("/usr/share/applications/org.example.OwnedTool.desktop");
+    pass.applications.push_back(owned_desktop);
+
+    FakeOwnershipLookup owned_lookup;
+    PackageOwnershipEvidence own_ev;
+    own_ev.package_provider_id = "dpkg";
+    own_ev.package_identity_id =
+        OptionalString::of(dpkg_owned.package_identity_id);
+    own_ev.package_name = "owned-tool";
+    owned_lookup.add("/usr/share/applications/org.example.OwnedTool.desktop",
+                     own_ev);
+
+    AppStreamMetadataRecord as_fp_dual;
+    as_fp_dual.component_id = "org.example.DualTool";
+    as_fp_dual.component_kind = "desktop-application";
+    as_fp_dual.bundles.push_back(
+        {"flatpak", "app/org.example.DualTool/x86_64/stable"});
+
+    AppStreamMetadataRecord as_dpkg_dual;
+    as_dpkg_dual.component_id = "org.example.DualTool";
+    as_dpkg_dual.component_kind = "console-application";
+    as_dpkg_dual.package_names = {"dual-tool"};
+    as_dpkg_dual.provenance.origin_kind = AppStreamMetadataOriginKind::kCatalog;
+
+    AppStreamMetadataRecord as_owned;
+    as_owned.component_id = "org.example.OwnedTool";
+    as_owned.component_kind = "desktop-application";
+    as_owned.desktop_launchable_ids = {"org.example.OwnedTool.desktop"};
+    as_owned.package_names = {"owned-tool"};
+    as_owned.provenance.origin_kind = AppStreamMetadataOriginKind::kCatalog;
+
+    const ResolvedDiscoveryInventory inv = resolve_discovery_inventory(
+        pass, {as_fp_dual, as_dpkg_dual, as_owned}, &owned_lookup);
+
+    bool saw_fp_dual = false;
+    bool saw_dpkg_dual = false;
+    int owned_count = 0;
+    for (const auto& app : inv.applications) {
+      if (app.resolved_id == fp.application_id) saw_fp_dual = true;
+      if (app.primary_provenance.provider_id == "dpkg" &&
+          app.primary_provenance.native_id == "dual-tool") {
+        saw_dpkg_dual = true;
+      }
+      if (!app.linked_appstream_component_ids.empty() &&
+          app.linked_appstream_component_ids[0] == "org.example.OwnedTool") {
+        ++owned_count;
+      }
+    }
+    expect(saw_fp_dual && saw_dpkg_dual,
+           "Flatpak matching org.example.DualTool must NOT suppress separate "
+           "DPKG installation sharing the same component ID");
+    expect(owned_count == 1,
+           "verified DPKG installation owning its desktop entry must "
+           "deduplicate to a single ResolvedApplication");
+  }
+}
+
+void test_async_resolved_discovery_lifecycle_serialization_and_legacy_isolation() {
+  using flutter_device_apps_linux::ResolvedDiscoveryExecutionOutcome;
+
+  // 1. Completion on platform thread, optional AppStream flag, and isolation of
+  // legacy GIO-only discover_async alongside discover_resolved_async.
+  {
+    std::atomic<int> gio_calls{0};
+    std::atomic<int> pkg_calls{0};
+    std::atomic<int> as_calls{0};
+
+    auto service = std::make_shared<ApplicationDiscoveryService>();
+    service->register_provider(std::make_unique<ControlledDiscoveryProvider>(
+        "gio", [&]() {
+          gio_calls.fetch_add(1);
+          DiscoveryResult res;
+          DiscoveredApplication app = make_gio_app(
+              "org.example.AsyncApp.desktop", "Async App", true, false, false);
+          app.desktop_file_path =
+              OptionalString::of("/usr/share/applications/org.example.AsyncApp.desktop");
+          res.applications.push_back(std::move(app));
+          return res;
+        }));
+    class CallbackPackageProvider final : public PackageDiscoveryProvider {
+     public:
+      CallbackPackageProvider(std::string id,
+                              std::function<PackageDiscoveryResult()> fn)
+          : id_(std::move(id)), fn_(std::move(fn)) {}
+      const char* id() const override { return id_.c_str(); }
+      bool is_available() const override { return true; }
+      PackageDiscoveryResult discover_packages() override { return fn_(); }
+
+     private:
+      std::string id_;
+      std::function<PackageDiscoveryResult()> fn_;
+    };
+
+    service->register_package_provider(
+        std::make_unique<CallbackPackageProvider>("dpkg", [&]() {
+          pkg_calls.fetch_add(1);
+          PackageDiscoveryResult res;
+          res.packages.push_back(make_owned_pkg(
+              "dpkg", InstallationSource::kDpkg, "async-app", "amd64",
+              "1.2.3-1"));
+          return res;
+        }));
+
+    AppStreamBackendResult as_backend_res;
+    AppStreamMetadataRecord as_rec;
+    as_rec.component_id = "org.example.AsyncApp";
+    as_rec.component_kind = "desktop-application";
+    as_rec.desktop_launchable_ids = {"org.example.AsyncApp.desktop"};
+    as_rec.summary = OptionalString::of("Async App Summary");
+    as_rec.provenance.origin_kind = AppStreamMetadataOriginKind::kMetainfo;
+    as_backend_res.records.push_back(as_rec);
+    service->set_metadata_provider(std::make_unique<AppStreamMetadataProvider>(
+        std::make_unique<FakeAppStreamBackend>(
+            true, "libappstream.so.5", as_backend_res, nullptr, &as_calls)));
+
+    TestPlatformLoop loop;
+    WorkerPoolFixture pool;
+    const std::thread::id platform_thread = std::this_thread::get_id();
+    AsyncDiscoveryRunner runner(
+        service, pool.scheduler(),
+        [&loop](std::function<void()> cb) { loop.post(std::move(cb)); });
+
+    // Legacy GIO-only pass must never invoke package or AppStream providers.
+    DiscoveryExecutionOutcome legacy_out;
+    runner.discover_async(
+        [&](DiscoveryExecutionOutcome outcome) {
+          expect(std::this_thread::get_id() == platform_thread,
+                 "legacy completion must run on platform thread");
+          legacy_out = std::move(outcome);
+        },
+        DiscoveryRequestOptions::only_providers({"gio"}));
+    loop.run_one();
+    expect(legacy_out.status == DiscoveryExecutionStatus::kCompleted,
+           "legacy discover_async must succeed");
+    expect(gio_calls.load() == 1 && pkg_calls.load() == 0 &&
+               as_calls.load() == 0,
+           "legacy GIO-only discover_async must not run package or AppStream "
+           "providers");
+
+    // Resolved pass with AppStream enabled.
+    ResolvedDiscoveryExecutionOutcome resolved_with_as;
+    runner.discover_resolved_async(
+        [&](ResolvedDiscoveryExecutionOutcome outcome) {
+          expect(std::this_thread::get_id() == platform_thread,
+                 "resolved completion must run on platform thread");
+          resolved_with_as = std::move(outcome);
+        },
+        DiscoveryRequestOptions::all_providers(), true);
+    loop.run_one();
+    expect(resolved_with_as.status == DiscoveryExecutionStatus::kCompleted,
+           "discover_resolved_async should complete");
+    expect(resolved_with_as.inventory.applications.size() == 1,
+           "discover_resolved_async should return resolved application");
+    expect(resolved_with_as.inventory.packages.size() == 1,
+           "discover_resolved_async should preserve raw package inventory");
+    if (!resolved_with_as.inventory.applications.empty()) {
+      expect(resolved_with_as.inventory.applications[0].classification ==
+                 ApplicationClassification::kGuiApplication,
+             "AppStream enrichment should classify desktop-application as GUI");
+      expect(resolved_with_as.inventory.applications[0]
+                     .metadata.summary.has_value() &&
+                 resolved_with_as.inventory.applications[0]
+                         .metadata.summary.value() == "Async App Summary",
+             "AppStream summary should enrich resolved application");
+    }
+    expect(pkg_calls.load() == 1 && as_calls.load() == 1,
+           "discover_resolved_async should run package and AppStream providers");
+
+    // Resolved pass with AppStream disabled.
+    ResolvedDiscoveryExecutionOutcome resolved_no_as;
+    runner.discover_resolved_async(
+        [&](ResolvedDiscoveryExecutionOutcome outcome) {
+          resolved_no_as = std::move(outcome);
+        },
+        DiscoveryRequestOptions::all_providers(), false);
+    loop.run_one();
+    expect(resolved_no_as.status == DiscoveryExecutionStatus::kCompleted,
+           "discover_resolved_async without AppStream should complete");
+    expect(as_calls.load() == 1,
+           "include_appstream_metadata=false must not query AppStream");
+    if (!resolved_no_as.inventory.applications.empty()) {
+      expect(resolved_no_as.inventory.applications[0].classification ==
+                 ApplicationClassification::kUnknown,
+             "without AppStream, GIO-only app classification must remain "
+             "unknown");
+    }
+
+    pool.join_all();
+  }
+
+  // 2. Overlapping serialization (interleaved legacy + resolved), cancellation,
+  // worker exception, and non-blocking teardown.
+  {
+    Latch started(1);
+    Latch release(1);
+    std::atomic<int> in_flight{0};
+    std::atomic<int> max_in_flight{0};
+    std::atomic<int> calls{0};
+
+    auto service = std::make_shared<ApplicationDiscoveryService>();
+    service->register_provider(std::make_unique<ControlledDiscoveryProvider>(
+        "gio", [&]() {
+          const int cur = in_flight.fetch_add(1) + 1;
+          int prev = max_in_flight.load();
+          while (cur > prev &&
+                 !max_in_flight.compare_exchange_weak(prev, cur)) {
+          }
+          const int n = calls.fetch_add(1) + 1;
+          if (n == 1) {
+            started.count_down();
+            release.wait();
+          }
+          DiscoveryResult res;
+          res.applications.push_back(make_gio_app(
+              ("org.example.Seq" + std::to_string(n) + ".desktop").c_str(),
+              "Seq", false, false, false));
+          in_flight.fetch_sub(1);
+          return res;
+        }));
+
+    TestPlatformLoop loop;
+    WorkerPoolFixture pool;
+    AsyncDiscoveryRunner runner(
+        service, pool.scheduler(),
+        [&loop](std::function<void()> cb) { loop.post(std::move(cb)); });
+
+    std::vector<int> order;
+    DiscoveryExecutionStatus cancel_status = DiscoveryExecutionStatus::kCompleted;
+    runner.discover_resolved_async([&](ResolvedDiscoveryExecutionOutcome out) {
+      expect(out.status == DiscoveryExecutionStatus::kCompleted,
+             "first resolved request should complete");
+      order.push_back(1);
+    });
+    started.wait();
+
+    DiscoveryRequestHandle cancelled = runner.discover_resolved_async(
+        [&](ResolvedDiscoveryExecutionOutcome out) {
+          cancel_status = out.status;
+          order.push_back(2);
+        });
+    runner.discover_async(
+        [&](DiscoveryExecutionOutcome out) {
+          expect(out.status == DiscoveryExecutionStatus::kCompleted,
+                 "interleaved legacy request should complete");
+          order.push_back(3);
+        },
+        DiscoveryRequestOptions::only_providers({"gio"}));
+
+    cancelled.cancel();
+    expect(pool.scheduled_workers() == 1,
+           "interleaved resolved and legacy requests must share one worker");
+
+    release.count_down();
+    loop.run_until(3);
+    pool.join_all();
+
+    expect(max_in_flight.load() == 1,
+           "interleaved requests must never access providers concurrently");
+    expect(calls.load() == 2,
+           "cancelled queued resolved request must not execute provider");
+    expect(cancel_status == DiscoveryExecutionStatus::kCancelled,
+           "cancelled queued resolved request must report kCancelled");
+    expect(order.size() == 3 && order[0] == 1 && order[1] == 2 &&
+               order[2] == 3,
+           "interleaved resolved and legacy requests must complete FIFO");
+  }
+
+  // 3. Worker exception -> kExecutionError on discover_resolved_async.
+  {
+    auto service = std::make_shared<ApplicationDiscoveryService>();
+    service->register_provider(std::make_unique<ControlledDiscoveryProvider>(
+        "throwing",
+        []() -> DiscoveryResult { throw std::runtime_error("resolved boom"); }));
+
+    TestPlatformLoop loop;
+    WorkerPoolFixture pool;
+    AsyncDiscoveryRunner runner(
+        service, pool.scheduler(),
+        [&loop](std::function<void()> cb) { loop.post(std::move(cb)); });
+
+    ResolvedDiscoveryExecutionOutcome received;
+    runner.discover_resolved_async([&](ResolvedDiscoveryExecutionOutcome out) {
+      received = std::move(out);
+    });
+    loop.run_one();
+    pool.join_all();
+
+    expect(received.status == DiscoveryExecutionStatus::kExecutionError,
+           "worker exception in discover_resolved_async must report "
+           "kExecutionError");
+    expect(!received.error_message.empty(),
+           "kExecutionError in discover_resolved_async must carry error");
+  }
+
+  // 4. Non-blocking teardown while discover_resolved_async is in-flight/queued.
+  {
+    Latch slow_started(1);
+    Latch release_slow(1);
+    DiscoveryExecutionStatus queued_status =
+        DiscoveryExecutionStatus::kCompleted;
+    DiscoveryExecutionStatus inflight_status =
+        DiscoveryExecutionStatus::kCompleted;
+    bool inflight_empty_inventory = false;
+    std::atomic<int> inflight_callbacks{0};
+
+    TestPlatformLoop loop;
+    WorkerPoolFixture pool;
+    {
+      auto service = std::make_shared<ApplicationDiscoveryService>();
+      service->register_provider(std::make_unique<ControlledDiscoveryProvider>(
+          "gio", [&]() {
+            slow_started.count_down();
+            release_slow.wait();
+            DiscoveryResult res;
+            res.applications.push_back(make_gio_app(
+                "org.example.Slow.desktop", "Slow", true, false, false));
+            return res;
+          }));
+
+      auto runner = std::make_unique<AsyncDiscoveryRunner>(
+          service, pool.scheduler(),
+          [&loop](std::function<void()> cb) { loop.post(std::move(cb)); });
+      service.reset();
+
+      runner->discover_resolved_async(
+          [&](ResolvedDiscoveryExecutionOutcome out) {
+            inflight_status = out.status;
+            inflight_empty_inventory = out.inventory.applications.empty();
+            inflight_callbacks.fetch_add(1);
+          });
+      slow_started.wait();
+
+      runner->discover_resolved_async([&](ResolvedDiscoveryExecutionOutcome out) {
+        queued_status = out.status;
+      });
+
+      runner.reset();
+      expect(queued_status == DiscoveryExecutionStatus::kCancelled,
+             "queued resolved request must cancel immediately on teardown");
+      expect(inflight_callbacks.load() == 0,
+             "in-flight resolved request has not completed before release");
+    }
+
+    release_slow.count_down();
+    pool.join_all();
+    loop.drain_available();
+    expect(inflight_callbacks.load() == 1 &&
+               inflight_status == DiscoveryExecutionStatus::kCancelled &&
+               inflight_empty_inventory,
+           "in-flight resolved request during teardown must deliver kCancelled "
+           "once with empty inventory");
+  }
+}
+
+}  // namespace
+
+int main() {
+  test_unified_model_defaults_are_unknown_and_missing();
+  test_visibility_states_remain_independent_from_source_and_classification();
+  test_unified_model_distinguishes_empty_vs_missing_and_false_vs_unknown();
+  test_identity_contract_and_collision_resistance();
+  test_legacy_desktop_file_id_validation();
+  test_legacy_adapter_enforces_gio_visibility_and_preserves_order();
+  test_coordinator_report_distinguishes_success_unavailable_and_failure();
+  test_async_completion_context_empty_and_provider_failures();
+  test_async_worker_exception_produces_execution_error();
+  test_async_serializes_overlapping_requests_and_keeps_platform_responsive();
+  test_async_cancellation_for_queued_and_in_flight_requests();
+  test_teardown_while_discovery_pending_is_non_blocking_and_safe();
+  test_teardown_with_stopped_platform_loop_releases_pending_calls();
+  test_concurrent_registration_and_discovery_on_service();
+  test_flatpak_missing_backend_or_library_is_unavailable();
+  test_flatpak_empty_installations();
+  test_flatpak_scopes_named_installs_branches_arches_metadata_and_runtimes();
+  test_flatpak_partial_and_total_installation_failures();
+  test_flatpak_ownership_and_legacy_list_apps_compatibility();
+  test_provider_filtering_legacy_gio_only_vs_unified();
+  test_snap_missing_backend_filtering_parallel_metadata_and_stable_id();
+  test_snap_provider_failure_isolation();
+  test_snapd_socket_backend_end_to_end();
+  test_appstream_missing_library_unsupported_abi_and_malformed_errors();
+  test_appstream_metadata_fields_ambiguous_candidates_and_install_evidence();
+  test_dpkg_missing_empty_and_unreadable_databases();
+  test_dpkg_states_multiarch_multiline_missing_fields_and_upgrade_id();
+  test_dpkg_malformed_duplicate_and_legacy_isolation();
+  test_rpm_availability_abi_empty_and_provider_failures();
+  test_rpm_metadata_multiarch_multi_version_and_legacy_isolation();
+  test_pacman_conf_resolution();
+  test_pacman_availability_abi_empty_and_provider_failures();
+  test_pacman_metadata_reasons_upgrade_id_malformed_and_legacy_isolation();
+  test_nix_manifest_versions_v1_v2_v3_and_multiple_outputs();
+  test_nix_profile_aliases_separate_installations_and_upgrade_identity();
+  test_nix_missing_empty_malformed_unsupported_legacy_and_isolation();
+  test_resolution_dedup_separate_installations_and_order_independence();
+  test_resolution_ambiguous_matches_and_conflicting_metadata();
+  test_resolution_classification_ownership_catalog_only_and_isolation();
+  test_resolution_large_inventory_indexed_performance();
+  test_ownership_dpkg_indexer_multiarch_diversions_and_symlinks();
+  test_ownership_nix_rpm_pacman_indexers();
+  test_ownership_resolution_parallel_versions_diversions_and_hints();
+  test_ownership_service_single_pass_failure_isolation_and_legacy();
+  test_resolution_step92_integrity_cross_provider_parallel_rpm_and_scoped_dedup();
+  test_async_resolved_discovery_lifecycle_serialization_and_legacy_isolation();
+
+  if (g_failures > 0) {
+    std::cerr << g_failures << " test assertion(s) failed.\n";
+    return 1;
+  }
+  std::cout << "All discovery native unit and async tests passed.\n";
+  return 0;
+}

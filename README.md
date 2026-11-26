@@ -49,6 +49,27 @@ final matches = await FlutterDeviceAppsLinux.searchApps('image editor');
 Both methods return desktop entries that GIO considers visible in menus.
 Search results follow GIO's relevance order.
 
+### Discover normalized applications across local Linux sources
+
+```dart
+final inventory = await FlutterDeviceAppsLinux.discoverApps();
+for (final app in inventory.applications) {
+  print('${app.resolvedId}: ${app.metadata.name} (${app.classification.name})');
+}
+
+// Optionally include raw system/profile packages in a separate collection:
+final full = await FlutterDeviceAppsLinux.discoverApps(includePackages: true);
+print('Installed packages: ${full.packages.length}');
+```
+
+`discoverApps()` queries available local read-only sources (GIO desktop entries,
+Flatpak, Snap, DPKG, RPM, Pacman, Nix, and local AppStream metadata), correlates
+and deduplicates verified installations, and returns immutable results with
+per-provider diagnostics and preserved conflicts/ambiguities.
+Raw installed packages stay separate in `LinuxDiscoveryResult.packages` and are
+only populated when `includePackages: true`.
+Legacy `listApps()` remains GIO-only and unchanged.
+
 ### Get an app by desktop file ID
 
 ```dart
@@ -100,6 +121,7 @@ All methods below belong to `FlutterDeviceAppsLinux`.
 
 | Method | Purpose |
 | --- | --- |
+| `discoverApps` | Discover normalized applications across local Linux sources, with optional package inventory and provider diagnostics. |
 | `getAppIcon` | Get the app icon as PNG bytes. |
 | `openApp` | Request a launch through GIO and return whether it was accepted. |
 | `getAppMetadata` | Read homepage, developer, license, and description from local AppStream MetaInfo. |
