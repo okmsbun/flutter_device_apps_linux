@@ -31,6 +31,7 @@
 #include "discovery/flatpak_discovery_provider.h"
 #include "discovery/installed_package.h"
 #include "discovery/legacy_list_apps_adapter.h"
+#include "discovery/nix_discovery_provider.h"
 #include "discovery/package_discovery_provider.h"
 #include "discovery/pacman_discovery_provider.h"
 #include "discovery/rpm_discovery_provider.h"
@@ -78,6 +79,9 @@ using flutter_device_apps_linux::InstalledPackageRecord;
 using flutter_device_apps_linux::is_valid_legacy_desktop_file_id;
 using flutter_device_apps_linux::kFlatpakRefKindApp;
 using flutter_device_apps_linux::kFlatpakRefKindRuntime;
+using flutter_device_apps_linux::NixDiscoveryConfig;
+using flutter_device_apps_linux::NixDiscoveryProvider;
+using flutter_device_apps_linux::NixProfileSpec;
 using flutter_device_apps_linux::OptionalString;
 using flutter_device_apps_linux::PackageDiscoveryProvider;
 using flutter_device_apps_linux::PackageDiscoveryResult;
@@ -3158,6 +3162,477 @@ void test_pacman_metadata_reasons_upgrade_id_malformed_and_legacy_isolation() {
          "Pacman package_identity_id must stay stable across version upgrades");
 }
 
+// --- NixDiscoveryProvider tests ---
+
+class TempNixDir {
+ public:
+  TempNixDir() {
+    static std::atomic<int> counter{0};
+    path_ = "/tmp/fda-nix-test-" + std::to_string(getpid()) + "-" +
+            std::to_string(counter.fetch_add(1));
+    mkdir(path_.c_str(), 0700);
+  }
+
+  ~TempNixDir() {
+    for (auto it = files_.rbegin(); it != files_.rend(); ++it) {
+      unlink(it->c_str());
+    }
+    for (auto it = dirs_.rbegin(); it != dirs_.rend(); ++it) {
+      rmdir(it->c_str());
+    }
+    rmdir(path_.c_str());
+  }
+
+  const std::string& path() const { return path_; }
+
+  std::string make_dir(const std::string& rel) {
+    std::string cur = path_;
+    size_t pos = 0;
+    while (pos < rel.size()) {
+      size_t slash = rel.find('/', pos);
+      if (slash == std::string::npos) slash = rel.size();
+      const std::string seg = rel.substr(pos, slash - pos);
+      if (!seg.empty()) {
+        cur += "/" + seg;
+        if (mkdir(cur.c_str(), 0700) == 0) {
+          dirs_.push_back(cur);
+        }
+      }
+      pos = slash + 1;
+    }
+    return cur;
+  }
+
+  std::string write_file(const std::string& rel, const std::string& content) {
+    const size_t slash = rel.rfind('/');
+    if (slash != std::string::npos) {
+      make_dir(rel.substr(0, slash));
+    }
+    const std::string full = path_ + "/" + rel;
+    std::ofstream out(full.c_str(), std::ios::binary);
+    out << content;
+    out.close();
+    files_.push_back(full);
+    return full;
+  }
+
+  std::string make_symlink(const std::string& rel, const std::string& target) {
+    const size_t slash = rel.rfind('/');
+    if (slash != std::string::npos) {
+      make_dir(rel.substr(0, slash));
+    }
+    const std::string full = path_ + "/" + rel;
+    unlink(full.c_str());
+    if (symlink(target.c_str(), full.c_str()) == 0) {
+      files_.push_back(full);
+    }
+    return full;
+  }
+
+ private:
+  std::string path_;
+  std::vector<std::string> dirs_;
+  std::vector<std::string> files_;
+};
+
+void test_nix_manifest_versions_v1_v2_v3_and_multiple_outputs() {
+  TempNixDir root;
+
+  // Version 1 manifest (array elements, uri / originalUri, multiple outputs).
+  const std::string p_v1 = root.make_dir("p_v1");
+  root.write_file(
+      "p_v1/manifest.json",
+      "{\n"
+      "  \"version\": 1,\n"
+      "  \"elements\": [\n"
+      "    {\n"
+      "      \"active\": true,\n"
+      "      \"attrPath\": \"legacyPackages.x86_64-linux.ripgrep\",\n"
+      "      \"originalUri\": \"flake:nixpkgs\",\n"
+      "      \"uri\": \"github:NixOS/nixpkgs/1111111\",\n"
+      "      \"outputs\": [\"out\", \"man\"],\n"
+      "      \"priority\": 5,\n"
+      "      \"storePaths\": [\n"
+      "        \"/nix/store/0123456789abcdfghijklmnpqrsvwxyz-ripgrep-14.1.0\",\n"
+      "        \"/nix/store/0123456789abcdfghijklmnpqrsvwxyz-ripgrep-14.1.0-man\"\n"
+      "      ]\n"
+      "    },\n"
+      "    {\n"
+      "      \"active\": false,\n"
+      "      \"attrPath\": \"legacyPackages.x86_64-linux.hidden-pkg\",\n"
+      "      \"originalUri\": \"flake:nixpkgs\",\n"
+      "      \"uri\": \"github:NixOS/nixpkgs/1111111\",\n"
+      "      \"storePaths\": [\"/nix/store/0123456789abcdfghijklmnpqrsvwxyz-hidden-pkg-1.0\"]\n"
+      "    }\n"
+      "  ]\n"
+      "}\n");
+
+  // Version 2 manifest (array elements, url / originalUrl, separate output
+  // elements for the same attrPath must stay distinct).
+  const std::string p_v2 = root.make_dir("p_v2");
+  root.write_file(
+      "p_v2/manifest.json",
+      "{\n"
+      "  \"version\": 2,\n"
+      "  \"elements\": [\n"
+      "    {\n"
+      "      \"active\": true,\n"
+      "      \"attrPath\": \"legacyPackages.x86_64-linux.openssl\",\n"
+      "      \"originalUrl\": \"flake:nixpkgs\",\n"
+      "      \"url\": \"github:NixOS/nixpkgs/2222222\",\n"
+      "      \"outputs\": [\"bin\"],\n"
+      "      \"storePaths\": [\"/nix/store/0123456789abcdfghijklmnpqrsvwxyz-openssl-3.0.13-bin\"]\n"
+      "    },\n"
+      "    {\n"
+      "      \"active\": true,\n"
+      "      \"attrPath\": \"legacyPackages.x86_64-linux.openssl\",\n"
+      "      \"originalUrl\": \"flake:nixpkgs\",\n"
+      "      \"url\": \"github:NixOS/nixpkgs/2222222\",\n"
+      "      \"outputs\": [\"man\"],\n"
+      "      \"storePaths\": [\"/nix/store/0123456789abcdfghijklmnpqrsvwxyz-openssl-3.0.13-man\"]\n"
+      "    }\n"
+      "  ]\n"
+      "}\n");
+
+  // Version 3 manifest (object map elements, url / originalUrl, active +
+  // inactive elements, null outputs, multiple storePaths).
+  const std::string p_v3 = root.make_dir("p_v3");
+  root.write_file(
+      "p_v3/manifest.json",
+      "{\n"
+      "  \"version\": 3,\n"
+      "  \"elements\": {\n"
+      "    \"hello\": {\n"
+      "      \"active\": true,\n"
+      "      \"attrPath\": \"packages.aarch64-linux.hello\",\n"
+      "      \"originalUrl\": \"flake:nixpkgs\",\n"
+      "      \"url\": \"github:NixOS/nixpkgs/3333333\",\n"
+      "      \"outputs\": null,\n"
+      "      \"priority\": 10,\n"
+      "      \"storePaths\": [\n"
+      "        \"/nix/store/0123456789abcdfghijklmnpqrsvwxyz-hello-2.12.1\",\n"
+      "        \"/nix/store/0123456789abcdfghijklmnpqrsvwxyz-hello-2.12.1-doc\"\n"
+      "      ]\n"
+      "    },\n"
+      "    \"inactive-tool\": {\n"
+      "      \"active\": false,\n"
+      "      \"attrPath\": \"legacyPackages.aarch64-linux.inactive-tool\",\n"
+      "      \"originalUrl\": \"flake:nixpkgs\",\n"
+      "      \"storePaths\": [\"/nix/store/0123456789abcdfghijklmnpqrsvwxyz-inactive-tool-1.0\"]\n"
+      "    }\n"
+      "  }\n"
+      "}\n");
+
+  NixDiscoveryConfig cfg;
+  cfg.include_standard_profiles = false;
+  cfg.explicit_profiles.push_back({p_v1, InstallationScope::kUser, "v1"});
+  cfg.explicit_profiles.push_back({p_v2, InstallationScope::kUser, "v2"});
+  cfg.explicit_profiles.push_back({p_v3, InstallationScope::kUser, "v3"});
+
+  NixDiscoveryProvider provider(cfg);
+  expect(std::string(provider.id()) == "nix" && provider.is_available(),
+         "NixDiscoveryProvider must report id=nix and available for fixtures");
+
+  const PackageDiscoveryResult res = provider.discover_packages();
+  expect(res.ok && res.error_message.empty(),
+         "valid v1/v2/v3 Nix manifests must succeed cleanly");
+  expect(res.packages.size() == 4,
+         "must discover 4 active elements (1 v1 + 2 v2 outputs + 1 v3) and "
+         "exclude inactive elements");
+  if (res.packages.size() != 4) return;
+
+  const auto& v1_rg = res.packages[0];
+  const auto& v2_bin = res.packages[1];
+  const auto& v2_man = res.packages[2];
+  const auto& v3_hello = res.packages[3];
+
+  expect(v1_rg.package_name == "ripgrep" &&
+             v1_rg.version.has_value() && v1_rg.version.value() == "14.1.0" &&
+             v1_rg.architecture.has_value() &&
+             v1_rg.architecture.value() == "x86_64-linux" &&
+             v1_rg.source_url.has_value() &&
+             v1_rg.source_url.value() == "flake:nixpkgs" &&
+             v1_rg.locked_url.has_value() &&
+             v1_rg.locked_url.value() == "github:NixOS/nixpkgs/1111111" &&
+             v1_rg.outputs.size() == 2 && v1_rg.store_paths.size() == 2 &&
+             v1_rg.install_priority.has_value() &&
+             v1_rg.install_priority.value() == 5 &&
+             v1_rg.provenance.installation_source == InstallationSource::kNix &&
+             v1_rg.classification == ApplicationClassification::kUnknown,
+         "v1 manifest metadata, outputs, storePaths, priority, and provenance "
+         "must be preserved");
+
+  expect(v2_bin.package_name == "openssl" &&
+             v2_bin.version.has_value() && v2_bin.version.value() == "3.0.13" &&
+             v2_man.package_name == "openssl" &&
+             v2_bin.package_identity_id != v2_man.package_identity_id,
+         "v2 separate output installs of same attrPath must strip output "
+         "suffix from version and have distinct identities");
+
+  expect(v3_hello.package_name == "hello" &&
+             v3_hello.version.has_value() &&
+             v3_hello.version.value() == "2.12.1" &&
+             v3_hello.architecture.has_value() &&
+             v3_hello.architecture.value() == "aarch64-linux" &&
+             v3_hello.outputs.empty() && v3_hello.store_paths.size() == 2 &&
+             v3_hello.install_priority.has_value() &&
+             v3_hello.install_priority.value() == 10 &&
+             v3_hello.package_identity_id == "nix:hello:user:v3",
+         "v3 object-map element metadata, multiple storePaths, and stable "
+         "identity must match");
+}
+
+void test_nix_profile_aliases_separate_installations_and_upgrade_identity() {
+  TempNixDir root;
+
+  // Simulated Nix store generation directories for user profile (gen 1 & gen 2)
+  // and a separate system default profile.
+  const std::string gen1_store = root.make_dir("store/gen1-profile");
+  root.write_file(
+      "store/gen1-profile/manifest.json",
+      "{\n"
+      "  \"version\": 3,\n"
+      "  \"elements\": {\n"
+      "    \"ripgrep\": {\n"
+      "      \"active\": true,\n"
+      "      \"attrPath\": \"legacyPackages.x86_64-linux.ripgrep\",\n"
+      "      \"originalUrl\": \"flake:nixpkgs\",\n"
+      "      \"url\": \"github:NixOS/nixpkgs/aaaa\",\n"
+      "      \"storePaths\": [\"/nix/store/0123456789abcdfghijklmnpqrsvwxyz-ripgrep-14.0.0\"]\n"
+      "    }\n"
+      "  }\n"
+      "}\n");
+
+  const std::string gen2_store = root.make_dir("store/gen2-profile");
+  root.write_file(
+      "store/gen2-profile/manifest.json",
+      "{\n"
+      "  \"version\": 3,\n"
+      "  \"elements\": {\n"
+      "    \"ripgrep\": {\n"
+      "      \"active\": true,\n"
+      "      \"attrPath\": \"legacyPackages.x86_64-linux.ripgrep\",\n"
+      "      \"originalUrl\": \"flake:nixpkgs\",\n"
+      "      \"url\": \"github:NixOS/nixpkgs/bbbb\",\n"
+      "      \"storePaths\": [\"/nix/store/zyxwvsqrpnmkljihgfcdba9876543210-ripgrep-15.0.0\"]\n"
+      "    }\n"
+      "  }\n"
+      "}\n");
+
+  const std::string sys_store = root.make_dir("store/system-default");
+  root.write_file(
+      "store/system-default/manifest.json",
+      "{\n"
+      "  \"version\": 3,\n"
+      "  \"elements\": {\n"
+      "    \"ripgrep\": {\n"
+      "      \"active\": true,\n"
+      "      \"attrPath\": \"legacyPackages.x86_64-linux.ripgrep\",\n"
+      "      \"originalUrl\": \"flake:nixpkgs\",\n"
+      "      \"storePaths\": [\"/nix/store/0123456789abcdfghijklmnpqrsvwxyz-ripgrep-14.0.0\"]\n"
+      "    }\n"
+      "  }\n"
+      "}\n");
+
+  // Historical generation link in the same directory must NOT be scanned.
+  root.make_symlink("profiles/per-user/alice/profile-1-link", gen1_store);
+  root.make_symlink("profiles/per-user/alice/profile-2-link", gen2_store);
+
+  // Active user profile aliases: XDG profile, ~/.nix-profile, and
+  // per-user/alice/profile ALL point to gen1_store -> must deduplicate aliases!
+  const std::string per_user_link =
+      root.make_symlink("profiles/per-user/alice/profile", gen1_store);
+  root.make_symlink("home/.nix-profile", per_user_link);
+  root.make_symlink("xdg/nix/profile", per_user_link);
+
+  // Separate system default profile points to sys_store -> must be preserved!
+  root.make_symlink("profiles/default", sys_store);
+
+  NixDiscoveryConfig cfg;
+  cfg.include_standard_profiles = true;
+  cfg.home_dir_override = OptionalString::of(root.path() + "/home");
+  cfg.xdg_state_home_override = OptionalString::of(root.path() + "/xdg");
+  cfg.user_name_override = OptionalString::of("alice");
+  cfg.system_profiles_root = root.path() + "/profiles";
+
+  NixDiscoveryProvider provider(cfg);
+  const PackageDiscoveryResult gen1_res = provider.discover_packages();
+  expect(gen1_res.ok && gen1_res.error_message.empty(),
+         "standard user/XDG/system Nix profiles must discover cleanly");
+  expect(gen1_res.packages.size() == 2,
+         "3 symlink aliases of the user profile must deduplicate to 1 while "
+         "separate system default profile is preserved (total 2)");
+  if (gen1_res.packages.size() != 2) return;
+
+  const auto& user_rg_v1 = gen1_res.packages[0];
+  const auto& sys_rg = gen1_res.packages[1];
+  expect(user_rg_v1.provenance.installation_scope == InstallationScope::kUser &&
+             sys_rg.provenance.installation_scope == InstallationScope::kSystem,
+         "user and system profile scopes must remain distinct");
+  expect(user_rg_v1.package_identity_id != sys_rg.package_identity_id,
+         "same package installed in user and system profiles must have "
+         "distinct package_identity_ids");
+
+  // Upgrade user profile generation symlink from gen1_store -> gen2_store
+  // (both profile store hash AND package store hash + version change).
+  root.make_symlink("profiles/per-user/alice/profile", gen2_store);
+  const PackageDiscoveryResult gen2_res = provider.discover_packages();
+  expect(gen2_res.ok && gen2_res.packages.size() == 2,
+         "upgraded user profile generation must still return 2 active records");
+  if (gen2_res.packages.size() != 2) return;
+
+  const auto& user_rg_v2 = gen2_res.packages[0];
+  expect(user_rg_v2.package_identity_id == user_rg_v1.package_identity_id,
+         "Nix package_identity_id must stay stable across store-hash and "
+         "profile-generation upgrades");
+  expect(user_rg_v2.version.has_value() && user_rg_v2.version.value() == "15.0.0",
+         "upgraded Nix package version must reflect new generation");
+}
+
+void test_nix_missing_empty_malformed_unsupported_legacy_and_isolation() {
+  // 1. Missing profile directories -> unavailable.
+  {
+    NixDiscoveryConfig cfg;
+    cfg.include_standard_profiles = false;
+    cfg.explicit_profiles.push_back(
+        {"/tmp/fda-nix-missing-profile-99999", InstallationScope::kUser, "u"});
+    NixDiscoveryProvider provider(cfg);
+    expect(!provider.is_available(),
+           "absent Nix profiles must report is_available() == false");
+  }
+
+  TempNixDir root;
+
+  // 2. Empty profile dir -> succeeds with 0 packages.
+  {
+    const std::string empty_dir = root.make_dir("empty_profile");
+    NixDiscoveryConfig cfg;
+    cfg.include_standard_profiles = false;
+    cfg.explicit_profiles.push_back(
+        {empty_dir, InstallationScope::kUser, "empty"});
+    NixDiscoveryProvider provider(cfg);
+    expect(provider.is_available(), "existing empty profile is available");
+    const PackageDiscoveryResult res = provider.discover_packages();
+    expect(res.ok && res.packages.empty() && res.error_message.empty(),
+           "empty Nix profile must succeed cleanly with 0 packages");
+  }
+
+  // 3. Legacy manifest.nix -> explicitly reported unsupported, never evaluated.
+  {
+    const std::string legacy_dir = root.make_dir("legacy_nix");
+    root.write_file("legacy_nix/manifest.nix",
+                    "[ { name = \"hello-2.12\"; outPath = \"/nix/store/x\"; } ]\n");
+    NixDiscoveryConfig cfg;
+    cfg.include_standard_profiles = false;
+    cfg.explicit_profiles.push_back(
+        {legacy_dir, InstallationScope::kUser, "legacy"});
+    NixDiscoveryProvider provider(cfg);
+    const PackageDiscoveryResult res = provider.discover_packages();
+    expect(!res.ok && res.packages.empty() &&
+               res.error_message.find("manifest.nix") != std::string::npos &&
+               res.error_message.find("unsupported") != std::string::npos,
+           "legacy manifest.nix must fail with explicit unsupported diagnostic");
+  }
+
+  // 4. Unsupported manifest.json schema version -> explicit diagnostic.
+  {
+    const std::string v99_dir = root.make_dir("unsupported_v99");
+    root.write_file("unsupported_v99/manifest.json",
+                    "{\"version\": 99, \"elements\": {}}\n");
+    NixDiscoveryConfig cfg;
+    cfg.include_standard_profiles = false;
+    cfg.explicit_profiles.push_back(
+        {v99_dir, InstallationScope::kUser, "v99"});
+    const PackageDiscoveryResult res =
+        NixDiscoveryProvider(cfg).discover_packages();
+    expect(!res.ok &&
+               res.error_message.find("unsupported") != std::string::npos,
+           "unsupported Nix manifest.json version must be explicitly reported");
+  }
+
+  // 5. Malformed JSON + malformed element mixed with valid profile + GIO
+  // isolation + legacy GIO-only listApps() isolation.
+  const std::string bad_json_dir = root.make_dir("bad_json");
+  root.write_file("bad_json/manifest.json", "{ broken json");
+
+  const std::string mixed_dir = root.make_dir("mixed_valid");
+  root.write_file(
+      "mixed_valid/manifest.json",
+      "{\n"
+      "  \"version\": 3,\n"
+      "  \"elements\": {\n"
+      "    \"bad\": {\"active\": true, \"storePaths\": []},\n"
+      "    \"jq\": {\n"
+      "      \"active\": true,\n"
+      "      \"attrPath\": \"legacyPackages.x86_64-linux.jq\",\n"
+      "      \"storePaths\": [\"/nix/store/0123456789abcdfghijklmnpqrsvwxyz-jq-1.7.1\"]\n"
+      "    }\n"
+      "  }\n"
+      "}\n");
+
+  NixDiscoveryConfig mixed_cfg;
+  mixed_cfg.include_standard_profiles = false;
+  mixed_cfg.explicit_profiles.push_back(
+      {bad_json_dir, InstallationScope::kOther, "bad"});
+  mixed_cfg.explicit_profiles.push_back(
+      {mixed_dir, InstallationScope::kUser, "mixed"});
+
+  ApplicationDiscoveryService service;
+  service.register_provider(std::make_unique<FakeDiscoveryProvider>(
+      "gio", true, []() {
+        DiscoveryResult r;
+        r.applications.push_back(make_gio_app(
+            "org.example.Visible.desktop", "Visible", true, false, false));
+        return r;
+      }()));
+  service.register_package_provider(
+      std::make_unique<NixDiscoveryProvider>(mixed_cfg));
+
+  const DiscoveryPassResult unified =
+      service.discover_with_report(DiscoveryRequestOptions::all_providers());
+  expect(unified.applications.size() == 1 &&
+             unified.applications[0].provenance.provider_id == "gio",
+         "Nix packages must NEVER appear in confirmed applications vector");
+  expect(unified.packages.size() == 1 &&
+             unified.packages[0].package_name == "jq" &&
+             unified.packages[0].classification ==
+                 ApplicationClassification::kUnknown,
+         "valid Nix profile must still yield packages despite sibling bad JSON "
+         "and malformed elements");
+  expect(unified.provider_summaries.size() == 2 &&
+             unified.provider_summaries[1].provider_id == "nix" &&
+             unified.provider_summaries[1].status ==
+                 ProviderExecutionStatus::kPartiallyFailed,
+         "mixed Nix profile errors must surface kPartiallyFailed");
+
+  // Legacy GIO-only listApps() must NEVER execute Nix provider.
+  std::atomic<int> nix_avail{0};
+  std::atomic<int> nix_disc{0};
+  auto isolated_service = std::make_shared<ApplicationDiscoveryService>();
+  isolated_service->register_provider(
+      std::make_unique<FakeDiscoveryProvider>("gio", true, DiscoveryResult{}));
+  isolated_service->register_package_provider(
+      std::make_unique<CountingPackageProvider>(
+          "nix", true, PackageDiscoveryResult{}, &nix_avail, &nix_disc));
+
+  TestPlatformLoop loop;
+  WorkerPoolFixture pool;
+  AsyncDiscoveryRunner runner(
+      isolated_service, pool.scheduler(),
+      [&loop](std::function<void()> cb) { loop.post(std::move(cb)); });
+  DiscoveryExecutionOutcome legacy_outcome;
+  runner.discover_async(
+      [&](DiscoveryExecutionOutcome outcome) {
+        legacy_outcome = std::move(outcome);
+      },
+      DiscoveryRequestOptions::only_providers({"gio"}));
+  loop.run_one();
+  pool.join_all();
+  expect(nix_avail.load() == 0 && nix_disc.load() == 0 &&
+             legacy_outcome.packages.empty(),
+         "legacy GIO-only listApps() must never run Nix provider");
+}
+
 }  // namespace
 
 int main() {
@@ -3194,6 +3669,9 @@ int main() {
   test_pacman_conf_resolution();
   test_pacman_availability_abi_empty_and_provider_failures();
   test_pacman_metadata_reasons_upgrade_id_malformed_and_legacy_isolation();
+  test_nix_manifest_versions_v1_v2_v3_and_multiple_outputs();
+  test_nix_profile_aliases_separate_installations_and_upgrade_identity();
+  test_nix_missing_empty_malformed_unsupported_legacy_and_isolation();
 
   if (g_failures > 0) {
     std::cerr << g_failures << " test assertion(s) failed.\n";

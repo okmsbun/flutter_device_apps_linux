@@ -72,6 +72,16 @@ struct InstalledPackageRecord {
   OptionalString packager;
   OptionalString vendor;
 
+  // Optional profile-based package manager metadata (for example, Nix
+  // profiles and manifest.json elements).
+  OptionalString profile_path;
+  OptionalString attribute_path;
+  OptionalString source_url;
+  OptionalString locked_url;
+  std::vector<std::string> outputs;
+  std::vector<std::string> store_paths;
+  OptionalValue<int> install_priority;
+
   // Actual installation state, desired selection state, and install reason.
   PackageInstallationState installation_state =
       PackageInstallationState::kUnknown;

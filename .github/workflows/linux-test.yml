@@ -22,6 +22,13 @@ jobs:
           echo "=== Disk usage before cleanup ==="
           df -h /
 
+          avail_kib="$(df -Pk / | awk 'NR==2 {print $4}')"
+          min_free_kib=$((25 * 1024 * 1024))
+          if [ -n "$avail_kib" ] && [ "$avail_kib" -ge "$min_free_kib" ]; then
+            echo "Skipping disk cleanup: available space (${avail_kib} KiB) is already >= 25 GiB."
+            exit 0
+          fi
+
           # Explicit allowlist of large standalone (non-dpkg-managed) SDKs and
           # toolcaches preinstalled on GitHub-hosted Ubuntu runners.
           # Excludes dpkg-managed runtimes (.NET, PowerShell, Google Cloud CLI)
@@ -83,7 +90,9 @@ jobs:
             linux/discovery/async_discovery_runner.cc \
             linux/discovery/dpkg_discovery_provider.cc \
             linux/discovery/flatpak_discovery_provider.cc \
+            linux/discovery/json_parser.cc \
             linux/discovery/legacy_list_apps_adapter.cc \
+            linux/discovery/nix_discovery_provider.cc \
             linux/discovery/pacman_discovery_provider.cc \
             linux/discovery/rpm_discovery_provider.cc \
             linux/discovery/snap_discovery_provider.cc \
@@ -101,7 +110,9 @@ jobs:
             linux/discovery/async_discovery_runner.cc \
             linux/discovery/dpkg_discovery_provider.cc \
             linux/discovery/flatpak_discovery_provider.cc \
+            linux/discovery/json_parser.cc \
             linux/discovery/legacy_list_apps_adapter.cc \
+            linux/discovery/nix_discovery_provider.cc \
             linux/discovery/pacman_discovery_provider.cc \
             linux/discovery/rpm_discovery_provider.cc \
             linux/discovery/snap_discovery_provider.cc \

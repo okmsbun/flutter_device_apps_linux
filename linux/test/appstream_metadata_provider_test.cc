@@ -96,6 +96,9 @@ int run_fixture(const char* metainfo_dir, const char* catalog_dir) {
 
   const AppStreamMetadataResult res = service.load_appstream_metadata();
   expect(res.ok, "isolated local AppStream fixture load must succeed");
+  expect(res.records.size() == 2,
+         "isolated fixture load must return only the 2 valid fixture "
+         "components without leaking host OS metadata");
 
   int editor_candidates = 0;
   bool saw_localized_desktop = false;
@@ -111,6 +114,9 @@ int run_fixture(const char* metainfo_dir, const char* catalog_dir) {
           rec.desktop_launchable_ids.size() == 1 &&
           rec.desktop_launchable_ids[0] == "org.example.Editor.desktop") {
         saw_localized_desktop = true;
+        expect(rec.provenance.origin_kind ==
+                   AppStreamMetadataOriginKind::kMetainfo,
+               "metainfo fixture must preserve kMetainfo origin_kind");
         expect(rec.name.has_value() && rec.name.value() == "Örnek Editör",
                "localized Turkish name must be resolved");
         expect(rec.summary.has_value() &&
@@ -131,6 +137,9 @@ int run_fixture(const char* metainfo_dir, const char* catalog_dir) {
     } else if (rec.component_id == "org.example.CliTool") {
       if (rec.component_kind == "console-application") {
         saw_console = true;
+        expect(rec.provenance.origin_kind ==
+                   AppStreamMetadataOriginKind::kCatalog,
+               "catalog fixture must preserve kCatalog origin_kind");
         expect(!rec.package_names.empty() &&
                    rec.package_names[0] == "example-cli",
                "package_names must be parsed from catalog");
