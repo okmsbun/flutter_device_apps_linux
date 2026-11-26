@@ -8,10 +8,11 @@
 
 #include <gio/gdesktopappinfo.h>
 
-#include <atomic>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -339,15 +340,68 @@ static void schedule_query(FlMethodCall* call, QueryKind kind, const char* targe
   g_task_run_in_thread(task, run_query);
 }
 
+struct ScopedMethodCall {
+  FlMethodCall* call = nullptr;
+
+  explicit ScopedMethodCall(FlMethodCall* retained) : call(retained) {}
+  ~ScopedMethodCall() {
+    if (call != nullptr) {
+      g_object_unref(call);
+    }
+  }
+
+  ScopedMethodCall(const ScopedMethodCall&) = delete;
+  ScopedMethodCall& operator=(const ScopedMethodCall&) = delete;
+};
+
+// Owned and accessed exclusively on the Flutter Linux platform thread.
+// Keeps FlMethodCall* ownership strictly off worker threads so pending calls
+// are released immediately on plugin teardown even if the platform main loop
+// stops before an in-flight worker completes.
+struct PendingMethodCalls {
+  bool torn_down = false;
+  uint64_t next_id = 0;
+  std::unordered_map<uint64_t, FlMethodCall*> calls;
+
+  ~PendingMethodCalls() { teardown(); }
+
+  uint64_t add(FlMethodCall* call) {
+    const uint64_t id = ++next_id;
+    calls.emplace(id, static_cast<FlMethodCall*>(g_object_ref(call)));
+    return id;
+  }
+
+  FlMethodCall* take(uint64_t id) {
+    if (torn_down) return nullptr;
+    const auto it = calls.find(id);
+    if (it == calls.end()) return nullptr;
+    FlMethodCall* call = it->second;
+    calls.erase(it);
+    return call;
+  }
+
+  void teardown() {
+    torn_down = true;
+    for (auto& entry : calls) {
+      if (entry.second != nullptr) {
+        g_object_unref(entry.second);
+      }
+    }
+    calls.clear();
+  }
+};
+
 struct DiscoveryPluginContext {
   std::shared_ptr<flutter_device_apps_linux::ApplicationDiscoveryService>
       service;
   std::unique_ptr<flutter_device_apps_linux::AsyncDiscoveryRunner> runner;
-  std::shared_ptr<std::atomic<bool>> torn_down =
-      std::make_shared<std::atomic<bool>>(false);
+  std::shared_ptr<PendingMethodCalls> pending_calls =
+      std::make_shared<PendingMethodCalls>();
 
   ~DiscoveryPluginContext() {
-    torn_down->store(true);
+    if (pending_calls != nullptr) {
+      pending_calls->teardown();
+    }
     if (runner != nullptr) {
       runner->shutdown();
     }
@@ -359,41 +413,38 @@ static void handle_method_call(FlMethodChannel*, FlMethodCall* call,
   const char* method = fl_method_call_get_name(call);
   if (g_str_equal(method, "listApps")) {
     auto* context = static_cast<DiscoveryPluginContext*>(user_data);
-    if (context == nullptr || context->runner == nullptr) {
+    if (context == nullptr || context->runner == nullptr ||
+        context->pending_calls == nullptr) {
       g_autoptr(FlValue) empty = fl_value_new_list();
       fl_method_call_respond_success(call, empty, nullptr);
       return;
     }
 
-    std::shared_ptr<FlMethodCall> retained_call(
-        static_cast<FlMethodCall*>(g_object_ref(call)), g_object_unref);
-    std::shared_ptr<std::atomic<bool>> torn_down = context->torn_down;
-    auto responded = std::make_shared<std::atomic<bool>>(false);
+    const uint64_t call_id = context->pending_calls->add(call);
+    std::weak_ptr<PendingMethodCalls> weak_calls(context->pending_calls);
 
     context->runner->discover_async(
-        [retained_call, torn_down, responded](
-            flutter_device_apps_linux::DiscoveryExecutionOutcome outcome) mutable {
-          std::shared_ptr<FlMethodCall> method_call = std::move(retained_call);
-          if (method_call == nullptr) return;
-          if (torn_down->load() ||
-              outcome.status ==
-                  flutter_device_apps_linux::DiscoveryExecutionStatus::
-                      kCancelled) {
-            return;
-          }
-          if (responded->exchange(true)) {
+        [call_id, weak_calls](
+            flutter_device_apps_linux::DiscoveryExecutionOutcome outcome) {
+          auto pending_calls = weak_calls.lock();
+          if (pending_calls == nullptr) return;
+
+          ScopedMethodCall method_call(pending_calls->take(call_id));
+          if (method_call.call == nullptr) return;
+          if (outcome.status ==
+              flutter_device_apps_linux::DiscoveryExecutionStatus::kCancelled) {
             return;
           }
           if (outcome.status ==
               flutter_device_apps_linux::DiscoveryExecutionStatus::
                   kExecutionError) {
-            fl_method_call_respond_error(method_call.get(), "ERR_DISCOVERY",
+            fl_method_call_respond_error(method_call.call, "ERR_DISCOVERY",
                                          "Application discovery failed",
                                          nullptr, nullptr);
             return;
           }
           g_autoptr(FlValue) apps = legacy_list_apps_value(outcome.applications);
-          fl_method_call_respond_success(method_call.get(), apps, nullptr);
+          fl_method_call_respond_success(method_call.call, apps, nullptr);
         });
     return;
   }
@@ -505,11 +556,18 @@ static std::unique_ptr<DiscoveryPluginContext> create_discovery_context() {
         });
   };
 
+  // Explicitly attach a GSource to platform_context rather than calling
+  // g_main_context_invoke_full(). g_main_context_invoke_full() may acquire an
+  // unowned default GMainContext and invoke the callback synchronously on the
+  // worker thread; an attached idle GSource only runs on the thread iterating
+  // platform_context (the Flutter Linux platform main loop).
   auto dispatch_completion = [platform_context](
                                  std::function<void()> completion) {
     auto* fn = new std::function<void()>(std::move(completion));
-    g_main_context_invoke_full(
-        platform_context.get(), G_PRIORITY_DEFAULT,
+    GSource* source = g_idle_source_new();
+    g_source_set_priority(source, G_PRIORITY_DEFAULT);
+    g_source_set_callback(
+        source,
         [](gpointer data) -> gboolean {
           auto* callback = static_cast<std::function<void()>*>(data);
           try {
@@ -525,6 +583,8 @@ static std::unique_ptr<DiscoveryPluginContext> create_discovery_context() {
         [](gpointer data) {
           delete static_cast<std::function<void()>*>(data);
         });
+    g_source_attach(source, platform_context.get());
+    g_source_unref(source);
   };
 
   context->runner =

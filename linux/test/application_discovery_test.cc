@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -838,6 +839,133 @@ void test_teardown_while_discovery_pending_is_non_blocking_and_safe() {
          "and completion finish");
 }
 
+void test_teardown_with_stopped_platform_loop_releases_pending_calls() {
+  struct PlatformOnlyCall {
+    std::thread::id owner_thread;
+    int* released_count;
+    bool* wrong_thread_release;
+
+    ~PlatformOnlyCall() {
+      if (std::this_thread::get_id() != owner_thread) {
+        *wrong_thread_release = true;
+      }
+      ++(*released_count);
+    }
+  };
+
+  struct PlatformCallTable {
+    bool torn_down = false;
+    uint64_t next_id = 0;
+    std::unordered_map<uint64_t, std::unique_ptr<PlatformOnlyCall>> calls;
+
+    uint64_t add(std::unique_ptr<PlatformOnlyCall> call) {
+      const uint64_t id = ++next_id;
+      calls.emplace(id, std::move(call));
+      return id;
+    }
+
+    std::unique_ptr<PlatformOnlyCall> take(uint64_t id) {
+      if (torn_down) return nullptr;
+      const auto it = calls.find(id);
+      if (it == calls.end()) return nullptr;
+      auto call = std::move(it->second);
+      calls.erase(it);
+      return call;
+    }
+
+    void teardown() {
+      torn_down = true;
+      calls.clear();
+    }
+  };
+
+  const std::thread::id platform_thread = std::this_thread::get_id();
+  int released_calls = 0;
+  bool wrong_thread_release = false;
+  std::atomic<int> responses{0};
+  Latch slow_started(1);
+  Latch release_slow(1);
+
+  std::mutex stopped_loop_mutex;
+  std::vector<std::function<void()>> undelivered_callbacks;
+  WorkerPoolFixture pool;
+
+  {
+    auto service = std::make_shared<ApplicationDiscoveryService>();
+    service->register_provider(std::make_unique<ControlledDiscoveryProvider>(
+        "gio", [&]() {
+          slow_started.count_down();
+          release_slow.wait();
+          DiscoveryResult result;
+          result.applications.push_back(make_gio_app(
+              "org.example.Slow.desktop", "Slow", true, false, false));
+          return result;
+        }));
+
+    auto table = std::make_shared<PlatformCallTable>();
+    AsyncDiscoveryRunner runner(
+        service, pool.scheduler(), [&](std::function<void()> cb) {
+          // Simulate a stopped main loop: callbacks are enqueued but never
+          // dispatched before teardown/destruction.
+          std::lock_guard<std::mutex> lock(stopped_loop_mutex);
+          undelivered_callbacks.push_back(std::move(cb));
+        });
+
+    const uint64_t first_id = table->add(std::unique_ptr<PlatformOnlyCall>(
+        new PlatformOnlyCall{platform_thread, &released_calls,
+                             &wrong_thread_release}));
+    std::weak_ptr<PlatformCallTable> weak_table(table);
+    runner.discover_async([first_id, weak_table, &responses](
+                              DiscoveryExecutionOutcome) {
+      auto locked = weak_table.lock();
+      if (locked == nullptr) return;
+      auto call = locked->take(first_id);
+      if (call != nullptr) responses.fetch_add(1);
+    });
+    slow_started.wait();
+
+    const uint64_t second_id = table->add(std::unique_ptr<PlatformOnlyCall>(
+        new PlatformOnlyCall{platform_thread, &released_calls,
+                             &wrong_thread_release}));
+    runner.discover_async([second_id, weak_table, &responses](
+                              DiscoveryExecutionOutcome) {
+      auto locked = weak_table.lock();
+      if (locked == nullptr) return;
+      auto call = locked->take(second_id);
+      if (call != nullptr) responses.fetch_add(1);
+    });
+
+    // Teardown on platform thread while slow worker is still running and main
+    // loop will never pump again.
+    table->teardown();
+    runner.shutdown();
+    table.reset();
+
+    expect(released_calls == 2,
+           "all pending calls (in-flight and queued) must release immediately "
+           "on platform thread during teardown");
+    expect(!wrong_thread_release,
+           "platform call handles must never release on a worker thread");
+
+    release_slow.count_down();
+  }
+
+  pool.join_all();
+  // Destroy un-dispatched callbacks on a background thread to simulate
+  // GMainContext finalization from a worker thread after main loop stop.
+  std::thread cleanup([&]() {
+    std::lock_guard<std::mutex> lock(stopped_loop_mutex);
+    undelivered_callbacks.clear();
+  });
+  cleanup.join();
+
+  expect(responses.load() == 0,
+         "no response must be sent after teardown with stopped loop");
+  expect(!wrong_thread_release,
+         "destroying undelivered callbacks on another thread must not touch "
+         "platform call handles");
+}
+
 void test_concurrent_registration_and_discovery_on_service() {
   ApplicationDiscoveryService service;
   service.register_provider(std::make_unique<FakeDiscoveryProvider>(
@@ -876,6 +1004,7 @@ int main() {
   test_async_serializes_overlapping_requests_and_keeps_platform_responsive();
   test_async_cancellation_for_queued_and_in_flight_requests();
   test_teardown_while_discovery_pending_is_non_blocking_and_safe();
+  test_teardown_with_stopped_platform_loop_releases_pending_calls();
   test_concurrent_registration_and_discovery_on_service();
 
   if (g_failures > 0) {
