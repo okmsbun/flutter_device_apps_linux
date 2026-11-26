@@ -21,6 +21,7 @@
 
 #include <gio/gdesktopappinfo.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -114,6 +115,387 @@ static FlValue* legacy_list_apps_value(
     fl_value_append_take(list, legacy_app_value(record));
   }
   return list;
+}
+
+static void set_optional_string(
+    FlValue* map, const char* key,
+    const flutter_device_apps_linux::OptionalString& value) {
+  if (value.has_value()) {
+    fl_value_set_string_take(map, key,
+                             fl_value_new_string(value.value().c_str()));
+  }
+}
+
+static FlValue* string_vector_value(const std::vector<std::string>& items) {
+  FlValue* list = fl_value_new_list();
+  for (const auto& item : items) {
+    fl_value_append_take(list, fl_value_new_string(item.c_str()));
+  }
+  return list;
+}
+
+static const char* installation_source_name(
+    flutter_device_apps_linux::InstallationSource source) {
+  using flutter_device_apps_linux::InstallationSource;
+  switch (source) {
+    case InstallationSource::kFlatpak:
+      return "flatpak";
+    case InstallationSource::kSnap:
+      return "snap";
+    case InstallationSource::kAppImage:
+      return "appImage";
+    case InstallationSource::kDpkg:
+      return "dpkg";
+    case InstallationSource::kRpm:
+      return "rpm";
+    case InstallationSource::kPacman:
+      return "pacman";
+    case InstallationSource::kNix:
+      return "nix";
+    case InstallationSource::kUnknown:
+      return "unknown";
+  }
+  return "unknown";
+}
+
+static const char* installation_scope_name(
+    flutter_device_apps_linux::InstallationScope scope) {
+  using flutter_device_apps_linux::InstallationScope;
+  switch (scope) {
+    case InstallationScope::kSystem:
+      return "system";
+    case InstallationScope::kUser:
+      return "user";
+    case InstallationScope::kOther:
+      return "other";
+    case InstallationScope::kUnknown:
+      return "unknown";
+  }
+  return "unknown";
+}
+
+static const char* capability_state_name(
+    flutter_device_apps_linux::CapabilityState state) {
+  using flutter_device_apps_linux::CapabilityState;
+  switch (state) {
+    case CapabilityState::kSupported:
+      return "supported";
+    case CapabilityState::kUnsupported:
+      return "unsupported";
+    case CapabilityState::kUnknown:
+      return "unknown";
+  }
+  return "unknown";
+}
+
+static const char* menu_visibility_name(
+    flutter_device_apps_linux::DesktopMenuVisibility visibility) {
+  using flutter_device_apps_linux::DesktopMenuVisibility;
+  switch (visibility) {
+    case DesktopMenuVisibility::kVisible:
+      return "visible";
+    case DesktopMenuVisibility::kNotVisible:
+      return "notVisible";
+    case DesktopMenuVisibility::kUnknown:
+      return "unknown";
+  }
+  return "unknown";
+}
+
+static const char* classification_name(
+    flutter_device_apps_linux::ApplicationClassification classification) {
+  using flutter_device_apps_linux::ApplicationClassification;
+  switch (classification) {
+    case ApplicationClassification::kGuiApplication:
+      return "guiApplication";
+    case ApplicationClassification::kCliApplication:
+      return "cliApplication";
+    case ApplicationClassification::kService:
+      return "service";
+    case ApplicationClassification::kLibrary:
+      return "library";
+    case ApplicationClassification::kRuntime:
+      return "runtime";
+    case ApplicationClassification::kUnknown:
+      return "unknown";
+  }
+  return "unknown";
+}
+
+static const char* provider_status_name(
+    flutter_device_apps_linux::ProviderExecutionStatus status) {
+  using flutter_device_apps_linux::ProviderExecutionStatus;
+  switch (status) {
+    case ProviderExecutionStatus::kSucceeded:
+      return "succeeded";
+    case ProviderExecutionStatus::kPartiallyFailed:
+      return "partiallyFailed";
+    case ProviderExecutionStatus::kUnavailable:
+      return "unavailable";
+    case ProviderExecutionStatus::kFailed:
+      return "failed";
+  }
+  return "failed";
+}
+
+static const char* pkg_installation_state_name(
+    flutter_device_apps_linux::PackageInstallationState state) {
+  using flutter_device_apps_linux::PackageInstallationState;
+  switch (state) {
+    case PackageInstallationState::kInstalled:
+      return "installed";
+    case PackageInstallationState::kTriggersAwaited:
+      return "triggersAwaited";
+    case PackageInstallationState::kTriggersPending:
+      return "triggersPending";
+    case PackageInstallationState::kUnknown:
+      return "unknown";
+  }
+  return "unknown";
+}
+
+static const char* pkg_selection_state_name(
+    flutter_device_apps_linux::PackageSelectionState state) {
+  using flutter_device_apps_linux::PackageSelectionState;
+  switch (state) {
+    case PackageSelectionState::kInstall:
+      return "install";
+    case PackageSelectionState::kHold:
+      return "hold";
+    case PackageSelectionState::kDeinstall:
+      return "deinstall";
+    case PackageSelectionState::kPurge:
+      return "purge";
+    case PackageSelectionState::kUnknown:
+      return "unknown";
+  }
+  return "unknown";
+}
+
+static const char* pkg_install_reason_name(
+    flutter_device_apps_linux::PackageInstallReason reason) {
+  using flutter_device_apps_linux::PackageInstallReason;
+  switch (reason) {
+    case PackageInstallReason::kExplicit:
+      return "explicit";
+    case PackageInstallReason::kDependency:
+      return "dependency";
+    case PackageInstallReason::kUnknown:
+      return "unknown";
+  }
+  return "unknown";
+}
+
+static FlValue* provenance_value(
+    const flutter_device_apps_linux::SourceProvenance& prov) {
+  FlValue* map = fl_value_new_map();
+  set_string(map, "providerId", prov.provider_id.c_str());
+  set_string(map, "nativeId", prov.native_id.c_str());
+  set_string(map, "installationSource",
+             installation_source_name(prov.installation_source));
+  set_string(map, "installationScope",
+             installation_scope_name(prov.installation_scope));
+  return map;
+}
+
+static FlValue* capabilities_value(
+    const flutter_device_apps_linux::ApplicationCapabilities& caps) {
+  FlValue* map = fl_value_new_map();
+  set_string(map, "supportsFiles", capability_state_name(caps.supports_files));
+  set_string(map, "supportsUris", capability_state_name(caps.supports_uris));
+  set_string(map, "requiresTerminal",
+             capability_state_name(caps.requires_terminal));
+  set_string(map, "launchable", capability_state_name(caps.launchable));
+  return map;
+}
+
+static FlValue* ambiguity_list_value(
+    const std::vector<flutter_device_apps_linux::ResolutionAmbiguity>& items) {
+  FlValue* list = fl_value_new_list();
+  for (const auto& amb : items) {
+    FlValue* map = fl_value_new_map();
+    set_string(map, "reason", amb.reason.c_str());
+    fl_value_set_string_take(map, "candidateIds",
+                             string_vector_value(amb.candidate_ids));
+    fl_value_append_take(list, map);
+  }
+  return list;
+}
+
+static FlValue* resolved_app_value(
+    const flutter_device_apps_linux::ResolvedApplication& app) {
+  FlValue* map = fl_value_new_map();
+  set_string(map, "resolvedId", app.resolved_id.c_str());
+  fl_value_set_string_take(map, "primaryProvenance",
+                           provenance_value(app.primary_provenance));
+
+  FlValue* provs = fl_value_new_list();
+  for (const auto& prov : app.source_provenances) {
+    fl_value_append_take(provs, provenance_value(prov));
+  }
+  fl_value_set_string_take(map, "sourceProvenances", provs);
+  fl_value_set_string_take(map, "originalRecordIds",
+                           string_vector_value(app.original_record_ids));
+
+  FlValue* desktops = fl_value_new_list();
+  for (const auto& entry : app.desktop_entries) {
+    FlValue* d = fl_value_new_map();
+    set_string(d, "desktopFileId", entry.desktop_file_id.c_str());
+    set_optional_string(d, "desktopFilePath", entry.desktop_file_path);
+    set_optional_string(d, "displayName", entry.display_name);
+    set_string(d, "desktopMenuVisibility",
+               menu_visibility_name(entry.desktop_menu_visibility));
+    fl_value_set_string_take(d, "capabilities",
+                             capabilities_value(entry.capabilities));
+    set_string(d, "providerId", entry.provider_id.c_str());
+    set_string(d, "originalApplicationId",
+               entry.original_application_id.c_str());
+    fl_value_append_take(desktops, d);
+  }
+  fl_value_set_string_take(map, "desktopEntries", desktops);
+  fl_value_set_string_take(
+      map, "linkedPackageIdentityIds",
+      string_vector_value(app.linked_package_identity_ids));
+  fl_value_set_string_take(
+      map, "linkedAppStreamComponentIds",
+      string_vector_value(app.linked_appstream_component_ids));
+
+  FlValue* meta = fl_value_new_map();
+  set_optional_string(meta, "name", app.metadata.name);
+  set_optional_string(meta, "version", app.metadata.version);
+  set_optional_string(meta, "revision", app.metadata.revision);
+  set_optional_string(meta, "channel", app.metadata.channel);
+  set_optional_string(meta, "summary", app.metadata.summary);
+  set_optional_string(meta, "description", app.metadata.description);
+  set_optional_string(meta, "executable", app.metadata.executable);
+  set_optional_string(meta, "homepage", app.metadata.homepage);
+  set_optional_string(meta, "license", app.metadata.license);
+  set_optional_string(meta, "iconReference", app.metadata.icon_reference);
+  set_optional_string(meta, "architecture", app.metadata.architecture);
+  set_optional_string(meta, "branch", app.metadata.branch);
+  fl_value_set_string_take(map, "metadata", meta);
+
+  FlValue* cat_rel = fl_value_new_map();
+  set_optional_string(cat_rel, "latestVersion",
+                      app.catalog_releases.latest_version);
+  set_optional_string(cat_rel, "latestDate", app.catalog_releases.latest_date);
+  FlValue* rels = fl_value_new_list();
+  for (const auto& r : app.catalog_releases.releases) {
+    FlValue* rm = fl_value_new_map();
+    set_optional_string(rm, "version", r.version);
+    set_optional_string(rm, "date", r.date);
+    if (r.has_timestamp) {
+      fl_value_set_string_take(rm, "timestamp", fl_value_new_int(r.timestamp));
+    }
+    set_optional_string(rm, "urgency", r.urgency);
+    fl_value_append_take(rels, rm);
+  }
+  fl_value_set_string_take(cat_rel, "releases", rels);
+  fl_value_set_string_take(map, "catalogReleases", cat_rel);
+
+  fl_value_set_string_take(map, "capabilities",
+                           capabilities_value(app.capabilities));
+  set_string(map, "desktopMenuVisibility",
+             menu_visibility_name(app.desktop_menu_visibility));
+  set_string(map, "classification", classification_name(app.classification));
+
+  FlValue* conflicts = fl_value_new_list();
+  for (const auto& c : app.metadata_conflicts) {
+    FlValue* cm = fl_value_new_map();
+    set_string(cm, "fieldName", c.field_name.c_str());
+    set_string(cm, "chosenProviderId", c.chosen_provider_id.c_str());
+    set_string(cm, "chosenValue", c.chosen_value.c_str());
+    set_string(cm, "conflictingProviderId", c.conflicting_provider_id.c_str());
+    set_string(cm, "conflictingValue", c.conflicting_value.c_str());
+    fl_value_append_take(conflicts, cm);
+  }
+  fl_value_set_string_take(map, "metadataConflicts", conflicts);
+  fl_value_set_string_take(map, "ambiguities",
+                           ambiguity_list_value(app.ambiguities));
+  return map;
+}
+
+static FlValue* installed_package_value(
+    const flutter_device_apps_linux::InstalledPackageRecord& pkg) {
+  FlValue* map = fl_value_new_map();
+  set_string(map, "packageIdentityId", pkg.package_identity_id.c_str());
+  set_optional_string(map, "installationIdentityId",
+                      pkg.installation_identity_id);
+  fl_value_set_string_take(map, "provenance", provenance_value(pkg.provenance));
+  set_string(map, "packageName", pkg.package_name.c_str());
+  set_optional_string(map, "architecture", pkg.architecture);
+  set_optional_string(map, "epoch", pkg.epoch);
+  set_optional_string(map, "version", pkg.version);
+  set_optional_string(map, "release", pkg.release);
+  set_optional_string(map, "summary", pkg.summary);
+  set_optional_string(map, "description", pkg.description);
+  set_optional_string(map, "section", pkg.section);
+  set_optional_string(map, "packageGroup", pkg.package_group);
+  fl_value_set_string_take(map, "groups", string_vector_value(pkg.groups));
+  set_optional_string(map, "priority", pkg.priority);
+  set_optional_string(map, "license", pkg.license);
+  fl_value_set_string_take(map, "licenses", string_vector_value(pkg.licenses));
+  set_optional_string(map, "homepage", pkg.homepage);
+  set_optional_string(map, "maintainer", pkg.maintainer);
+  set_optional_string(map, "packager", pkg.packager);
+  set_optional_string(map, "vendor", pkg.vendor);
+  set_optional_string(map, "profilePath", pkg.profile_path);
+  set_optional_string(map, "attributePath", pkg.attribute_path);
+  set_optional_string(map, "sourceUrl", pkg.source_url);
+  set_optional_string(map, "lockedUrl", pkg.locked_url);
+  fl_value_set_string_take(map, "outputs", string_vector_value(pkg.outputs));
+  fl_value_set_string_take(map, "storePaths",
+                           string_vector_value(pkg.store_paths));
+  if (pkg.install_priority.has_value()) {
+    fl_value_set_string_take(map, "installPriority",
+                             fl_value_new_int(pkg.install_priority.value()));
+  }
+  set_string(map, "installationState",
+             pkg_installation_state_name(pkg.installation_state));
+  set_string(map, "selectionState",
+             pkg_selection_state_name(pkg.selection_state));
+  set_string(map, "installReason",
+             pkg_install_reason_name(pkg.install_reason));
+  set_string(map, "classification", classification_name(pkg.classification));
+  return map;
+}
+
+static FlValue* resolved_discovery_value(
+    const flutter_device_apps_linux::ResolvedDiscoveryInventory& inventory,
+    bool include_packages) {
+  FlValue* root = fl_value_new_map();
+
+  FlValue* apps = fl_value_new_list();
+  for (const auto& app : inventory.applications) {
+    fl_value_append_take(apps, resolved_app_value(app));
+  }
+  fl_value_set_string_take(root, "applications", apps);
+
+  FlValue* pkgs = fl_value_new_list();
+  if (include_packages) {
+    for (const auto& pkg : inventory.packages) {
+      fl_value_append_take(pkgs, installed_package_value(pkg));
+    }
+  }
+  fl_value_set_string_take(root, "packages", pkgs);
+
+  FlValue* diags = fl_value_new_list();
+  for (const auto& summary : inventory.provider_summaries) {
+    FlValue* d = fl_value_new_map();
+    set_string(d, "providerId", summary.provider_id.c_str());
+    set_string(d, "status", provider_status_name(summary.status));
+    fl_value_set_string_take(
+        d, "discoveredCount",
+        fl_value_new_int(static_cast<int64_t>(summary.discovered_count)));
+    if (!summary.error_message.empty()) {
+      set_string(d, "errorMessage", summary.error_message.c_str());
+    }
+    fl_value_append_take(diags, d);
+  }
+  fl_value_set_string_take(root, "providerDiagnostics", diags);
+  fl_value_set_string_take(root, "ambiguities",
+                           ambiguity_list_value(inventory.ambiguities));
+  return root;
 }
 
 static FlValue* search_apps(const char* query) {
@@ -461,6 +843,122 @@ static void handle_method_call(FlMethodChannel*, FlMethodCall* call,
         },
         flutter_device_apps_linux::DiscoveryRequestOptions::only_providers(
             {"gio"}));
+    return;
+  }
+
+  if (g_str_equal(method, "discoverApps")) {
+    bool include_packages = false;
+    bool include_appstream = true;
+    flutter_device_apps_linux::DiscoveryRequestOptions options =
+        flutter_device_apps_linux::DiscoveryRequestOptions::all_providers();
+
+    FlValue* args = fl_method_call_get_args(call);
+    if (args != nullptr && fl_value_get_type(args) != FL_VALUE_TYPE_NULL) {
+      if (fl_value_get_type(args) != FL_VALUE_TYPE_MAP) {
+        fl_method_call_respond_error(call, "ARG", "Expected a discovery options map",
+                                     nullptr, nullptr);
+        return;
+      }
+      FlValue* inc_pkg = fl_value_lookup_string(args, "includePackages");
+      if (inc_pkg != nullptr &&
+          fl_value_get_type(inc_pkg) != FL_VALUE_TYPE_NULL) {
+        if (fl_value_get_type(inc_pkg) != FL_VALUE_TYPE_BOOL) {
+          fl_method_call_respond_error(call, "ARG",
+                                       "includePackages must be a boolean",
+                                       nullptr, nullptr);
+          return;
+        }
+        include_packages = fl_value_get_bool(inc_pkg) != FALSE;
+      }
+      FlValue* inc_as = fl_value_lookup_string(args, "includeAppStreamMetadata");
+      if (inc_as != nullptr &&
+          fl_value_get_type(inc_as) != FL_VALUE_TYPE_NULL) {
+        if (fl_value_get_type(inc_as) != FL_VALUE_TYPE_BOOL) {
+          fl_method_call_respond_error(
+              call, "ARG", "includeAppStreamMetadata must be a boolean",
+              nullptr, nullptr);
+          return;
+        }
+        include_appstream = fl_value_get_bool(inc_as) != FALSE;
+      }
+      FlValue* providers_val = fl_value_lookup_string(args, "providers");
+      if (providers_val != nullptr &&
+          fl_value_get_type(providers_val) != FL_VALUE_TYPE_NULL) {
+        if (fl_value_get_type(providers_val) != FL_VALUE_TYPE_LIST) {
+          fl_method_call_respond_error(call, "ARG",
+                                       "providers must be a list of strings",
+                                       nullptr, nullptr);
+          return;
+        }
+        const size_t len = fl_value_get_length(providers_val);
+        if (len == 0) {
+          fl_method_call_respond_error(
+              call, "ARG", "providers must not be empty when specified",
+              nullptr, nullptr);
+          return;
+        }
+        for (size_t i = 0; i < len; ++i) {
+          FlValue* item = fl_value_get_list_value(providers_val, i);
+          if (item == nullptr ||
+              fl_value_get_type(item) != FL_VALUE_TYPE_STRING) {
+            fl_method_call_respond_error(
+                call, "ARG", "providers entries must be non-empty strings",
+                nullptr, nullptr);
+            return;
+          }
+          const char* pid = fl_value_get_string(item);
+          if (pid == nullptr || *pid == '\0') {
+            fl_method_call_respond_error(
+                call, "ARG", "providers entries must be non-empty strings",
+                nullptr, nullptr);
+            return;
+          }
+          options.provider_ids.emplace_back(pid);
+        }
+      }
+    }
+
+    auto* context = static_cast<DiscoveryPluginContext*>(user_data);
+    if (context == nullptr || context->runner == nullptr ||
+        context->pending_calls == nullptr) {
+      flutter_device_apps_linux::ResolvedDiscoveryInventory empty_inv;
+      g_autoptr(FlValue) response =
+          resolved_discovery_value(empty_inv, include_packages);
+      fl_method_call_respond_success(call, response, nullptr);
+      return;
+    }
+
+    const uint64_t call_id = context->pending_calls->add(call);
+    std::weak_ptr<PendingMethodCalls> weak_calls(context->pending_calls);
+
+    context->runner->discover_resolved_async(
+        [call_id, weak_calls, include_packages](
+            flutter_device_apps_linux::ResolvedDiscoveryExecutionOutcome
+                outcome) {
+          auto pending_calls = weak_calls.lock();
+          if (pending_calls == nullptr) return;
+
+          ScopedMethodCall method_call(pending_calls->take(call_id));
+          if (method_call.call == nullptr) return;
+          if (outcome.status ==
+              flutter_device_apps_linux::DiscoveryExecutionStatus::kCancelled) {
+            return;
+          }
+          if (outcome.status ==
+              flutter_device_apps_linux::DiscoveryExecutionStatus::
+                  kExecutionError) {
+            fl_method_call_respond_error(
+                method_call.call, "ERR_DISCOVERY",
+                outcome.error_message.empty() ? "Application discovery failed"
+                                              : outcome.error_message.c_str(),
+                nullptr, nullptr);
+            return;
+          }
+          g_autoptr(FlValue) response =
+              resolved_discovery_value(outcome.inventory, include_packages);
+          fl_method_call_respond_success(method_call.call, response, nullptr);
+        },
+        std::move(options), include_appstream);
     return;
   }
 

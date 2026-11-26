@@ -187,7 +187,7 @@ int run_fixture(const char* populated_root) {
   expect(parsed_tuples == expected_tuples,
          "RpmDiscoveryProvider output must match rpm -qa reference output");
 
-  // --- Runtime file ownership via librpm basename index + rpmfi ---
+  // --- Runtime file ownership via librpm RPMDBI_BASENAMES + rpmfi ---
   {
     auto own_backend = create_librpm_backend(cfg);
     const auto own = own_backend->find_file_owners(
@@ -195,6 +195,10 @@ int run_fixture(const char* populated_root) {
          "/usr/share/applications/not-owned.desktop",
          "/other/dir/example-tool.desktop"});
     expect(own.ok, "librpm file ownership query must succeed");
+    if (own.owners.size() != 1) {
+      std::cerr << "  diag: expected 1 owner for example-tool.desktop, got "
+                << own.owners.size() << " (err=" << own.error_message << ")\n";
+    }
     expect(own.owners.size() == 1 &&
                own.owners[0].path ==
                    "/usr/share/applications/example-tool.desktop" &&
@@ -203,6 +207,26 @@ int run_fixture(const char* populated_root) {
                own.owners[0].package.version.value() == "3.1.4",
            "rpmfi full-path verification must own only the exact path (same "
            "basename in another directory must not match)");
+
+    // Verify parallel RPM versions owning the same file path are BOTH
+    // preserved with distinct version/release metadata, while a different
+    // directory with the same basename yields 0 owners.
+    const auto parallel_own = own_backend->find_file_owners(
+        {"/usr/share/example-multi/shared.txt",
+         "/other/dir/shared.txt"});
+    expect(parallel_own.ok, "parallel RPM ownership query must succeed");
+    std::set<std::string> multi_versions;
+    for (const auto& o : parallel_own.owners) {
+      if (o.path == "/usr/share/example-multi/shared.txt" &&
+          o.package.name == "example-multi" && o.package.version.has_value()) {
+        multi_versions.insert(o.package.version.value());
+      }
+    }
+    expect(parallel_own.owners.size() == 2 &&
+               multi_versions.count("1.0.0") == 1 &&
+               multi_versions.count("2.0.0") == 1,
+           "parallel RPM versions owning a shared path must both be reported "
+           "without matching another directory");
 
     const std::string list_cmd =
         std::string("rpm --root '") + populated_root + "' -ql example-tool";

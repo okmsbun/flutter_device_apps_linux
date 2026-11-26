@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -37,7 +38,6 @@ struct LibRpmSymbols {
   // Optional file-ownership symbols (rpmfi API).
   void* (*fi_new)(const void*, void*, int, unsigned int) = nullptr;
   void* (*fi_free)(void*) = nullptr;
-  void* (*fi_init)(void*, int) = nullptr;
   int (*fi_next)(void*) = nullptr;
   const char* (*fi_fn)(void*) = nullptr;
 };
@@ -248,8 +248,8 @@ class LibRpmBackend final : public RpmBackend {
       return result;
     }
     if (symbols_.fi_new == nullptr || symbols_.fi_free == nullptr ||
-        symbols_.fi_init == nullptr || symbols_.fi_next == nullptr ||
-        symbols_.fi_fn == nullptr || tags_.basenames == kRpmTagNotFound) {
+        symbols_.fi_next == nullptr || symbols_.fi_fn == nullptr ||
+        tags_.basenames == kRpmTagNotFound) {
       result.ok = false;
       result.error_kind = RpmQueryErrorKind::kUnsupportedAbi;
       result.error_message = "librpm rpmfi file ownership API is unavailable";
@@ -300,24 +300,31 @@ class LibRpmBackend final : public RpmBackend {
     }
     db_open = true;
 
-    for (const auto& target : absolute_paths) {
-      const size_t slash = target.rfind('/');
-      if (slash == std::string::npos || slash + 1 >= target.size()) continue;
-      const std::string basename = target.substr(slash + 1);
+    // Normalize optional root_dir prefix so host-prefixed paths resolve cleanly
+    // against root-relative paths stored inside RPM headers.
+    std::string normalized_root = config_.root_dir;
+    while (normalized_root.size() > 1 && normalized_root.back() == '/') {
+      normalized_root.pop_back();
+    }
 
-      // RPMDBI_BASENAMES == RPMTAG_BASENAMES; the index keys on basenames only,
-      // so every candidate is verified against the exact full path via rpmfi.
-      void* mi = symbols_.ts_init_iterator(ts, tags_.basenames,
-                                           basename.c_str(), 0);
-      if (mi == nullptr) continue;
+    auto collect_matches = [&](const std::string& target,
+                               const std::string& query_path,
+                               const char* lookup_key,
+                               std::unordered_set<std::string>* seen_keys) {
+      size_t added = 0;
+      void* mi =
+          symbols_.ts_init_iterator(ts, tags_.basenames, lookup_key, 0);
+      if (mi == nullptr) return added;
       while (void* header = symbols_.db_next_iterator(mi)) {
-        void* fi = symbols_.fi_new(ts, header, tags_.basenames, 0);
+        // Pass ts == nullptr so rpmfiNew() reads header-relative paths directly
+        // without transaction relocation; rpmfiNew() initializes the cursor to
+        // -1 so the first rpmfiNext() visits index 0.
+        void* fi = symbols_.fi_new(nullptr, header, tags_.basenames, 0);
         if (fi == nullptr) continue;
         bool matched = false;
-        symbols_.fi_init(fi, 0);
         while (symbols_.fi_next(fi) >= 0) {
           const char* fn = symbols_.fi_fn(fi);
-          if (fn != nullptr && target == fn) {
+          if (fn != nullptr && query_path == fn) {
             matched = true;
             break;
           }
@@ -341,9 +348,47 @@ class LibRpmBackend final : public RpmBackend {
             read_optional_string(symbols_, header, tags_.release);
         owner.package.architecture =
             read_optional_string(symbols_, header, tags_.arch);
-        result.owners.push_back(std::move(owner));
+
+        const std::string dedup_key =
+            target + "\n" +
+            build_rpm_installation_identity_id(
+                owner.package.name, owner.package.architecture,
+                owner.package.epoch, owner.package.version,
+                owner.package.release);
+        if (seen_keys->insert(dedup_key).second) {
+          result.owners.push_back(std::move(owner));
+          ++added;
+        }
       }
       symbols_.db_free_iterator(mi);
+      return added;
+    };
+
+    std::unordered_set<std::string> seen_owner_keys;
+    for (const auto& target : absolute_paths) {
+      if (target.empty() || target[0] != '/') continue;
+      std::string query_path = target;
+      if (!normalized_root.empty() && normalized_root != "/" &&
+          target.size() > normalized_root.size() &&
+          target.compare(0, normalized_root.size(), normalized_root) == 0 &&
+          target[normalized_root.size()] == '/') {
+        query_path = target.substr(normalized_root.size());
+      }
+      const size_t slash = query_path.rfind('/');
+      if (slash == std::string::npos || slash + 1 >= query_path.size()) {
+        continue;
+      }
+
+      // In upstream librpm (lib/rpmdb.c), RPMDBI_BASENAMES routes through
+      // rpmdbFindByFile() and expects the full absolute path (same API used by
+      // `rpm -qf` and Python `ts.dbMatch('basenames', path)`). Fall back to
+      // bare basename lookup only if full-path lookup yields no matches; every
+      // candidate header is still strictly verified via rpmfiFN() == query_path.
+      if (collect_matches(target, query_path, query_path.c_str(),
+                          &seen_owner_keys) == 0) {
+        const std::string basename = query_path.substr(slash + 1);
+        collect_matches(target, query_path, basename.c_str(), &seen_owner_keys);
+      }
     }
 
     cleanup();
@@ -419,7 +464,6 @@ class LibRpmBackend final : public RpmBackend {
 
     load_symbol(module, "rpmfiNew", &syms.fi_new);
     load_symbol(module, "rpmfiFree", &syms.fi_free);
-    load_symbol(module, "rpmfiInit", &syms.fi_init);
     load_symbol(module, "rpmfiNext", &syms.fi_next);
     load_symbol(module, "rpmfiFN", &syms.fi_fn);
     load_symbol(module, "rpmtsCloseDB", &syms.ts_close_db);

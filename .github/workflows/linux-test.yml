@@ -457,7 +457,12 @@ jobs:
           %description
           Offline fixture package version 1.
 
+          %install
+          mkdir -p %{buildroot}/usr/share/example-multi
+          printf 'shared\n' > %{buildroot}/usr/share/example-multi/shared.txt
+
           %files
+          /usr/share/example-multi/shared.txt
           EOF
 
           cat > "$rpm_work/rpmbuild/SPECS/example-multi-2.spec" <<'EOF'
@@ -475,7 +480,12 @@ jobs:
           %description
           Offline fixture package version 2.
 
+          %install
+          mkdir -p %{buildroot}/usr/share/example-multi
+          printf 'shared\n' > %{buildroot}/usr/share/example-multi/shared.txt
+
           %files
+          /usr/share/example-multi/shared.txt
           EOF
 
           cat > "$rpm_work/rpmbuild/SPECS/example-tool.spec" <<'EOF'
@@ -505,11 +515,11 @@ jobs:
           # so use sudo strictly for isolated fixture DB population and make
           # the fixture world-readable before running the unprivileged test.
           sudo rpm --root "$rpm_work/fixture_root" --initdb
-          sudo rpm --root "$rpm_work/fixture_root" -ivh --justdb --nodeps --noscripts --notriggers --ignorearch \
+          sudo rpm --root "$rpm_work/fixture_root" -ivh --justdb --replacefiles --nodeps --noscripts --notriggers --ignorearch \
             "$rpm_work/rpmbuild/RPMS/noarch/example-multi-1.0.0-1.noarch.rpm"
-          sudo rpm --root "$rpm_work/fixture_root" -ivh --justdb --nodeps --noscripts --notriggers --ignorearch \
+          sudo rpm --root "$rpm_work/fixture_root" -ivh --justdb --replacefiles --nodeps --noscripts --notriggers --ignorearch \
             "$rpm_work/rpmbuild/RPMS/noarch/example-multi-2.0.0-2.noarch.rpm"
-          sudo rpm --root "$rpm_work/fixture_root" -ivh --justdb --nodeps --noscripts --notriggers --ignorearch \
+          sudo rpm --root "$rpm_work/fixture_root" -ivh --justdb --replacefiles --nodeps --noscripts --notriggers --ignorearch \
             "$rpm_work/rpmbuild/RPMS/noarch/example-tool-3.1.4-1.noarch.rpm"
           sudo chmod -R a+rX "$rpm_work/fixture_root"
 

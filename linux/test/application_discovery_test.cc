@@ -4973,6 +4973,279 @@ void test_resolution_step92_integrity_cross_provider_parallel_rpm_and_scoped_ded
   }
 }
 
+void test_async_resolved_discovery_lifecycle_serialization_and_legacy_isolation() {
+  using flutter_device_apps_linux::ResolvedDiscoveryExecutionOutcome;
+
+  // 1. Completion on platform thread, optional AppStream flag, and isolation of
+  // legacy GIO-only discover_async alongside discover_resolved_async.
+  {
+    std::atomic<int> gio_calls{0};
+    std::atomic<int> pkg_calls{0};
+    std::atomic<int> as_calls{0};
+
+    auto service = std::make_shared<ApplicationDiscoveryService>();
+    service->register_provider(std::make_unique<ControlledDiscoveryProvider>(
+        "gio", [&]() {
+          gio_calls.fetch_add(1);
+          DiscoveryResult res;
+          DiscoveredApplication app = make_gio_app(
+              "org.example.AsyncApp.desktop", "Async App", true, false, false);
+          app.desktop_file_path =
+              OptionalString::of("/usr/share/applications/org.example.AsyncApp.desktop");
+          res.applications.push_back(std::move(app));
+          return res;
+        }));
+    service->register_package_provider(
+        std::make_unique<FakePackageDiscoveryProvider>(
+            "dpkg", true, [&]() {
+              pkg_calls.fetch_add(1);
+              PackageDiscoveryResult res;
+              res.packages.push_back(make_owned_pkg(
+                  "dpkg", InstallationSource::kDpkg, "async-app", "amd64",
+                  "1.2.3-1"));
+              return res;
+            }));
+
+    AppStreamBackendResult as_backend_res;
+    AppStreamMetadataRecord as_rec;
+    as_rec.component_id = "org.example.AsyncApp";
+    as_rec.component_kind = "desktop-application";
+    as_rec.desktop_launchable_ids = {"org.example.AsyncApp.desktop"};
+    as_rec.summary = OptionalString::of("Async App Summary");
+    as_rec.provenance.origin_kind = AppStreamMetadataOriginKind::kMetaInfo;
+    as_backend_res.records.push_back(as_rec);
+    service->set_metadata_provider(std::make_unique<AppStreamMetadataProvider>(
+        std::make_unique<FakeAppStreamBackend>(
+            true, [&]() {
+              as_calls.fetch_add(1);
+              return as_backend_res;
+            })));
+
+    TestPlatformLoop loop;
+    WorkerPoolFixture pool;
+    const std::thread::id platform_thread = std::this_thread::get_id();
+    AsyncDiscoveryRunner runner(
+        service, pool.scheduler(),
+        [&loop](std::function<void()> cb) { loop.post(std::move(cb)); });
+
+    // Legacy GIO-only pass must never invoke package or AppStream providers.
+    DiscoveryExecutionOutcome legacy_out;
+    runner.discover_async(
+        [&](DiscoveryExecutionOutcome outcome) {
+          expect(std::this_thread::get_id() == platform_thread,
+                 "legacy completion must run on platform thread");
+          legacy_out = std::move(outcome);
+        },
+        DiscoveryRequestOptions::only_providers({"gio"}));
+    loop.run_one();
+    expect(legacy_out.status == DiscoveryExecutionStatus::kCompleted,
+           "legacy discover_async must succeed");
+    expect(gio_calls.load() == 1 && pkg_calls.load() == 0 &&
+               as_calls.load() == 0,
+           "legacy GIO-only discover_async must not run package or AppStream "
+           "providers");
+
+    // Resolved pass with AppStream enabled.
+    ResolvedDiscoveryExecutionOutcome resolved_with_as;
+    runner.discover_resolved_async(
+        [&](ResolvedDiscoveryExecutionOutcome outcome) {
+          expect(std::this_thread::get_id() == platform_thread,
+                 "resolved completion must run on platform thread");
+          resolved_with_as = std::move(outcome);
+        },
+        DiscoveryRequestOptions::all_providers(), true);
+    loop.run_one();
+    expect(resolved_with_as.status == DiscoveryExecutionStatus::kCompleted,
+           "discover_resolved_async should complete");
+    expect(resolved_with_as.inventory.applications.size() == 1,
+           "discover_resolved_async should return resolved application");
+    expect(resolved_with_as.inventory.packages.size() == 1,
+           "discover_resolved_async should preserve raw package inventory");
+    if (!resolved_with_as.inventory.applications.empty()) {
+      expect(resolved_with_as.inventory.applications[0].classification ==
+                 ApplicationClassification::kGuiApplication,
+             "AppStream enrichment should classify desktop-application as GUI");
+      expect(resolved_with_as.inventory.applications[0]
+                     .metadata.summary.has_value() &&
+                 resolved_with_as.inventory.applications[0]
+                         .metadata.summary.value() == "Async App Summary",
+             "AppStream summary should enrich resolved application");
+    }
+    expect(pkg_calls.load() == 1 && as_calls.load() == 1,
+           "discover_resolved_async should run package and AppStream providers");
+
+    // Resolved pass with AppStream disabled.
+    ResolvedDiscoveryExecutionOutcome resolved_no_as;
+    runner.discover_resolved_async(
+        [&](ResolvedDiscoveryExecutionOutcome outcome) {
+          resolved_no_as = std::move(outcome);
+        },
+        DiscoveryRequestOptions::all_providers(), false);
+    loop.run_one();
+    expect(resolved_no_as.status == DiscoveryExecutionStatus::kCompleted,
+           "discover_resolved_async without AppStream should complete");
+    expect(as_calls.load() == 1,
+           "include_appstream_metadata=false must not query AppStream");
+    if (!resolved_no_as.inventory.applications.empty()) {
+      expect(resolved_no_as.inventory.applications[0].classification ==
+                 ApplicationClassification::kUnknown,
+             "without AppStream, GIO-only app classification must remain "
+             "unknown");
+    }
+
+    pool.join_all();
+  }
+
+  // 2. Overlapping serialization (interleaved legacy + resolved), cancellation,
+  // worker exception, and non-blocking teardown.
+  {
+    Latch started(1);
+    Latch release(1);
+    std::atomic<int> in_flight{0};
+    std::atomic<int> max_in_flight{0};
+    std::atomic<int> calls{0};
+
+    auto service = std::make_shared<ApplicationDiscoveryService>();
+    service->register_provider(std::make_unique<ControlledDiscoveryProvider>(
+        "gio", [&]() {
+          const int cur = in_flight.fetch_add(1) + 1;
+          int prev = max_in_flight.load();
+          while (cur > prev &&
+                 !max_in_flight.compare_exchange_weak(prev, cur)) {
+          }
+          const int n = calls.fetch_add(1) + 1;
+          if (n == 1) {
+            started.count_down();
+            release.wait();
+          }
+          DiscoveryResult res;
+          res.applications.push_back(make_gio_app(
+              ("org.example.Seq" + std::to_string(n) + ".desktop").c_str(),
+              "Seq", false, false, false));
+          in_flight.fetch_sub(1);
+          return res;
+        }));
+
+    TestPlatformLoop loop;
+    WorkerPoolFixture pool;
+    AsyncDiscoveryRunner runner(
+        service, pool.scheduler(),
+        [&loop](std::function<void()> cb) { loop.post(std::move(cb)); });
+
+    std::vector<int> order;
+    DiscoveryExecutionStatus cancel_status = DiscoveryExecutionStatus::kCompleted;
+    runner.discover_resolved_async([&](ResolvedDiscoveryExecutionOutcome out) {
+      expect(out.status == DiscoveryExecutionStatus::kCompleted,
+             "first resolved request should complete");
+      order.push_back(1);
+    });
+    started.wait();
+
+    DiscoveryRequestHandle cancelled = runner.discover_resolved_async(
+        [&](ResolvedDiscoveryExecutionOutcome out) {
+          cancel_status = out.status;
+          order.push_back(2);
+        });
+    runner.discover_async(
+        [&](DiscoveryExecutionOutcome out) {
+          expect(out.status == DiscoveryExecutionStatus::kCompleted,
+                 "interleaved legacy request should complete");
+          order.push_back(3);
+        },
+        DiscoveryRequestOptions::only_providers({"gio"}));
+
+    cancelled.cancel();
+    expect(pool.scheduled_workers() == 1,
+           "interleaved resolved and legacy requests must share one worker");
+
+    release.count_down();
+    loop.run_until(3);
+    pool.join_all();
+
+    expect(max_in_flight.load() == 1,
+           "interleaved requests must never access providers concurrently");
+    expect(calls.load() == 2,
+           "cancelled queued resolved request must not execute provider");
+    expect(cancel_status == DiscoveryExecutionStatus::kCancelled,
+           "cancelled queued resolved request must report kCancelled");
+    expect(order.size() == 3 && order[0] == 1 && order[1] == 2 &&
+               order[2] == 3,
+           "interleaved resolved and legacy requests must complete FIFO");
+  }
+
+  // 3. Worker exception -> kExecutionError on discover_resolved_async.
+  {
+    auto service = std::make_shared<ApplicationDiscoveryService>();
+    service->register_provider(std::make_unique<ControlledDiscoveryProvider>(
+        "throwing",
+        []() -> DiscoveryResult { throw std::runtime_error("resolved boom"); }));
+
+    TestPlatformLoop loop;
+    WorkerPoolFixture pool;
+    AsyncDiscoveryRunner runner(
+        service, pool.scheduler(),
+        [&loop](std::function<void()> cb) { loop.post(std::move(cb)); });
+
+    ResolvedDiscoveryExecutionOutcome received;
+    runner.discover_resolved_async([&](ResolvedDiscoveryExecutionOutcome out) {
+      received = std::move(out);
+    });
+    loop.run_one();
+    pool.join_all();
+
+    expect(received.status == DiscoveryExecutionStatus::kExecutionError,
+           "worker exception in discover_resolved_async must report "
+           "kExecutionError");
+    expect(!received.error_message.empty(),
+           "kExecutionError in discover_resolved_async must carry error");
+  }
+
+  // 4. Non-blocking teardown while discover_resolved_async is in-flight/queued.
+  {
+    Latch slow_started(1);
+    Latch release_slow(1);
+    DiscoveryExecutionStatus queued_status =
+        DiscoveryExecutionStatus::kCompleted;
+    std::atomic<int> inflight_callbacks{0};
+
+    TestPlatformLoop loop;
+    WorkerPoolFixture pool;
+    {
+      auto service = std::make_shared<ApplicationDiscoveryService>();
+      service->register_provider(std::make_unique<ControlledDiscoveryProvider>(
+          "gio", [&]() {
+            slow_started.count_down();
+            release_slow.wait();
+            return DiscoveryResult{};
+          }));
+
+      auto runner = std::make_unique<AsyncDiscoveryRunner>(
+          service, pool.scheduler(),
+          [&loop](std::function<void()> cb) { loop.post(std::move(cb)); });
+      service.reset();
+
+      runner->discover_resolved_async([&](ResolvedDiscoveryExecutionOutcome) {
+        inflight_callbacks.fetch_add(1);
+      });
+      slow_started.wait();
+
+      runner->discover_resolved_async([&](ResolvedDiscoveryExecutionOutcome out) {
+        queued_status = out.status;
+      });
+
+      runner.reset();
+      expect(queued_status == DiscoveryExecutionStatus::kCancelled,
+             "queued resolved request must cancel immediately on teardown");
+    }
+
+    release_slow.count_down();
+    pool.join_all();
+    loop.drain();
+    expect(inflight_callbacks.load() == 0,
+           "in-flight resolved request must not invoke callback after teardown");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -5021,6 +5294,7 @@ int main() {
   test_ownership_resolution_parallel_versions_diversions_and_hints();
   test_ownership_service_single_pass_failure_isolation_and_legacy();
   test_resolution_step92_integrity_cross_provider_parallel_rpm_and_scoped_dedup();
+  test_async_resolved_discovery_lifecycle_serialization_and_legacy_isolation();
 
   if (g_failures > 0) {
     std::cerr << g_failures << " test assertion(s) failed.\n";

@@ -28,6 +28,13 @@ struct DiscoveryExecutionOutcome {
   std::string error_message;
 };
 
+// Owning outcome for unified resolved discovery across all selected providers.
+struct ResolvedDiscoveryExecutionOutcome {
+  DiscoveryExecutionStatus status = DiscoveryExecutionStatus::kCompleted;
+  ResolvedDiscoveryInventory inventory;
+  std::string error_message;
+};
+
 // Lightweight handle allowing best-effort cancellation of a submitted request.
 // Cancellation never invalidates data currently accessed by an active worker.
 class DiscoveryRequestHandle {
@@ -57,6 +64,8 @@ class DiscoveryRequestHandle {
 class AsyncDiscoveryRunner {
  public:
   using CompletionCallback = std::function<void(DiscoveryExecutionOutcome)>;
+  using ResolvedCompletionCallback =
+      std::function<void(ResolvedDiscoveryExecutionOutcome)>;
   using WorkScheduler = std::function<void(std::function<void()>)>;
   using CompletionDispatcher = std::function<void(std::function<void()>)>;
 
@@ -77,6 +86,15 @@ class AsyncDiscoveryRunner {
       CompletionCallback on_complete,
       DiscoveryRequestOptions options =
           DiscoveryRequestOptions::all_providers());
+
+  // Enqueues an asynchronous resolved discovery request backed by
+  // ApplicationDiscoveryService::discover_resolved() on the same serialized
+  // FIFO worker queue and safe teardown lifecycle as discover_async().
+  DiscoveryRequestHandle discover_resolved_async(
+      ResolvedCompletionCallback on_complete,
+      DiscoveryRequestOptions options =
+          DiscoveryRequestOptions::all_providers(),
+      bool include_appstream_metadata = true);
 
   // Initiates non-blocking teardown. Queued requests that have not started are
   // immediately cancelled on the caller's thread; any currently running worker
