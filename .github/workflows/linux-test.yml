@@ -88,6 +88,7 @@ jobs:
             linux/discovery/application_discovery_service.cc \
             linux/discovery/appstream_metadata_provider.cc \
             linux/discovery/async_discovery_runner.cc \
+            linux/discovery/discovery_resolution.cc \
             linux/discovery/dpkg_discovery_provider.cc \
             linux/discovery/flatpak_discovery_provider.cc \
             linux/discovery/json_parser.cc \
@@ -108,6 +109,7 @@ jobs:
             linux/discovery/application_discovery_service.cc \
             linux/discovery/appstream_metadata_provider.cc \
             linux/discovery/async_discovery_runner.cc \
+            linux/discovery/discovery_resolution.cc \
             linux/discovery/dpkg_discovery_provider.cc \
             linux/discovery/flatpak_discovery_provider.cc \
             linux/discovery/json_parser.cc \
@@ -309,8 +311,10 @@ jobs:
           clang++ -std=c++14 -Wall -Wextra -Wpedantic -Werror \
             -Ilinux \
             $(pkg-config --cflags gio-unix-2.0 gmodule-2.0) \
+            linux/discovery/application_identity.cc \
             linux/discovery/application_discovery_service.cc \
             linux/discovery/appstream_metadata_provider.cc \
+            linux/discovery/discovery_resolution.cc \
             linux/discovery/libappstream_backend.cc \
             linux/test/appstream_metadata_provider_test.cc \
             $(pkg-config --libs gio-unix-2.0 gmodule-2.0) \

@@ -163,4 +163,44 @@ AppStreamMetadataResult ApplicationDiscoveryService::load_appstream_metadata() {
   return metadata_provider_->load_metadata();
 }
 
+ResolvedDiscoveryInventory ApplicationDiscoveryService::discover_resolved(
+    const DiscoveryRequestOptions& options, bool include_appstream_metadata,
+    const PackageOwnershipLookup* ownership_lookup) {
+  DiscoveryPassResult pass_result = discover_with_report(options);
+
+  std::vector<AppStreamMetadataRecord> appstream_records;
+  const bool appstream_selected =
+      include_appstream_metadata &&
+      (options.provider_ids.empty() ||
+       is_provider_selected(options, "appstream"));
+
+  if (appstream_selected) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (metadata_provider_ != nullptr) {
+      ProviderExecutionSummary as_summary;
+      as_summary.provider_id = "appstream";
+      if (!metadata_provider_->is_available()) {
+        as_summary.status = ProviderExecutionStatus::kUnavailable;
+      } else {
+        AppStreamMetadataResult as_result = metadata_provider_->load_metadata();
+        if (!as_result.ok) {
+          as_summary.status = ProviderExecutionStatus::kFailed;
+          as_summary.error_message = std::move(as_result.error_message);
+        } else {
+          as_summary.status = as_result.error_message.empty()
+                                  ? ProviderExecutionStatus::kSucceeded
+                                  : ProviderExecutionStatus::kPartiallyFailed;
+          as_summary.discovered_count = as_result.records.size();
+          as_summary.error_message = std::move(as_result.error_message);
+          appstream_records = std::move(as_result.records);
+        }
+      }
+      pass_result.provider_summaries.push_back(std::move(as_summary));
+    }
+  }
+
+  return resolve_discovery_inventory(pass_result, appstream_records,
+                                     ownership_lookup);
+}
+
 }  // namespace flutter_device_apps_linux

@@ -10,6 +10,7 @@
 
 #include "application_discovery_provider.h"
 #include "appstream_metadata_provider.h"
+#include "discovery_resolution.h"
 #include "package_discovery_provider.h"
 
 namespace flutter_device_apps_linux {
@@ -121,6 +122,16 @@ class ApplicationDiscoveryService {
   // Loads local AppStream metadata candidates independently of installed
   // application discovery.
   AppStreamMetadataResult load_appstream_metadata();
+
+  // Executes selected providers, optionally loads AppStream metadata, and
+  // runs indexed identity resolution, deduplication, enrichment, and
+  // classification without altering raw discover_with_report() or legacy
+  // GIO-only listApps() behavior.
+  ResolvedDiscoveryInventory discover_resolved(
+      const DiscoveryRequestOptions& options =
+          DiscoveryRequestOptions::all_providers(),
+      bool include_appstream_metadata = true,
+      const PackageOwnershipLookup* ownership_lookup = nullptr);
 
  private:
   mutable std::mutex mutex_;

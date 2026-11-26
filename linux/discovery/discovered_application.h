@@ -156,6 +156,9 @@ struct DiscoveredApplication {
   // "org.example.Editor.desktop"). Unset when no desktop entry exists.
   OptionalString desktop_file_id;
 
+  // Optional absolute path to the .desktop file when discovered via GIO.
+  OptionalString desktop_file_path;
+
   // Optional package identifier (for example, Flatpak app ID or DPKG package).
   OptionalString package_id;
 

@@ -27,6 +27,7 @@
 #include "discovery/appstream_metadata_provider.h"
 #include "discovery/async_discovery_runner.h"
 #include "discovery/discovered_application.h"
+#include "discovery/discovery_resolution.h"
 #include "discovery/dpkg_discovery_provider.h"
 #include "discovery/flatpak_discovery_provider.h"
 #include "discovery/installed_package.h"
@@ -57,6 +58,7 @@ using flutter_device_apps_linux::AsyncDiscoveryRunner;
 using flutter_device_apps_linux::build_application_id;
 using flutter_device_apps_linux::capability_from_bool;
 using flutter_device_apps_linux::CapabilityState;
+using flutter_device_apps_linux::classify_appstream_component_kind;
 using flutter_device_apps_linux::create_snapd_socket_backend;
 using flutter_device_apps_linux::DesktopMenuVisibility;
 using flutter_device_apps_linux::DiscoveredApplication;
@@ -79,6 +81,7 @@ using flutter_device_apps_linux::InstalledPackageRecord;
 using flutter_device_apps_linux::is_valid_legacy_desktop_file_id;
 using flutter_device_apps_linux::kFlatpakRefKindApp;
 using flutter_device_apps_linux::kFlatpakRefKindRuntime;
+using flutter_device_apps_linux::MetadataConflict;
 using flutter_device_apps_linux::NixDiscoveryConfig;
 using flutter_device_apps_linux::NixDiscoveryProvider;
 using flutter_device_apps_linux::NixProfileSpec;
@@ -87,6 +90,8 @@ using flutter_device_apps_linux::PackageDiscoveryProvider;
 using flutter_device_apps_linux::PackageDiscoveryResult;
 using flutter_device_apps_linux::PackageInstallationState;
 using flutter_device_apps_linux::PackageInstallReason;
+using flutter_device_apps_linux::PackageOwnershipEvidence;
+using flutter_device_apps_linux::PackageOwnershipLookup;
 using flutter_device_apps_linux::PackageSelectionState;
 using flutter_device_apps_linux::PacmanBackend;
 using flutter_device_apps_linux::PacmanBackendQueryResult;
@@ -95,7 +100,10 @@ using flutter_device_apps_linux::PacmanInstalledPackageRecord;
 using flutter_device_apps_linux::PacmanQueryErrorKind;
 using flutter_device_apps_linux::PacmanResolvedPaths;
 using flutter_device_apps_linux::ProviderExecutionStatus;
+using flutter_device_apps_linux::resolve_discovery_inventory;
 using flutter_device_apps_linux::resolve_pacman_db_paths;
+using flutter_device_apps_linux::ResolvedApplication;
+using flutter_device_apps_linux::ResolvedDiscoveryInventory;
 using flutter_device_apps_linux::RpmBackend;
 using flutter_device_apps_linux::RpmBackendQueryResult;
 using flutter_device_apps_linux::RpmDiscoveryProvider;
@@ -3633,6 +3641,653 @@ void test_nix_missing_empty_malformed_unsupported_legacy_and_isolation() {
          "legacy GIO-only listApps() must never run Nix provider");
 }
 
+// --- Step 9: Identity Resolution, Deduplication & Classification tests ---
+
+class FakeOwnershipLookup final : public PackageOwnershipLookup {
+ public:
+  void add(const std::string& path, PackageOwnershipEvidence evidence) {
+    owners_[path].push_back(std::move(evidence));
+  }
+
+  std::vector<PackageOwnershipEvidence> lookup_file_owners(
+      const std::string& file_path) const override {
+    const auto it = owners_.find(file_path);
+    if (it == owners_.end()) return {};
+    return it->second;
+  }
+
+ private:
+  std::unordered_map<std::string, std::vector<PackageOwnershipEvidence>>
+      owners_;
+};
+
+const ResolvedApplication* find_resolved_by_id(
+    const ResolvedDiscoveryInventory& inv, const std::string& id) {
+  for (const auto& app : inv.applications) {
+    if (app.resolved_id == id) return &app;
+  }
+  return nullptr;
+}
+
+void test_resolution_dedup_separate_installations_and_order_independence() {
+  DiscoveryPassResult pass;
+
+  // 1. Flatpak app org.example.Suite (user, stable) + TWO GIO desktop entries
+  // referencing X-Flatpak=org.example.Suite -> MUST merge into ONE installation
+  // with 2 desktop_entries!
+  DiscoveredApplication fp_suite;
+  fp_suite.provenance.provider_id = "flatpak";
+  fp_suite.provenance.native_id = "org.example.Suite";
+  fp_suite.provenance.installation_source = InstallationSource::kFlatpak;
+  fp_suite.provenance.installation_scope = InstallationScope::kUser;
+  fp_suite.package_id = OptionalString::of("org.example.Suite");
+  fp_suite.installation_id = OptionalString::of("user/stable/x86_64");
+  fp_suite.application_id = build_application_id(
+      "flatpak", "org.example.Suite", InstallationScope::kUser,
+      fp_suite.installation_id);
+  fp_suite.metadata.name = OptionalString::of("Suite");
+  fp_suite.metadata.version = OptionalString::of("2.4.0");
+  fp_suite.metadata.architecture = OptionalString::of("x86_64");
+  fp_suite.metadata.branch = OptionalString::of("stable");
+  pass.applications.push_back(fp_suite);
+
+  DiscoveredApplication gio_suite_main = make_gio_app(
+      "org.example.Suite.desktop", "Suite", true, true, false);
+  gio_suite_main.provenance.installation_source = InstallationSource::kFlatpak;
+  gio_suite_main.package_id = OptionalString::of("org.example.Suite");
+  pass.applications.push_back(gio_suite_main);
+
+  DiscoveredApplication gio_suite_viewer = make_gio_app(
+      "org.example.Suite.Viewer.desktop", "Suite Viewer", true, false, false);
+  gio_suite_viewer.provenance.installation_source =
+      InstallationSource::kFlatpak;
+  gio_suite_viewer.package_id = OptionalString::of("org.example.Suite");
+  pass.applications.push_back(gio_suite_viewer);
+
+  // 2. Same display name "Firefox" installed separately as Flatpak (system),
+  // Snap primary ("firefox"), Snap parallel instance ("firefox_beta"), AND
+  // native GIO entry -> MUST NEVER merge across package managers or parallel
+  // instances!
+  DiscoveredApplication fp_ff;
+  fp_ff.provenance.provider_id = "flatpak";
+  fp_ff.provenance.native_id = "org.mozilla.firefox";
+  fp_ff.provenance.installation_source = InstallationSource::kFlatpak;
+  fp_ff.provenance.installation_scope = InstallationScope::kSystem;
+  fp_ff.package_id = OptionalString::of("org.mozilla.firefox");
+  fp_ff.installation_id = OptionalString::of("default/stable/x86_64");
+  fp_ff.application_id = build_application_id(
+      "flatpak", "org.mozilla.firefox", InstallationScope::kSystem,
+      fp_ff.installation_id);
+  fp_ff.metadata.name = OptionalString::of("Firefox");
+  fp_ff.metadata.version = OptionalString::of("130.0");
+  pass.applications.push_back(fp_ff);
+
+  DiscoveredApplication snap_ff;
+  snap_ff.provenance.provider_id = "snap";
+  snap_ff.provenance.native_id = "firefox";
+  snap_ff.provenance.installation_source = InstallationSource::kSnap;
+  snap_ff.provenance.installation_scope = InstallationScope::kSystem;
+  snap_ff.package_id = OptionalString::of("firefox");
+  snap_ff.application_id =
+      build_application_id("snap", "firefox", InstallationScope::kSystem);
+  snap_ff.metadata.name = OptionalString::of("Firefox");
+  snap_ff.metadata.version = OptionalString::of("131.0");
+  pass.applications.push_back(snap_ff);
+
+  DiscoveredApplication snap_ff_beta;
+  snap_ff_beta.provenance.provider_id = "snap";
+  snap_ff_beta.provenance.native_id = "firefox_beta";
+  snap_ff_beta.provenance.installation_source = InstallationSource::kSnap;
+  snap_ff_beta.provenance.installation_scope = InstallationScope::kSystem;
+  snap_ff_beta.package_id = OptionalString::of("firefox");
+  snap_ff_beta.installation_id = OptionalString::of("beta");
+  snap_ff_beta.application_id = build_application_id(
+      "snap", "firefox_beta", InstallationScope::kSystem,
+      snap_ff_beta.installation_id);
+  snap_ff_beta.metadata.name = OptionalString::of("Firefox");
+  snap_ff_beta.metadata.version = OptionalString::of("132.0b1");
+  pass.applications.push_back(snap_ff_beta);
+
+  // GIO entry with X-SnapInstanceName=firefox -> merges ONLY into snap_ff, NOT
+  // into snap_ff_beta or fp_ff!
+  DiscoveredApplication gio_snap_ff =
+      make_gio_app("firefox_firefox.desktop", "Firefox", true, true, false);
+  gio_snap_ff.provenance.installation_source = InstallationSource::kSnap;
+  gio_snap_ff.package_id = OptionalString::of("firefox");
+  pass.applications.push_back(gio_snap_ff);
+
+  // Unmarked native GIO Firefox entry -> MUST stay separate (never merged by
+  // display name "Firefox" alone!).
+  DiscoveredApplication gio_native_ff =
+      make_gio_app("firefox.desktop", "Firefox", true, true, false);
+  pass.applications.push_back(gio_native_ff);
+
+  const ResolvedDiscoveryInventory forward = resolve_discovery_inventory(pass);
+
+  // Reverse input ordering and verify 100% deterministic identical output.
+  DiscoveryPassResult reversed_pass = pass;
+  std::reverse(reversed_pass.applications.begin(),
+               reversed_pass.applications.end());
+  const ResolvedDiscoveryInventory backward =
+      resolve_discovery_inventory(reversed_pass);
+
+  expect(forward.applications.size() == 5,
+         "expected 5 separate resolved installations (1 merged Flatpak Suite + "
+         "4 distinct Firefox installations across Flatpak, Snap, Snap beta, "
+         "and native GIO)");
+  expect(forward.applications.size() == backward.applications.size(),
+         "reversed provider order must produce identical application count");
+
+  for (size_t i = 0;
+       i < forward.applications.size() && i < backward.applications.size();
+       ++i) {
+    expect(forward.applications[i].resolved_id ==
+               backward.applications[i].resolved_id &&
+               forward.applications[i].desktop_entries.size() ==
+                   backward.applications[i].desktop_entries.size() &&
+               forward.applications[i].original_record_ids ==
+                   backward.applications[i].original_record_ids,
+           "resolution output must be deterministic and independent of "
+           "provider execution order");
+  }
+
+  const auto* suite = find_resolved_by_id(forward, fp_suite.application_id);
+  expect(suite != nullptr, "merged Flatpak Suite must exist");
+  if (suite != nullptr) {
+    expect(suite->desktop_entries.size() == 2,
+           "both desktop entries belonging to Flatpak Suite must be attached");
+    expect(suite->original_record_ids.size() == 3,
+           "all 3 original provider IDs must be preserved in provenance");
+    expect(suite->metadata.version.has_value() &&
+               suite->metadata.version.value() == "2.4.0",
+           "installed Flatpak version must be preserved");
+    expect(suite->classification == ApplicationClassification::kGuiApplication,
+           "desktop entries with Terminal=false classify Suite as GUI");
+  }
+
+  const auto* resolved_snap_ff =
+      find_resolved_by_id(forward, snap_ff.application_id);
+  const auto* resolved_snap_beta =
+      find_resolved_by_id(forward, snap_ff_beta.application_id);
+  expect(resolved_snap_ff != nullptr &&
+             resolved_snap_ff->desktop_entries.size() == 1 &&
+             resolved_snap_ff->desktop_entries[0].desktop_file_id ==
+                 "firefox_firefox.desktop",
+         "Snap primary instance must absorb its X-SnapInstanceName desktop "
+         "entry");
+  expect(resolved_snap_beta != nullptr &&
+             resolved_snap_beta->desktop_entries.empty(),
+         "Snap parallel beta instance must remain separate without absorbing "
+         "primary instance desktop entry");
+}
+
+void test_resolution_ambiguous_matches_and_conflicting_metadata() {
+  DiscoveryPassResult pass;
+
+  // 1. Ambiguous X-Flatpak: org.example.Dual installed in BOTH user and system
+  // scopes; GIO entry has X-Flatpak=org.example.Dual with scope=kUnknown ->
+  // MUST NOT guess; must preserve GIO separately with explicit ambiguity!
+  DiscoveredApplication fp_user;
+  fp_user.provenance.provider_id = "flatpak";
+  fp_user.provenance.native_id = "org.example.Dual";
+  fp_user.provenance.installation_source = InstallationSource::kFlatpak;
+  fp_user.provenance.installation_scope = InstallationScope::kUser;
+  fp_user.package_id = OptionalString::of("org.example.Dual");
+  fp_user.installation_id = OptionalString::of("user/stable/x86_64");
+  fp_user.application_id = build_application_id(
+      "flatpak", "org.example.Dual", InstallationScope::kUser,
+      fp_user.installation_id);
+  fp_user.metadata.version = OptionalString::of("1.0.0");
+  pass.applications.push_back(fp_user);
+
+  DiscoveredApplication fp_sys = fp_user;
+  fp_sys.provenance.installation_scope = InstallationScope::kSystem;
+  fp_sys.installation_id = OptionalString::of("default/stable/x86_64");
+  fp_sys.application_id = build_application_id(
+      "flatpak", "org.example.Dual", InstallationScope::kSystem,
+      fp_sys.installation_id);
+  pass.applications.push_back(fp_sys);
+
+  DiscoveredApplication gio_dual =
+      make_gio_app("org.example.Dual.desktop", "Dual App", true, false, false);
+  gio_dual.provenance.installation_source = InstallationSource::kFlatpak;
+  gio_dual.package_id = OptionalString::of("org.example.Dual");
+  pass.applications.push_back(gio_dual);
+
+  // 2. Conflicting metadata + installed vs catalog release version separation:
+  // Snap "editor" (installed version 1.2.3, license MIT) + GIO entry ("Editor
+  // Desktop") + AppStream metainfo ("Editor AppStream", license GPL-3.0,
+  // catalog release 9.9.9).
+  DiscoveredApplication snap_ed;
+  snap_ed.provenance.provider_id = "snap";
+  snap_ed.provenance.native_id = "editor";
+  snap_ed.provenance.installation_source = InstallationSource::kSnap;
+  snap_ed.provenance.installation_scope = InstallationScope::kSystem;
+  snap_ed.package_id = OptionalString::of("editor");
+  snap_ed.application_id =
+      build_application_id("snap", "editor", InstallationScope::kSystem);
+  snap_ed.metadata.name = OptionalString::of("Editor Snap");
+  snap_ed.metadata.version = OptionalString::of("1.2.3");
+  snap_ed.metadata.license = OptionalString::of("MIT");
+  snap_ed.metadata.summary = OptionalString::of("Snap summary");
+  pass.applications.push_back(snap_ed);
+
+  DiscoveredApplication gio_ed = make_gio_app(
+      "editor_editor.desktop", "Editor Desktop", true, true, false);
+  gio_ed.provenance.installation_source = InstallationSource::kSnap;
+  gio_ed.package_id = OptionalString::of("editor");
+  pass.applications.push_back(gio_ed);
+
+  AppStreamMetadataRecord as_ed;
+  as_ed.component_id = "org.example.Editor";
+  as_ed.component_kind = "desktop-application";
+  as_ed.name = OptionalString::of("Editor AppStream");
+  as_ed.summary = OptionalString::of("AppStream metainfo summary");
+  as_ed.project_license = OptionalString::of("GPL-3.0");
+  as_ed.desktop_launchable_ids = {"editor_editor.desktop"};
+  as_ed.bundles.push_back({"snap", "editor"});
+  as_ed.provenance.origin_kind = AppStreamMetadataOriginKind::kMetainfo;
+  AppStreamReleaseMetadata rel;
+  rel.version = OptionalString::of("9.9.9");
+  rel.date = OptionalString::of("2026-11-01");
+  as_ed.releases.push_back(rel);
+
+  // 3. Ambiguous AppStream: two distinct component_ids claiming the same
+  // desktop_file_id -> MUST preserve ambiguity instead of guessing!
+  DiscoveredApplication gio_amb = make_gio_app(
+      "org.example.Ambig.desktop", "Ambiguous", false, false, false);
+  pass.applications.push_back(gio_amb);
+
+  AppStreamMetadataRecord as_amb_1;
+  as_amb_1.component_id = "org.example.AmbigOne";
+  as_amb_1.component_kind = "desktop-application";
+  as_amb_1.desktop_launchable_ids = {"org.example.Ambig.desktop"};
+  AppStreamMetadataRecord as_amb_2;
+  as_amb_2.component_id = "org.example.AmbigTwo";
+  as_amb_2.component_kind = "desktop-application";
+  as_amb_2.desktop_launchable_ids = {"org.example.Ambig.desktop"};
+
+  const ResolvedDiscoveryInventory inv =
+      resolve_discovery_inventory(pass, {as_ed, as_amb_1, as_amb_2});
+
+  // Verify Dual ambiguity preserved (user + system + standalone GIO = 3).
+  const auto* standalone_dual = find_resolved_by_id(inv, gio_dual.application_id);
+  expect(standalone_dual != nullptr && !standalone_dual->ambiguities.empty() &&
+             standalone_dual->ambiguities[0].candidate_ids.size() == 2,
+         "ambiguous X-Flatpak across user/system installs must be preserved "
+         "with candidate IDs instead of guessed");
+
+  // Verify Editor precedence, conflict preservation, and version separation.
+  const auto* ed = find_resolved_by_id(inv, snap_ed.application_id);
+  expect(ed != nullptr, "merged Snap Editor must exist");
+  if (ed != nullptr) {
+    expect(ed->metadata.version.has_value() &&
+               ed->metadata.version.value() == "1.2.3",
+           "installed version must remain 1.2.3 (never overwritten by catalog "
+           "release 9.9.9)");
+    expect(ed->catalog_releases.latest_version.has_value() &&
+               ed->catalog_releases.latest_version.value() == "9.9.9",
+           "AppStream catalog release version must stay in catalog_releases");
+    expect(ed->metadata.name.has_value() &&
+               ed->metadata.name.value() == "Editor Desktop",
+           "GIO display name must take precedence over Snap/AppStream");
+    expect(ed->metadata.summary.has_value() &&
+               ed->metadata.summary.value() == "AppStream metainfo summary",
+           "AppStream metainfo summary must take precedence over Snap summary");
+    expect(ed->metadata.license.has_value() &&
+               ed->metadata.license.value() == "MIT",
+           "installed Snap license must take precedence over AppStream license");
+    expect(ed->metadata_conflicts.size() >= 3,
+           "disagreeing name, summary, and license must be recorded in "
+           "metadata_conflicts");
+  }
+
+  // Verify ambiguous AppStream preserved without linking an arbitrary pick.
+  const auto* amb = find_resolved_by_id(inv, gio_amb.application_id);
+  expect(amb != nullptr && amb->linked_appstream_component_ids.empty() &&
+             !amb->ambiguities.empty() &&
+             amb->ambiguities[0].candidate_ids.size() == 2,
+         "ambiguous AppStream component matches must be preserved rather than "
+         "guessed");
+
+  // Verify stable resolved_id across version upgrade.
+  DiscoveryPassResult upgraded_pass = pass;
+  upgraded_pass.applications[3].metadata.version = OptionalString::of("2.0.0");
+  const ResolvedDiscoveryInventory upgraded_inv =
+      resolve_discovery_inventory(upgraded_pass, {as_ed});
+  const auto* ed_upgraded =
+      find_resolved_by_id(upgraded_inv, snap_ed.application_id);
+  expect(ed != nullptr && ed_upgraded != nullptr &&
+             ed->resolved_id == ed_upgraded->resolved_id &&
+             ed_upgraded->metadata.version.value() == "2.0.0",
+         "resolved_id must remain identical across upgrades");
+}
+
+void test_resolution_classification_ownership_catalog_only_and_isolation() {
+  DiscoveryPassResult pass;
+
+  // 1. Multiple desktop entries owned by ONE DPKG package via documented
+  // PackageOwnershipLookup -> both stay separate apps referencing the SAME
+  // owning package_identity_id!
+  DiscoveredApplication writer = make_gio_app(
+      "libreoffice-writer.desktop", "LibreOffice Writer", true, false, false);
+  writer.desktop_file_path =
+      OptionalString::of("/usr/share/applications/libreoffice-writer.desktop");
+  pass.applications.push_back(writer);
+
+  DiscoveredApplication calc = make_gio_app(
+      "libreoffice-calc.desktop", "LibreOffice Calc", true, false, false);
+  calc.desktop_file_path =
+      OptionalString::of("/usr/share/applications/libreoffice-calc.desktop");
+  pass.applications.push_back(calc);
+
+  // 2. Terminal desktop entry -> classified as kCliApplication via Terminal=true.
+  DiscoveredApplication htop_desktop =
+      make_gio_app("htop.desktop", "htop", false, false, true);
+  pass.applications.push_back(htop_desktop);
+
+  // 3. GIO desktop entry residing inside an active Nix store path -> linked
+  // authoritatively to owning Nix package without filesystem heuristics.
+  DiscoveredApplication nix_gui =
+      make_gio_app("org.example.NixApp.desktop", "Nix App", false, false, false);
+  nix_gui.desktop_file_path = OptionalString::of(
+      "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-nixapp-3.0/share/"
+      "applications/org.example.NixApp.desktop");
+  pass.applications.push_back(nix_gui);
+
+  // Installed packages across DPKG, RPM, Pacman, Nix:
+  auto make_pkg = [](const char* prov, InstallationSource src,
+                     InstallationScope scope, const char* name,
+                     const char* arch, const char* ver,
+                     const char* section = "") {
+    InstalledPackageRecord p;
+    p.provenance.provider_id = prov;
+    p.provenance.native_id = name;
+    p.provenance.installation_source = src;
+    p.provenance.installation_scope = scope;
+    p.package_name = name;
+    p.architecture = OptionalString::of(arch);
+    p.version = OptionalString::of(ver);
+    if (*section != '\0') p.section = OptionalString::of(section);
+    p.installation_state = PackageInstallationState::kInstalled;
+    p.package_identity_id =
+        build_application_id(prov, name, scope, p.architecture);
+    return p;
+  };
+
+  InstalledPackageRecord pkg_lo =
+      make_pkg("dpkg", InstallationSource::kDpkg, InstallationScope::kSystem,
+               "libreoffice-core", "amd64", "24.2.0-1", "editors");
+  InstalledPackageRecord pkg_rg =
+      make_pkg("dpkg", InstallationSource::kDpkg, InstallationScope::kSystem,
+               "ripgrep", "amd64", "14.1.0-1", "utils");
+  InstalledPackageRecord pkg_svc =
+      make_pkg("rpm", InstallationSource::kRpm, InstallationScope::kSystem,
+               "example-daemon", "x86_64", "1.0.0");
+  InstalledPackageRecord pkg_lib =
+      make_pkg("pacman", InstallationSource::kPacman,
+               InstallationScope::kSystem, "libexample", "x86_64", "2.0-1");
+  InstalledPackageRecord pkg_rt =
+      make_pkg("pacman", InstallationSource::kPacman,
+               InstallationScope::kSystem, "example-runtime", "x86_64", "4.0-1");
+  // Package with tempting name "libssl3" and Section "libs" but NO AppStream
+  // evidence -> MUST stay kUnknown and strictly in packages!
+  InstalledPackageRecord pkg_unclassified =
+      make_pkg("dpkg", InstallationSource::kDpkg, InstallationScope::kSystem,
+               "libssl3", "amd64", "3.0.13", "libs");
+  InstalledPackageRecord pkg_nix =
+      make_pkg("nix", InstallationSource::kNix, InstallationScope::kUser,
+               "nixapp", "x86_64-linux", "3.0");
+  pkg_nix.store_paths.push_back(
+      "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-nixapp-3.0");
+
+  pass.packages = {pkg_lo,  pkg_rg,           pkg_svc, pkg_lib,
+                   pkg_rt,  pkg_unclassified, pkg_nix};
+
+  FakeOwnershipLookup ownership;
+  PackageOwnershipEvidence lo_owner;
+  lo_owner.package_provider_id = "dpkg";
+  lo_owner.package_identity_id = OptionalString::of(pkg_lo.package_identity_id);
+  lo_owner.package_name = "libreoffice-core";
+  ownership.add("/usr/share/applications/libreoffice-writer.desktop", lo_owner);
+  ownership.add("/usr/share/applications/libreoffice-calc.desktop", lo_owner);
+
+  // AppStream records covering CLI, service, library, runtime, AND catalog-only
+  // (uninstalled) app!
+  AppStreamMetadataRecord as_rg;
+  as_rg.component_id = "org.example.ripgrep";
+  as_rg.component_kind = "console-application";
+  as_rg.name = OptionalString::of("ripgrep");
+  as_rg.package_names = {"ripgrep"};
+  as_rg.provenance.origin_kind = AppStreamMetadataOriginKind::kCatalog;
+
+  AppStreamMetadataRecord as_svc;
+  as_svc.component_id = "org.example.daemon";
+  as_svc.component_kind = "service";
+  as_svc.package_names = {"example-daemon"};
+
+  AppStreamMetadataRecord as_lib;
+  as_lib.component_id = "org.example.libexample";
+  as_lib.component_kind = "library";
+  as_lib.package_names = {"libexample"};
+
+  AppStreamMetadataRecord as_rt;
+  as_rt.component_id = "org.example.runtime";
+  as_rt.component_kind = "runtime";
+  as_rt.package_names = {"example-runtime"};
+
+  // Catalog-only app NOT installed anywhere -> MUST NEVER appear in
+  // applications!
+  AppStreamMetadataRecord as_catalog_only;
+  as_catalog_only.component_id = "org.example.NotInstalled";
+  as_catalog_only.component_kind = "desktop-application";
+  as_catalog_only.name = OptionalString::of("Ghost App");
+  as_catalog_only.package_names = {"not-installed-pkg"};
+  as_catalog_only.desktop_launchable_ids = {"org.example.NotInstalled.desktop"};
+  as_catalog_only.provenance.origin_kind =
+      AppStreamMetadataOriginKind::kCatalog;
+
+  const ResolvedDiscoveryInventory inv = resolve_discovery_inventory(
+      pass, {as_rg, as_svc, as_lib, as_rt, as_catalog_only}, &ownership);
+
+  // Check multiple desktop entries belonging to one package.
+  const auto* res_writer = find_resolved_by_id(inv, writer.application_id);
+  const auto* res_calc = find_resolved_by_id(inv, calc.application_id);
+  expect(res_writer != nullptr && res_calc != nullptr &&
+             res_writer->linked_package_identity_ids.size() == 1 &&
+             res_calc->linked_package_identity_ids.size() == 1 &&
+             res_writer->linked_package_identity_ids[0] ==
+                 pkg_lo.package_identity_id &&
+             res_calc->linked_package_identity_ids[0] ==
+                 pkg_lo.package_identity_id &&
+             res_writer->metadata.version.has_value() &&
+             res_writer->metadata.version.value() == "24.2.0-1",
+         "multiple desktop entries belonging to one package must stay distinct "
+         "applications linked to the same package_identity_id");
+
+  // Check Terminal=true desktop entry -> kCliApplication.
+  const auto* res_htop = find_resolved_by_id(inv, htop_desktop.application_id);
+  expect(res_htop != nullptr &&
+             res_htop->classification ==
+                 ApplicationClassification::kCliApplication,
+         "Terminal=true desktop entry must classify as kCliApplication");
+
+  // Check Nix store-path ownership link.
+  const auto* res_nix = find_resolved_by_id(inv, nix_gui.application_id);
+  expect(res_nix != nullptr &&
+             res_nix->linked_package_identity_ids.size() == 1 &&
+             res_nix->linked_package_identity_ids[0] ==
+                 pkg_nix.package_identity_id &&
+             res_nix->primary_provenance.installation_source ==
+                 InstallationSource::kNix,
+         "GIO entry inside active Nix store path must link to owning Nix "
+         "package");
+
+  // Check verified DPKG + AppStream console-application promoted cleanly, while
+  // service, library, runtime, unclassified package, and catalog-only record
+  // are NOT promoted!
+  bool found_promoted_rg = false;
+  bool found_ghost = false;
+  bool found_unclassified_app = false;
+  for (const auto& app : inv.applications) {
+    if (app.primary_provenance.native_id == "ripgrep" &&
+        app.classification == ApplicationClassification::kCliApplication) {
+      found_promoted_rg = true;
+    }
+    if (app.resolved_id.find("NotInstalled") != std::string::npos) {
+      found_ghost = true;
+    }
+    if (app.primary_provenance.native_id == "libssl3") {
+      found_unclassified_app = true;
+    }
+  }
+  expect(found_promoted_rg,
+         "installed package with strong AppStream console-application match "
+         "must be classified as CLI application");
+  expect(!found_ghost,
+         "catalog-only AppStream record must NEVER be promoted to installed "
+         "applications");
+  expect(!found_unclassified_app,
+         "insufficiently identified package (libssl3) must stay in package "
+         "inventory");
+  expect(inv.unmatched_appstream_records.size() == 1 &&
+             inv.unmatched_appstream_records[0].component_id ==
+                 "org.example.NotInstalled",
+         "catalog-only record must remain in unmatched_appstream_records");
+
+  // Verify authoritative classification on package inventory (and kUnknown for
+  // libssl3 despite name/section!).
+  for (const auto& pkg : inv.packages) {
+    if (pkg.package_name == "example-daemon") {
+      expect(pkg.classification == ApplicationClassification::kService,
+             "AppStream service must classify package as kService");
+    } else if (pkg.package_name == "libexample") {
+      expect(pkg.classification == ApplicationClassification::kLibrary,
+             "AppStream library must classify package as kLibrary");
+    } else if (pkg.package_name == "example-runtime") {
+      expect(pkg.classification == ApplicationClassification::kRuntime,
+             "AppStream runtime must classify package as kRuntime");
+    } else if (pkg.package_name == "libssl3") {
+      expect(pkg.classification == ApplicationClassification::kUnknown,
+             "packages must NEVER be classified by name (lib*) or section "
+             "(libs) alone");
+    }
+  }
+
+  // Verify ApplicationDiscoveryService::discover_resolved() failure isolation.
+  {
+    ApplicationDiscoveryService service;
+    service.register_provider(std::make_unique<FakeDiscoveryProvider>(
+        "gio", true, [&]() {
+          DiscoveryResult r;
+          r.applications.push_back(writer);
+          return r;
+        }()));
+    DiscoveryResult failed_fp;
+    failed_fp.ok = false;
+    failed_fp.error_message = "flatpak failure";
+    service.register_provider(std::make_unique<FakeDiscoveryProvider>(
+        "flatpak", true, std::move(failed_fp)));
+    AppStreamBackendResult failed_as;
+    failed_as.ok = false;
+    failed_as.error_kind = AppStreamQueryErrorKind::kLoadFailed;
+    failed_as.error_message = "appstream failure";
+    service.set_metadata_provider(std::make_unique<AppStreamMetadataProvider>(
+        std::make_unique<FakeAppStreamBackend>(
+            true, "libappstream.so.5", std::move(failed_as))));
+
+    const ResolvedDiscoveryInventory res = service.discover_resolved();
+    expect(res.applications.size() == 1 &&
+               res.applications[0].resolved_id == writer.application_id,
+           "provider and AppStream failures must not block GIO resolution");
+    expect(res.provider_summaries.size() == 3 &&
+               res.provider_summaries[1].status ==
+                   ProviderExecutionStatus::kFailed &&
+               res.provider_summaries[2].provider_id == "appstream" &&
+               res.provider_summaries[2].status ==
+                   ProviderExecutionStatus::kFailed,
+           "failure summaries must be preserved in discover_resolved()");
+  }
+}
+
+void test_resolution_large_inventory_indexed_performance() {
+  DiscoveryPassResult pass;
+  std::vector<AppStreamMetadataRecord> appstream;
+
+  const size_t kPackageCount = 3000;
+  const size_t kAppCount = 600;
+  const size_t kCatalogOnlyCount = 400;
+
+  pass.packages.reserve(kPackageCount);
+  for (size_t i = 0; i < kPackageCount; ++i) {
+    InstalledPackageRecord pkg;
+    pkg.provenance.provider_id = "dpkg";
+    pkg.provenance.native_id = "pkg-" + std::to_string(i);
+    pkg.provenance.installation_source = InstallationSource::kDpkg;
+    pkg.provenance.installation_scope = InstallationScope::kSystem;
+    pkg.package_name = pkg.provenance.native_id;
+    pkg.architecture = OptionalString::of("amd64");
+    pkg.version = OptionalString::of("1.0." + std::to_string(i));
+    pkg.installation_state = PackageInstallationState::kInstalled;
+    pkg.package_identity_id = build_application_id(
+        "dpkg", pkg.package_name, InstallationScope::kSystem, pkg.architecture);
+    pass.packages.push_back(std::move(pkg));
+  }
+
+  pass.applications.reserve(kAppCount * 2);
+  appstream.reserve(kAppCount + kCatalogOnlyCount);
+  for (size_t i = 0; i < kAppCount; ++i) {
+    const std::string app_id = "org.example.ScaleApp" + std::to_string(i);
+    DiscoveredApplication fp;
+    fp.provenance.provider_id = "flatpak";
+    fp.provenance.native_id = app_id;
+    fp.provenance.installation_source = InstallationSource::kFlatpak;
+    fp.provenance.installation_scope = InstallationScope::kSystem;
+    fp.package_id = OptionalString::of(app_id);
+    fp.installation_id = OptionalString::of("default/stable/x86_64");
+    fp.application_id = build_application_id(
+        "flatpak", app_id, InstallationScope::kSystem, fp.installation_id);
+    fp.metadata.name = OptionalString::of("Scale App " + std::to_string(i));
+    fp.metadata.version = OptionalString::of("1.0.0");
+    pass.applications.push_back(std::move(fp));
+
+    const std::string desktop_id = app_id + ".desktop";
+    const std::string display_name = "Scale App " + std::to_string(i);
+    DiscoveredApplication gio =
+        make_gio_app(desktop_id.c_str(), display_name.c_str(), true, false,
+                     false);
+    gio.provenance.installation_source = InstallationSource::kFlatpak;
+    gio.package_id = OptionalString::of(app_id);
+    pass.applications.push_back(std::move(gio));
+
+    AppStreamMetadataRecord as;
+    as.component_id = app_id;
+    as.component_kind = "desktop-application";
+    as.desktop_launchable_ids = {app_id + ".desktop"};
+    as.bundles.push_back({"flatpak", "app/" + app_id + "/x86_64/stable"});
+    appstream.push_back(std::move(as));
+  }
+
+  for (size_t i = 0; i < kCatalogOnlyCount; ++i) {
+    AppStreamMetadataRecord ghost;
+    ghost.component_id = "org.example.CatalogOnly" + std::to_string(i);
+    ghost.component_kind = "desktop-application";
+    ghost.package_names = {"uninstalled-" + std::to_string(i)};
+    appstream.push_back(std::move(ghost));
+  }
+
+  const ResolvedDiscoveryInventory inv =
+      resolve_discovery_inventory(pass, appstream);
+  expect(inv.applications.size() == kAppCount,
+         "indexed resolution must merge all 600 GIO+Flatpak pairs cleanly");
+  expect(inv.packages.size() == kPackageCount,
+         "all 3000 unclassified packages must remain in package inventory");
+  expect(inv.unmatched_appstream_records.size() == kCatalogOnlyCount,
+         "all 400 catalog-only AppStream records must stay unmatched");
+  expect(inv.ambiguities.empty(),
+         "unambiguous large inventory must produce zero ambiguities");
+}
+
 }  // namespace
 
 int main() {
@@ -3672,6 +4327,10 @@ int main() {
   test_nix_manifest_versions_v1_v2_v3_and_multiple_outputs();
   test_nix_profile_aliases_separate_installations_and_upgrade_identity();
   test_nix_missing_empty_malformed_unsupported_legacy_and_isolation();
+  test_resolution_dedup_separate_installations_and_order_independence();
+  test_resolution_ambiguous_matches_and_conflicting_metadata();
+  test_resolution_classification_ownership_catalog_only_and_isolation();
+  test_resolution_large_inventory_indexed_performance();
 
   if (g_failures > 0) {
     std::cerr << g_failures << " test assertion(s) failed.\n";

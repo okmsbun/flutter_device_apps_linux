@@ -13,6 +13,7 @@ add_library(${PLUGIN_NAME} SHARED
   discovery/application_identity.cc
   discovery/appstream_metadata_provider.cc
   discovery/async_discovery_runner.cc
+  discovery/discovery_resolution.cc
   discovery/dpkg_discovery_provider.cc
   discovery/flatpak_discovery_provider.cc
   discovery/gio_discovery_provider.cc

@@ -69,6 +69,44 @@ DiscoveryResult GioDiscoveryProvider::discover() {
 
     auto* desktop =
         G_IS_DESKTOP_APP_INFO(info) ? G_DESKTOP_APP_INFO(info) : nullptr;
+    if (desktop != nullptr) {
+      const char* filename = g_desktop_app_info_get_filename(desktop);
+      if (filename != nullptr && *filename != '\0') {
+        app.desktop_file_path = OptionalString::of(filename);
+      }
+
+      // Preserve authoritative desktop-entry installation markers (X-Flatpak,
+      // X-SnapInstanceName, X-AppImage-*) without inferring scope or guessing
+      // package ownership from paths or names.
+      g_autofree char* x_flatpak =
+          g_desktop_app_info_get_string(desktop, "X-Flatpak");
+      if (x_flatpak != nullptr && *x_flatpak != '\0') {
+        app.provenance.installation_source = InstallationSource::kFlatpak;
+        app.package_id = OptionalString::of(x_flatpak);
+      } else {
+        g_autofree char* x_snap =
+            g_desktop_app_info_get_string(desktop, "X-SnapInstanceName");
+        if (x_snap != nullptr && *x_snap != '\0') {
+          app.provenance.installation_source = InstallationSource::kSnap;
+          app.package_id = OptionalString::of(x_snap);
+        } else {
+          g_autofree char* ai_ver =
+              g_desktop_app_info_get_string(desktop, "X-AppImage-Version");
+          g_autofree char* ai_name =
+              g_desktop_app_info_get_string(desktop, "X-AppImage-Name");
+          g_autofree char* ai_arch =
+              g_desktop_app_info_get_string(desktop, "X-AppImage-Arch");
+          if ((ai_ver != nullptr && *ai_ver != '\0') ||
+              (ai_name != nullptr && *ai_name != '\0') ||
+              (ai_arch != nullptr && *ai_arch != '\0')) {
+            app.provenance.installation_source = InstallationSource::kAppImage;
+            if (ai_ver != nullptr && *ai_ver != '\0') {
+              app.metadata.version = OptionalString::of(ai_ver);
+            }
+          }
+        }
+      }
+    }
     app.capabilities.supports_files =
         capability_from_bool(g_app_info_supports_files(info) != FALSE);
     app.capabilities.supports_uris =
