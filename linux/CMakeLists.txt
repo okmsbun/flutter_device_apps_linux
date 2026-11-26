@@ -11,10 +11,12 @@ add_library(${PLUGIN_NAME} SHARED
   elf_dependencies.cc
   discovery/application_discovery_service.cc
   discovery/application_identity.cc
+  discovery/appstream_metadata_provider.cc
   discovery/async_discovery_runner.cc
   discovery/flatpak_discovery_provider.cc
   discovery/gio_discovery_provider.cc
   discovery/legacy_list_apps_adapter.cc
+  discovery/libappstream_backend.cc
   discovery/libflatpak_backend.cc
   discovery/snap_discovery_provider.cc
   discovery/snapd_socket_backend.cc

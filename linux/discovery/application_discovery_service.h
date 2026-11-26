@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "application_discovery_provider.h"
+#include "appstream_metadata_provider.h"
 
 namespace flutter_device_apps_linux {
 
@@ -91,9 +92,23 @@ class ApplicationDiscoveryService {
       const DiscoveryRequestOptions& options =
           DiscoveryRequestOptions::all_providers());
 
+  // Registers an optional AppStream metadata provider kept strictly separate
+  // from installed-application discovery providers. AppStream records never
+  // enter discover_applications() / discover_with_report().
+  void set_metadata_provider(
+      std::unique_ptr<AppStreamMetadataProvider> provider);
+
+  // Returns whether an optional AppStream metadata provider is configured.
+  bool has_metadata_provider() const;
+
+  // Loads local AppStream metadata candidates independently of installed
+  // application discovery.
+  AppStreamMetadataResult load_appstream_metadata();
+
  private:
   mutable std::mutex mutex_;
   std::vector<std::unique_ptr<ApplicationDiscoveryProvider>> providers_;
+  std::unique_ptr<AppStreamMetadataProvider> metadata_provider_;
 };
 
 }  // namespace flutter_device_apps_linux

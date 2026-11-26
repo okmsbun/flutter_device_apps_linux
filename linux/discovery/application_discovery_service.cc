@@ -83,4 +83,26 @@ ApplicationDiscoveryService::discover_applications(
   return discover_with_report(options).applications;
 }
 
+void ApplicationDiscoveryService::set_metadata_provider(
+    std::unique_ptr<AppStreamMetadataProvider> provider) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  metadata_provider_ = std::move(provider);
+}
+
+bool ApplicationDiscoveryService::has_metadata_provider() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return metadata_provider_ != nullptr;
+}
+
+AppStreamMetadataResult ApplicationDiscoveryService::load_appstream_metadata() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  AppStreamMetadataResult result;
+  if (metadata_provider_ == nullptr) {
+    result.ok = false;
+    result.error_message = "No AppStream metadata provider registered";
+    return result;
+  }
+  return metadata_provider_->load_metadata();
+}
+
 }  // namespace flutter_device_apps_linux

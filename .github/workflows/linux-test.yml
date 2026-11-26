@@ -25,10 +25,11 @@ jobs:
       - name: Install Linux build and test dependencies
         run: |
           sudo apt-get update
-          # Note: intentionally install flatpak runtime (for libflatpak.so.0 and
-          # local offline fixture creation) without libflatpak-dev, proving the
-          # plugin builds without compile-time or link-time libflatpak headers.
+          # Note: intentionally install flatpak and libappstream runtime shared
+          # libraries without libflatpak-dev or libappstream-dev, proving the
+          # plugin builds without compile-time or link-time headers.
           sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev libstdc++-12-dev libgl1-mesa-dri shared-mime-info xvfb xauth flatpak
+          sudo apt-get install -y libappstream5 || sudo apt-get install -y libappstream4
 
       - name: Install dependencies
         run: flutter pub get
@@ -40,6 +41,7 @@ jobs:
             -Ilinux \
             linux/discovery/application_identity.cc \
             linux/discovery/application_discovery_service.cc \
+            linux/discovery/appstream_metadata_provider.cc \
             linux/discovery/async_discovery_runner.cc \
             linux/discovery/flatpak_discovery_provider.cc \
             linux/discovery/legacy_list_apps_adapter.cc \
@@ -54,6 +56,7 @@ jobs:
             -Ilinux \
             linux/discovery/application_identity.cc \
             linux/discovery/application_discovery_service.cc \
+            linux/discovery/appstream_metadata_provider.cc \
             linux/discovery/async_discovery_runner.cc \
             linux/discovery/flatpak_discovery_provider.cc \
             linux/discovery/legacy_list_apps_adapter.cc \
@@ -214,6 +217,78 @@ jobs:
 
           sudo chmod -R a+rX "$work_dir/system" "$work_dir/extra"
           /tmp/flatpak_discovery_provider_test --fixture
+
+      - name: Run native AppStream metadata integration tests
+        run: |
+          clang++ -std=c++14 -Wall -Wextra -Wpedantic -Werror \
+            -Ilinux \
+            $(pkg-config --cflags gio-unix-2.0 gmodule-2.0) \
+            linux/discovery/application_discovery_service.cc \
+            linux/discovery/appstream_metadata_provider.cc \
+            linux/discovery/libappstream_backend.cc \
+            linux/test/appstream_metadata_provider_test.cc \
+            $(pkg-config --libs gio-unix-2.0 gmodule-2.0) \
+            -o /tmp/appstream_metadata_provider_test
+
+          # Verify no mandatory DT_NEEDED ELF dependency on libappstream.
+          if readelf -d /tmp/appstream_metadata_provider_test | grep -q 'libappstream'; then
+            echo "Unexpected mandatory DT_NEEDED dependency on libappstream"
+            exit 1
+          fi
+
+          as_dir="$(mktemp -d)"
+          trap 'rm -rf -- "$as_dir"' EXIT
+
+          printf '%s\n' 'void unrelated_symbol(void) {}' | \
+            clang -x c - -fPIC -shared -o "$as_dir/libincomplete.so"
+          cat > "$as_dir/mismatched_v5.c" <<'EOF'
+          void* as_pool_new(void) { return 0; }
+          int as_pool_load(void* p, void* c, void** e) { (void)p; (void)c; (void)e; return 0; }
+          void* as_pool_get_components(void* p) { (void)p; return 0; }
+          const char* as_component_get_id(void* c) { (void)c; return 0; }
+          EOF
+          clang "$as_dir/mismatched_v5.c" -fPIC -shared -o "$as_dir/libappstream.so.5"
+
+          /tmp/appstream_metadata_provider_test --missing-lib
+          /tmp/appstream_metadata_provider_test --unsupported-abi \
+            "$as_dir/libincomplete.so" "$as_dir/libappstream.so.5"
+
+          mkdir -p "$as_dir/metainfo" "$as_dir/catalog"
+          cat > "$as_dir/metainfo/org.example.Editor.metainfo.xml" <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <component type="desktop-application">
+            <id>org.example.Editor</id>
+            <name>Example Editor</name>
+            <name xml:lang="tr">Örnek Editör</name>
+            <summary>Text editor</summary>
+            <summary xml:lang="tr">Metin düzenleyici</summary>
+            <description><p>Simple editor.</p></description>
+            <project_license>MIT</project_license>
+            <url type="homepage">https://example.org/editor</url>
+            <launchable type="desktop-id">org.example.Editor.desktop</launchable>
+            <categories><category>Utility</category></categories>
+            <releases>
+              <release version="3.1.0" date="2026-10-01"/>
+            </releases>
+          </component>
+          EOF
+          cat > "$as_dir/metainfo/malformed.metainfo.xml" <<'EOF'
+          <component ! broken xml
+          EOF
+          cat > "$as_dir/catalog/example-catalog.xml" <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <components version="0.16" origin="example-distro">
+            <component type="console-application">
+              <id>org.example.CliTool</id>
+              <pkgname>example-cli</pkgname>
+              <name>CLI Tool</name>
+              <summary>Command line utility</summary>
+              <bundle type="flatpak">app/org.example.CliTool/x86_64/stable</bundle>
+            </component>
+          </components>
+          EOF
+
+          /tmp/appstream_metadata_provider_test --fixture "$as_dir/metainfo" "$as_dir/catalog"
 
       - name: Run Linux integration tests
         run: bash example/tool/test_linux.sh

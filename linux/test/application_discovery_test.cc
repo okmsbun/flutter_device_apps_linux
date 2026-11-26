@@ -22,6 +22,8 @@
 #include "discovery/application_discovery_provider.h"
 #include "discovery/application_discovery_service.h"
 #include "discovery/application_identity.h"
+#include "discovery/appstream_metadata.h"
+#include "discovery/appstream_metadata_provider.h"
 #include "discovery/async_discovery_runner.h"
 #include "discovery/discovered_application.h"
 #include "discovery/flatpak_discovery_provider.h"
@@ -34,6 +36,16 @@ namespace {
 using flutter_device_apps_linux::ApplicationClassification;
 using flutter_device_apps_linux::ApplicationDiscoveryProvider;
 using flutter_device_apps_linux::ApplicationDiscoveryService;
+using flutter_device_apps_linux::AppStreamBackend;
+using flutter_device_apps_linux::AppStreamBackendResult;
+using flutter_device_apps_linux::AppStreamBundleReference;
+using flutter_device_apps_linux::AppStreamIconReference;
+using flutter_device_apps_linux::AppStreamMetadataOriginKind;
+using flutter_device_apps_linux::AppStreamMetadataProvider;
+using flutter_device_apps_linux::AppStreamMetadataRecord;
+using flutter_device_apps_linux::AppStreamMetadataResult;
+using flutter_device_apps_linux::AppStreamQueryErrorKind;
+using flutter_device_apps_linux::AppStreamReleaseMetadata;
 using flutter_device_apps_linux::AsyncDiscoveryRunner;
 using flutter_device_apps_linux::build_application_id;
 using flutter_device_apps_linux::capability_from_bool;
@@ -1971,6 +1983,231 @@ void test_snapd_socket_backend_end_to_end() {
   }
 }
 
+// --- AppStreamMetadataProvider tests ---
+
+class FakeAppStreamBackend final : public AppStreamBackend {
+ public:
+  FakeAppStreamBackend(bool available, std::string abi,
+                       AppStreamBackendResult result,
+                       std::atomic<int>* avail_calls = nullptr,
+                       std::atomic<int>* load_calls = nullptr)
+      : available_(available),
+        abi_(std::move(abi)),
+        result_(std::move(result)),
+        avail_calls_(avail_calls),
+        load_calls_(load_calls) {}
+
+  bool is_available() const override {
+    if (avail_calls_ != nullptr) avail_calls_->fetch_add(1);
+    return available_;
+  }
+
+  std::string abi_description() const override { return abi_; }
+
+  AppStreamBackendResult load_local_metadata() override {
+    if (load_calls_ != nullptr) load_calls_->fetch_add(1);
+    return result_;
+  }
+
+ private:
+  bool available_;
+  std::string abi_;
+  AppStreamBackendResult result_;
+  std::atomic<int>* avail_calls_;
+  std::atomic<int>* load_calls_;
+};
+
+void test_appstream_missing_library_unsupported_abi_and_malformed_errors() {
+  // Missing / null backend.
+  AppStreamMetadataProvider null_provider(nullptr);
+  expect(std::string(null_provider.id()) == "appstream",
+         "AppStreamMetadataProvider id() must be appstream");
+  expect(!null_provider.is_available(), "null AppStream backend is unavailable");
+  expect(!null_provider.load_metadata().ok,
+         "load_metadata() on null backend must fail cleanly");
+
+  // Unsupported ABI reported by backend.
+  {
+    AppStreamBackendResult err;
+    err.ok = false;
+    err.error_kind = AppStreamQueryErrorKind::kUnsupportedAbi;
+    err.error_message = "SONAME mismatch";
+    AppStreamMetadataProvider provider(std::make_unique<FakeAppStreamBackend>(
+        true, "unsupported", std::move(err)));
+    const AppStreamMetadataResult res = provider.load_metadata();
+    expect(!res.ok &&
+               res.error_message.find("unsupported libappstream ABI") !=
+                   std::string::npos,
+           "unsupported ABI error must be preserved cleanly");
+  }
+
+  // Malformed metadata error.
+  {
+    AppStreamBackendResult err;
+    err.ok = false;
+    err.error_kind = AppStreamQueryErrorKind::kMalformedMetadata;
+    err.error_message = "invalid XML document";
+    AppStreamMetadataProvider provider(std::make_unique<FakeAppStreamBackend>(
+        true, "libappstream.so.5", std::move(err)));
+    const AppStreamMetadataResult res = provider.load_metadata();
+    expect(!res.ok &&
+               res.error_message.find("malformed AppStream metadata") !=
+                   std::string::npos,
+           "malformed metadata error must be preserved cleanly");
+  }
+}
+
+void test_appstream_metadata_fields_ambiguous_candidates_and_install_evidence() {
+  AppStreamBackendResult backend_res;
+
+  // Candidate 1: Catalog-only desktop application (NOT installed!).
+  {
+    AppStreamMetadataRecord catalog_app;
+    catalog_app.component_id = "org.example.Editor";
+    catalog_app.component_kind = "desktop-application";
+    catalog_app.name = OptionalString::of("Editör");
+    catalog_app.summary = OptionalString::of("Metin düzenleyici");
+    catalog_app.description = OptionalString::of("Yerelleştirilmiş açıklama.");
+    catalog_app.project_license = OptionalString::of("MIT");
+    catalog_app.homepage = OptionalString::of("https://example.org/editor");
+    catalog_app.package_names.push_back("example-editor");
+    catalog_app.bundles.push_back({"flatpak", "app/org.example.Editor/x86_64/stable"});
+    catalog_app.desktop_launchable_ids.push_back("org.example.Editor.desktop");
+    catalog_app.categories.push_back("Utility");
+    catalog_app.categories.push_back("TextEditor");
+    catalog_app.icons.push_back({"stock", "org.example.Editor"});
+    catalog_app.icons.push_back({"remote", "https://example.org/icon.png"});
+    AppStreamReleaseMetadata rel;
+    rel.version = OptionalString::of("9.9.9");
+    rel.date = OptionalString::of("2026-10-01");
+    rel.urgency = OptionalString::of("medium");
+    catalog_app.releases.push_back(std::move(rel));
+    catalog_app.provenance.origin = OptionalString::of("ubuntu-noble-main");
+    catalog_app.provenance.data_id =
+        OptionalString::of("system/ubuntu-noble-main/package/org.example.Editor/*");
+    catalog_app.provenance.scope = InstallationScope::kSystem;
+    catalog_app.provenance.origin_kind = AppStreamMetadataOriginKind::kCatalog;
+    // Even if a buggy backend tried to set is_installation_proof = true, the
+    // provider must enforce false.
+    catalog_app.provenance.is_installation_proof = true;
+    backend_res.records.push_back(std::move(catalog_app));
+  }
+
+  // Candidate 2: Ambiguous second candidate with the SAME component_id from
+  // Flathub catalog — must be preserved without deduplication!
+  {
+    AppStreamMetadataRecord flatpak_candidate;
+    flatpak_candidate.component_id = "org.example.Editor";
+    flatpak_candidate.component_kind = "desktop-application";
+    flatpak_candidate.bundles.push_back(
+        {"flatpak", "app/org.example.Editor/x86_64/beta"});
+    flatpak_candidate.desktop_launchable_ids.push_back(
+        "org.example.Editor.desktop");
+    flatpak_candidate.provenance.origin = OptionalString::of("flathub-beta");
+    flatpak_candidate.provenance.data_id =
+        OptionalString::of("user/flathub-beta/flatpak/org.example.Editor/beta");
+    flatpak_candidate.provenance.scope = InstallationScope::kUser;
+    flatpak_candidate.provenance.origin_kind =
+        AppStreamMetadataOriginKind::kCatalog;
+    backend_res.records.push_back(std::move(flatpak_candidate));
+  }
+
+  // Candidate 3: Locally installed metainfo for a console application.
+  {
+    AppStreamMetadataRecord console_meta;
+    console_meta.component_id = "org.example.Ripgrep";
+    console_meta.component_kind = "console-application";
+    console_meta.package_names.push_back("ripgrep");
+    console_meta.provenance.origin = OptionalString::of("metainfo");
+    console_meta.provenance.scope = InstallationScope::kSystem;
+    console_meta.provenance.origin_kind =
+        AppStreamMetadataOriginKind::kMetainfo;
+    backend_res.records.push_back(std::move(console_meta));
+  }
+
+  // Candidate 4: Record missing component_id (malformed) -> skipped.
+  {
+    AppStreamMetadataRecord empty_id;
+    empty_id.component_kind = "desktop-application";
+    backend_res.records.push_back(std::move(empty_id));
+  }
+
+  std::atomic<int> appstream_avail_calls{0};
+  std::atomic<int> appstream_load_calls{0};
+
+  ApplicationDiscoveryService service;
+  service.register_provider(
+      std::make_unique<FakeDiscoveryProvider>("gio", true, DiscoveryResult{}));
+  service.set_metadata_provider(std::make_unique<AppStreamMetadataProvider>(
+      std::make_unique<FakeAppStreamBackend>(
+          true, "libappstream.so.5 (AppStream 1.0 ABI)",
+          std::move(backend_res), &appstream_avail_calls,
+          &appstream_load_calls)));
+
+  // 1. Legacy GIO-only discovery AND unified installed-application discovery
+  // must NOT invoke AppStream or emit catalog-only apps as installed!
+  const auto legacy_pass = service.discover_with_report(
+      DiscoveryRequestOptions::only_providers({"gio"}));
+  const auto unified_installed = service.discover_applications(
+      DiscoveryRequestOptions::all_providers());
+  expect(legacy_pass.applications.empty() && unified_installed.empty(),
+         "catalog-only and metainfo-only AppStream records must NEVER appear "
+         "as installed applications");
+  expect(appstream_avail_calls.load() == 0 && appstream_load_calls.load() == 0,
+         "legacy listApps() and installed discovery must incur zero AppStream "
+         "latency");
+
+  // 2. Explicit AppStream metadata load returns all 3 valid candidates,
+  // preserving ambiguous duplicates and provenance invariants.
+  expect(service.has_metadata_provider(),
+         "service should report configured AppStream metadata provider");
+  const AppStreamMetadataResult meta = service.load_appstream_metadata();
+  expect(meta.ok, "AppStream metadata load should succeed");
+  expect(meta.records.size() == 3,
+         "all 3 valid candidates (including ambiguous duplicates) must be "
+         "preserved while empty-ID record is skipped");
+  if (meta.records.size() != 3) return;
+
+  const auto& first = meta.records[0];
+  const auto& second = meta.records[1];
+  const auto& third = meta.records[2];
+
+  expect(first.component_id == "org.example.Editor" &&
+             second.component_id == "org.example.Editor",
+         "ambiguous candidates sharing component_id must both be preserved");
+  expect(first.provenance.data_id != second.provenance.data_id,
+         "ambiguous candidates must remain distinguishable by provenance");
+  expect(!first.provenance.is_installation_proof &&
+             !second.provenance.is_installation_proof &&
+             !third.provenance.is_installation_proof,
+         "AppStream records must NEVER claim installation proof");
+  expect(first.component_kind == "desktop-application" &&
+             third.component_kind == "console-application",
+         "component kinds must be preserved accurately");
+  expect(first.name.has_value() && first.name.value() == "Editör" &&
+             first.summary.has_value() &&
+             first.summary.value() == "Metin düzenleyici",
+         "localized metadata fields must be preserved");
+  expect(first.project_license.has_value() &&
+             first.project_license.value() == "MIT" &&
+             first.homepage.has_value() &&
+             first.homepage.value() == "https://example.org/editor",
+         "license and homepage must be preserved");
+  expect(first.desktop_launchable_ids.size() == 1 &&
+             first.desktop_launchable_ids[0] == "org.example.Editor.desktop",
+         "desktop launchable IDs must be preserved for future matching");
+  expect(first.package_names.size() == 1 &&
+             first.package_names[0] == "example-editor" &&
+             first.bundles.size() == 1 && first.bundles[0].kind == "flatpak",
+         "package names and bundle identifiers must be preserved");
+  expect(first.releases.size() == 1 &&
+             first.releases[0].version.has_value() &&
+             first.releases[0].version.value() == "9.9.9",
+         "catalog release metadata must remain on AppStreamReleaseMetadata");
+  expect(third.provenance.origin_kind == AppStreamMetadataOriginKind::kMetainfo,
+         "metainfo origin kind must be distinct from catalog origin kind");
+}
+
 }  // namespace
 
 int main() {
@@ -1997,6 +2234,8 @@ int main() {
   test_snap_missing_backend_filtering_parallel_metadata_and_stable_id();
   test_snap_provider_failure_isolation();
   test_snapd_socket_backend_end_to_end();
+  test_appstream_missing_library_unsupported_abi_and_malformed_errors();
+  test_appstream_metadata_fields_ambiguous_candidates_and_install_evidence();
 
   if (g_failures > 0) {
     std::cerr << g_failures << " test assertion(s) failed.\n";
